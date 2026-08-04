@@ -392,67 +392,88 @@ func replacementsMatchSimulation(replacements []*Replacement, newNodeClaims []*s
 // lists. Each phase runs one BFS to layer the graph by shortest alternating path from unmatched left vertices, then
 // augments along vertex-disjoint shortest paths with DFS; at most O(sqrt(V)) phases are needed.
 func hopcroftKarpMatchingSize(adjacency [][]int, rightSize int) int {
-	const unmatched = -1
-	unlayered := len(adjacency) + 1 // strictly greater than any reachable BFS layer
-	matchLeft := make([]int, len(adjacency))
-	matchRight := make([]int, rightSize)
-	for i := range matchLeft {
-		matchLeft[i] = unmatched
-	}
-	for j := range matchRight {
-		matchRight[j] = unmatched
-	}
-	layer := make([]int, len(adjacency))
-	queue := make([]int, 0, len(adjacency))
-
-	bfs := func() bool {
-		queue = queue[:0]
-		for u := range adjacency {
-			if matchLeft[u] == unmatched {
-				layer[u] = 0
-				queue = append(queue, u)
-			} else {
-				layer[u] = unlayered
-			}
-		}
-		foundAugmentingPath := false
-		for head := 0; head < len(queue); head++ {
-			u := queue[head]
-			for _, v := range adjacency[u] {
-				w := matchRight[v]
-				if w == unmatched {
-					foundAugmentingPath = true
-				} else if layer[w] == unlayered {
-					layer[w] = layer[u] + 1
-					queue = append(queue, w)
-				}
-			}
-		}
-		return foundAugmentingPath
-	}
-	var dfs func(u int) bool
-	dfs = func(u int) bool {
-		for _, v := range adjacency[u] {
-			w := matchRight[v]
-			if w == unmatched || (layer[w] == layer[u]+1 && dfs(w)) {
-				matchLeft[u] = v
-				matchRight[v] = u
-				return true
-			}
-		}
-		layer[u] = unlayered
-		return false
-	}
-
+	m := newBipartiteMatcher(adjacency, rightSize)
 	size := 0
-	for bfs() {
-		for u := range adjacency {
-			if matchLeft[u] == unmatched && dfs(u) {
+	for m.layerGraph() {
+		for u := range m.adjacency {
+			if m.matchLeft[u] == unmatchedVertex && m.augment(u) {
 				size++
 			}
 		}
 	}
 	return size
+}
+
+const unmatchedVertex = -1
+
+type bipartiteMatcher struct {
+	adjacency  [][]int
+	matchLeft  []int
+	matchRight []int
+	layer      []int
+	queue      []int
+	unlayered  int // strictly greater than any reachable BFS layer
+}
+
+func newBipartiteMatcher(adjacency [][]int, rightSize int) *bipartiteMatcher {
+	m := &bipartiteMatcher{
+		adjacency:  adjacency,
+		matchLeft:  make([]int, len(adjacency)),
+		matchRight: make([]int, rightSize),
+		layer:      make([]int, len(adjacency)),
+		queue:      make([]int, 0, len(adjacency)),
+		unlayered:  len(adjacency) + 1,
+	}
+	for i := range m.matchLeft {
+		m.matchLeft[i] = unmatchedVertex
+	}
+	for j := range m.matchRight {
+		m.matchRight[j] = unmatchedVertex
+	}
+	return m
+}
+
+// layerGraph BFS-layers left vertices by shortest alternating path from any unmatched left vertex,
+// reporting whether an augmenting path exists.
+func (m *bipartiteMatcher) layerGraph() bool {
+	m.queue = m.queue[:0]
+	for u := range m.adjacency {
+		if m.matchLeft[u] == unmatchedVertex {
+			m.layer[u] = 0
+			m.queue = append(m.queue, u)
+		} else {
+			m.layer[u] = m.unlayered
+		}
+	}
+	foundAugmentingPath := false
+	for head := 0; head < len(m.queue); head++ {
+		u := m.queue[head]
+		for _, v := range m.adjacency[u] {
+			w := m.matchRight[v]
+			if w == unmatchedVertex {
+				foundAugmentingPath = true
+			} else if m.layer[w] == m.unlayered {
+				m.layer[w] = m.layer[u] + 1
+				m.queue = append(m.queue, w)
+			}
+		}
+	}
+	return foundAugmentingPath
+}
+
+// augment searches for an augmenting path from left vertex u along the current layering, flipping
+// matched edges along the path if one is found.
+func (m *bipartiteMatcher) augment(u int) bool {
+	for _, v := range m.adjacency[u] {
+		w := m.matchRight[v]
+		if w == unmatchedVertex || (m.layer[w] == m.layer[u]+1 && m.augment(w)) {
+			m.matchLeft[u] = v
+			m.matchRight[v] = u
+			return true
+		}
+	}
+	m.layer[u] = m.unlayered
+	return false
 }
 
 // replacementMatchesSimulatedNodeClaim reports whether a command's replacement is still a valid stand-in for a
