@@ -214,6 +214,81 @@ func TestReplacementsMatchSimulationLargeAdversarialInput(t *testing.T) {
 	}
 }
 
+// kuhnMatchingSize is the previous Kuhn's augmenting-path implementation, kept here as a benchmark
+// baseline against hopcroftKarpMatchingSize.
+func kuhnMatchingSize(adjacency [][]int, rightSize int) int {
+	matchedTo := make([]int, rightSize)
+	for j := range matchedTo {
+		matchedTo[j] = -1
+	}
+	var augment func(i int, visited []bool) bool
+	augment = func(i int, visited []bool) bool {
+		for _, j := range adjacency[i] {
+			if visited[j] {
+				continue
+			}
+			visited[j] = true
+			if matchedTo[j] == -1 || augment(matchedTo[j], visited) {
+				matchedTo[j] = i
+				return true
+			}
+		}
+		return false
+	}
+	size := 0
+	for i := range adjacency {
+		if augment(i, make([]bool, rightSize)) {
+			size++
+		}
+	}
+	return size
+}
+
+// worstCaseAdjacency builds an n x n graph where every left vertex is compatible with every right
+// vertex except a shifted diagonal, forcing augmenting-path rework without making matching trivial.
+func worstCaseAdjacency(n int) [][]int {
+	adjacency := make([][]int, n)
+	for i := range adjacency {
+		for j := 0; j < n; j++ {
+			if j != (i+1)%n {
+				adjacency[i] = append(adjacency[i], j)
+			}
+		}
+	}
+	return adjacency
+}
+
+func TestHopcroftKarpMatchesKuhn(t *testing.T) {
+	for n := 1; n <= 12; n++ {
+		adjacency := worstCaseAdjacency(n)
+		if got, want := hopcroftKarpMatchingSize(adjacency, n), kuhnMatchingSize(adjacency, n); got != want {
+			t.Fatalf("n=%d: hopcroft-karp found %d, kuhn found %d", n, got, want)
+		}
+	}
+}
+
+func BenchmarkMatchingHopcroftKarp(b *testing.B) {
+	for _, n := range []int{3, 5, 10, 50} {
+		adjacency := worstCaseAdjacency(n)
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				hopcroftKarpMatchingSize(adjacency, n)
+			}
+		})
+	}
+}
+
+func BenchmarkMatchingKuhn(b *testing.B) {
+	for _, n := range []int{3, 5, 10, 50} {
+		adjacency := worstCaseAdjacency(n)
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				kuhnMatchingSize(adjacency, n)
+			}
+		})
+	}
+}
+
 func TestIsValidRecordsWaitStageOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(withConsolidationType(context.Background(), "cancel-test"))
 	fakeClock := clocktesting.NewFakeClock(time.Now())

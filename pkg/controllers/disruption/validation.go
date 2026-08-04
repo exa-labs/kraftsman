@@ -374,37 +374,85 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 // replacementsMatchSimulation reports whether there is a one-to-one matching between the command's replacements and
 // the simulated NodeClaims such that each replacement could still satisfy its matched simulated NodeClaim: same
 // NodePool, same taints, scheduling requirements contained in the simulated claim's, and instance type options that are a subset of the simulated
-// NodeClaim's options. Uses Kuhn's augmenting-path maximum bipartite matching, which is polynomial in the number of
-// replacements, so it stays cheap even for large MAX_CONSOLIDATION_REPLACEMENTS values.
+// NodeClaim's options. Uses Hopcroft-Karp maximum bipartite matching (O(E*sqrt(V))), which is polynomial in the
+// number of replacements, so it stays cheap even for large MAX_CONSOLIDATION_REPLACEMENTS values.
 func replacementsMatchSimulation(replacements []*Replacement, newNodeClaims []*scheduling.NodeClaim) bool {
-	canSatisfy := make([][]bool, len(replacements))
+	adjacency := make([][]int, len(replacements))
 	for i, r := range replacements {
-		canSatisfy[i] = make([]bool, len(newNodeClaims))
 		for j, nc := range newNodeClaims {
-			canSatisfy[i][j] = replacementMatchesSimulatedNodeClaim(r, nc)
+			if replacementMatchesSimulatedNodeClaim(r, nc) {
+				adjacency[i] = append(adjacency[i], j)
+			}
 		}
 	}
-	matchedTo := lo.Map(newNodeClaims, func(_ *scheduling.NodeClaim, _ int) int { return -1 })
-	var augment func(i int, visited []bool) bool
-	augment = func(i int, visited []bool) bool {
-		for j := range newNodeClaims {
-			if !canSatisfy[i][j] || visited[j] {
-				continue
+	return hopcroftKarpMatchingSize(adjacency, len(newNodeClaims)) == len(replacements)
+}
+
+// hopcroftKarpMatchingSize returns the size of a maximum bipartite matching for the given left-to-right adjacency
+// lists. Each phase runs one BFS to layer the graph by shortest alternating path from unmatched left vertices, then
+// augments along vertex-disjoint shortest paths with DFS; at most O(sqrt(V)) phases are needed.
+func hopcroftKarpMatchingSize(adjacency [][]int, rightSize int) int {
+	const unmatched = -1
+	unlayered := len(adjacency) + 1 // strictly greater than any reachable BFS layer
+	matchLeft := make([]int, len(adjacency))
+	matchRight := make([]int, rightSize)
+	for i := range matchLeft {
+		matchLeft[i] = unmatched
+	}
+	for j := range matchRight {
+		matchRight[j] = unmatched
+	}
+	layer := make([]int, len(adjacency))
+	queue := make([]int, 0, len(adjacency))
+
+	bfs := func() bool {
+		queue = queue[:0]
+		for u := range adjacency {
+			if matchLeft[u] == unmatched {
+				layer[u] = 0
+				queue = append(queue, u)
+			} else {
+				layer[u] = unlayered
 			}
-			visited[j] = true
-			if matchedTo[j] == -1 || augment(matchedTo[j], visited) {
-				matchedTo[j] = i
+		}
+		foundAugmentingPath := false
+		for head := 0; head < len(queue); head++ {
+			u := queue[head]
+			for _, v := range adjacency[u] {
+				w := matchRight[v]
+				if w == unmatched {
+					foundAugmentingPath = true
+				} else if layer[w] == unlayered {
+					layer[w] = layer[u] + 1
+					queue = append(queue, w)
+				}
+			}
+		}
+		return foundAugmentingPath
+	}
+	var dfs func(u int) bool
+	dfs = func(u int) bool {
+		for _, v := range adjacency[u] {
+			w := matchRight[v]
+			if w == unmatched || (layer[w] == layer[u]+1 && dfs(w)) {
+				matchLeft[u] = v
+				matchRight[v] = u
 				return true
 			}
 		}
+		layer[u] = unlayered
 		return false
 	}
-	for i := range replacements {
-		if !augment(i, make([]bool, len(newNodeClaims))) {
-			return false
+
+	size := 0
+	for bfs() {
+		for u := range adjacency {
+			if matchLeft[u] == unmatched && dfs(u) {
+				size++
+			}
 		}
 	}
-	return true
+	return size
 }
 
 // replacementMatchesSimulatedNodeClaim reports whether a command's replacement is still a valid stand-in for a
