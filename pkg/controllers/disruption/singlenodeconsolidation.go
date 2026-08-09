@@ -132,6 +132,15 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	balancedNodePoolsHeld := sets.New[string]()
 
 	timedOut := false
+	// The coverage cycle only accumulates across consecutive timed-out walks. Any pass that ends
+	// for another reason - it walked every candidate, returned its single command, or filled its
+	// proposal batch - resets it, so the next walk starts back at the head of the sorted list and
+	// the ranking is only overridden while timeouts are actually starving the tail.
+	defer func() {
+		if !timedOut {
+			s.evaluatedThisCycle = sets.New[string]()
+		}
+	}()
 	for i, candidate := range candidates {
 		if s.clock.Now().After(timeout) {
 			outcome = PassOutcomeTimedOut
@@ -367,9 +376,9 @@ func (s *SingleNodeConsolidation) SortCandidates(ctx context.Context, candidates
 // reached candidate is re-simulated and validated against current state. Without it, every
 // timed-out pass restarts at the head of the sorted list, so head candidates are re-evaluated
 // each pass while the tail past the timeout horizon is starved indefinitely; with it, every
-// candidate is reached within a bounded number of passes. A cycle ends when a walk completes,
-// or when every current candidate has been reached; either way the next pass starts a fresh
-// cycle in pure sorted order.
+// candidate is reached within a bounded number of passes. A cycle ends when a walk ends for
+// any reason other than a timeout, or when every current candidate has been reached; either
+// way the next pass starts a fresh cycle in pure sorted order.
 func (s *SingleNodeConsolidation) resumeCoverageCycle(ctx context.Context, candidates []*Candidate) []*Candidate {
 	if s.evaluatedThisCycle.Len() == 0 {
 		return candidates
