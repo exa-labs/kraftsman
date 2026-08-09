@@ -139,6 +139,10 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	defer func() {
 		if !timedOut {
 			s.evaluatedThisCycle = sets.New[string]()
+			// The gauge is otherwise only written by timed-out walks, so mark the cycle
+			// complete here or it would hold the last timed-out pass's partial fraction
+			// long after coverage recovered.
+			ObserveWalkCycleCoverage(s.ConsolidationType(), 1, 1)
 		}
 	}()
 	for i, candidate := range candidates {
