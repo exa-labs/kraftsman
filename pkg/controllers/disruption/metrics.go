@@ -553,6 +553,16 @@ var (
 		},
 		[]string{metrics.NodePoolLabel, ConsolidationTypeLabel},
 	)
+	WalkCycleCoverageRatio = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_walk_cycle_coverage_ratio",
+			Help:      "Fraction of current candidates the running coverage cycle has reached across its timed-out passes. Reaches 1 (and resets) when every candidate has been evaluated; a ratio pinned below 1 means candidates are entering the set faster than the walk covers them.",
+		},
+		[]string{ConsolidationTypeLabel},
+	)
 )
 
 var (
@@ -673,6 +683,15 @@ func ObserveUnseenNodePools(consolidationType string, nodePools []string) {
 // ObserveConsolidationCandidateSkip records a candidate the pass declined to act on. The
 // instance and capacity type identify which shapes a reason is concentrated in, which
 // NodePool alone cannot: a pool routinely mixes types whose consolidation outcomes differ.
+// ObserveWalkCycleCoverage reports how much of the current candidate set the coverage cycle has
+// reached, recorded when a pass times out.
+func ObserveWalkCycleCoverage(consolidationType string, evaluated, candidates int) {
+	if candidates == 0 {
+		return
+	}
+	WalkCycleCoverageRatio.Set(float64(evaluated)/float64(candidates), map[string]string{ConsolidationTypeLabel: consolidationType})
+}
+
 func ObserveConsolidationCandidateSkip(consolidationType, nodePool, instanceType, capacityType, reason string) {
 	ConsolidationCandidateSkipsTotal.Inc(map[string]string{
 		ConsolidationTypeLabel:    consolidationType,
