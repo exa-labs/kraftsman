@@ -58,6 +58,7 @@ type OptionsFields struct {
 	ConsolidationReplaceMinSavings      *float64
 	SpotToSpotMinInstanceTypes          *int
 	ConsolidationCandidateTimeout       *time.Duration
+	ConsolidationDiscoveryWorkers       *int
 	ConsolidationAttributeReplacements  *bool
 	ConsolidationSkipUnchangedNegatives *bool
 	ConsolidationNegativeCacheTTL       *time.Duration
@@ -115,6 +116,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		// Tests drive a fake clock, and a per-candidate deadline is wall-clock, so it is off by
 		// default here: a suite opts in when it is what is under test.
 		ConsolidationCandidateTimeout:       lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
+		ConsolidationDiscoveryWorkers:       lo.FromPtrOr(opts.ConsolidationDiscoveryWorkers, 1),
 		ConsolidationAttributeReplacements:  lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
 		ConsolidationSkipUnchangedNegatives: lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
 		ConsolidationNegativeCacheTTL:       lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
