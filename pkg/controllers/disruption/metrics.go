@@ -559,7 +559,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "consolidation_walk_cycle_coverage_ratio",
-			Help:      "Fraction of current candidates the running coverage cycle has reached across its timed-out passes. Reaches 1 (and resets) when every candidate has been evaluated; a ratio pinned below 1 means candidates are entering the set faster than the walk covers them.",
+			Help:      "Fraction of current candidates the running coverage cycle has reached across consecutive timed-out passes. A cycle ends - and the gauge reports 1 - when a pass stops for any reason other than a timeout, so a ratio pinned below 1 means back-to-back timeouts are letting candidates enter the set faster than the walk covers them.",
 		},
 		[]string{ConsolidationTypeLabel},
 	)
