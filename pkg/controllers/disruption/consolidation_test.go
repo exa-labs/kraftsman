@@ -2803,6 +2803,16 @@ var _ = Describe("Consolidation", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidation: lo.ToPtr(true)}))
 			applyPackedNode()
 			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotRetryTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotRetryOutcomeArmed,
+			})
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotRetryTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotRetryOutcomeAdmitted,
+			})
 
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
@@ -2831,6 +2841,16 @@ var _ = Describe("Consolidation", func() {
 			applyPackedNode()
 			recorder.Reset()
 			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotRetryTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotRetryOutcomeArmed,
+			})
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotRetryTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotRetryOutcomeNoCheapZone,
+			})
 
 			Expect(queue.GetCommands()).To(BeEmpty())
 			ExpectExists(ctx, env.Client, nodeClaim)
@@ -2842,6 +2862,29 @@ var _ = Describe("Consolidation", func() {
 			// that the priced capacity type was spot (not on-demand) and which zone set the worst case.
 			Expect(evt.Message).To(ContainSubstring("prices worst-case at"))
 			Expect(evt.Message).To(ContainSubstring("for spot in"))
+		})
+		It("records when capacity type minValues reject the retry", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidation: lo.ToPtr(true)}))
+			nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, v1.NodeSelectorRequirementWithMinValues{
+				Key:       v1.CapacityTypeLabelKey,
+				Operator:  corev1.NodeSelectorOpIn,
+				Values:    []string{v1.CapacityTypeOnDemand, v1.CapacityTypeSpot},
+				MinValues: lo.ToPtr(2),
+			})
+			ExpectSingletonReconciled(ctx, pricingController)
+			applyPackedNode()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotRetryTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotRetryOutcomeArmed,
+			})
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotRetryTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotRetryOutcomeCapacityTypeMinValues,
+			})
 		})
 		It("does not retry a spot candidate", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidation: lo.ToPtr(true)}))

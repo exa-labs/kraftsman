@@ -337,7 +337,10 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// fails: it may still turn the candidate into a replace command.
 	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, replacementPriceBudget, !simOpts.silent && spotRetrySnapshots == nil); !ok {
 		if spotRetrySnapshots != nil {
-			if c.retrySpotOnlyReplacements(candidates, results.NewNodeClaims, spotRetrySnapshots, replacementPriceBudget) {
+			if !simOpts.silent {
+				ObserveConsolidationODToSpotRetry(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
+			}
+			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, replacementPriceBudget) {
 				cmd := Command{
 					Candidates:            candidates,
 					Replacements:          replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -410,7 +413,12 @@ func satisfiesMinValues(r *scheduling.Requirement, n int) bool {
 // and insufficient spot capacity fails the launch rather than falling back to on-demand.
 // It reports whether every claim retained a viable option; claims are mutated only on success
 // being meaningful (callers discard them otherwise).
-func (c *consolidation) retrySpotOnlyReplacements(candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, priceBudget float64) bool {
+func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, priceBudget float64) bool {
+	observeOutcome := func(outcome string) {
+		if !simOpts.silent {
+			ObserveConsolidationODToSpotRetry(consolidationType, candidates, outcome)
+		}
+	}
 	// priceBudget is the aggregate across every replacement claim; a zone or type that is only cheap
 	// relative to the whole budget would get pinned into one claim and inflate its worst-case price
 	// past its share, so the narrowing below uses each claim's equal share. The aggregate filter at
@@ -422,6 +430,7 @@ func (c *consolidation) retrySpotOnlyReplacements(candidates []*Candidate, newNo
 		// an In requirement carrying fewer values than its minValues — pinning below that floor would
 		// produce a command whose launch the API server refuses, so bail to the ordinary skip instead.
 		if !satisfiesMinValues(nc.Requirements.Get(v1.CapacityTypeLabelKey), 1) {
+			observeOutcome(ODToSpotRetryOutcomeCapacityTypeMinValues)
 			return false
 		}
 		nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot))
@@ -438,7 +447,12 @@ func (c *consolidation) retrySpotOnlyReplacements(candidates []*Candidate, newNo
 				break
 			}
 		}
-		if len(zones) == 0 || !satisfiesMinValues(nc.Requirements.Get(corev1.LabelTopologyZone), len(zones)) {
+		if len(zones) == 0 {
+			observeOutcome(ODToSpotRetryOutcomeNoCheapZone)
+			return false
+		}
+		if !satisfiesMinValues(nc.Requirements.Get(corev1.LabelTopologyZone), len(zones)) {
+			observeOutcome(ODToSpotRetryOutcomeZoneMinValues)
 			return false
 		}
 		nc.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zones...))
@@ -451,6 +465,7 @@ func (c *consolidation) retrySpotOnlyReplacements(candidates []*Candidate, newNo
 		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 	if ok, _, _ := c.filterReplacementsAndPublish(newNodeClaims, candidates, priceBudget, false); !ok {
+		observeOutcome(ODToSpotRetryOutcomeAggregatePrice)
 		return false
 	}
 	// The replacement lands on spot; cap its options like spot-to-spot consolidation does so the
@@ -458,6 +473,7 @@ func (c *consolidation) retrySpotOnlyReplacements(candidates []*Candidate, newNo
 	for _, nc := range newNodeClaims {
 		truncateSpotInstanceTypeOptions(nc)
 	}
+	observeOutcome(ODToSpotRetryOutcomeAdmitted)
 	return true
 }
 

@@ -154,6 +154,20 @@ const (
 	SplitOutcomeNoOp                = "no_op"
 	SplitOutcomeError               = "error"
 	SplitOutcomeAttemptCapExhausted = "attempt_cap_exhausted"
+
+	// ODToSpotRetryOutcomeArmed means the ordinary price filter emptied the replacement claims and
+	// started the spot-only repricing retry.
+	ODToSpotRetryOutcomeArmed = "armed"
+	// ODToSpotRetryOutcomeAdmitted means the spot-only repricing retry produced a consolidation command.
+	ODToSpotRetryOutcomeAdmitted = "admitted"
+	// ODToSpotRetryOutcomeCapacityTypeMinValues means pinning capacity type to spot would violate minValues.
+	ODToSpotRetryOutcomeCapacityTypeMinValues = "capacity_type_min_values"
+	// ODToSpotRetryOutcomeNoCheapZone means no spot zone beats the retry's per-claim price budget.
+	ODToSpotRetryOutcomeNoCheapZone = "no_cheap_zone"
+	// ODToSpotRetryOutcomeZoneMinValues means pinning zones to the cheap set would violate minValues.
+	ODToSpotRetryOutcomeZoneMinValues = "zone_min_values"
+	// ODToSpotRetryOutcomeAggregatePrice means the final aggregate price filter rejected the retry.
+	ODToSpotRetryOutcomeAggregatePrice = "aggregate_price"
 )
 
 var (
@@ -476,6 +490,16 @@ var (
 		},
 		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, outcomeLabel},
 	)
+	ConsolidationODToSpotRetryTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_od_to_spot_retries_total",
+			Help:      "Number of on-demand to spot repricing retries by outcome, consolidation type, and NodePool. Counted per candidate, so a retry over a multi-node command records every candidate's NodePool. armed means the ordinary price filter emptied the replacements and started the retry; admitted means the retry produced a command; the rejection outcomes identify the retry constraint that prevented admission.",
+		},
+		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, outcomeLabel},
+	)
 	ConsolidationSplitSecondsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
@@ -647,6 +671,16 @@ func ObserveConsolidationCandidateSkip(consolidationType, nodePool, instanceType
 		metrics.CapacityTypeLabel: orUnknown(capacityType),
 		reasonLabel:               reason,
 	})
+}
+
+func ObserveConsolidationODToSpotRetry(consolidationType string, candidates []*Candidate, outcome string) {
+	for _, candidate := range candidates {
+		ConsolidationODToSpotRetryTotal.Inc(map[string]string{
+			ConsolidationTypeLabel: consolidationType,
+			metrics.NodePoolLabel:  candidate.NodePool.Name,
+			outcomeLabel:           outcome,
+		})
+	}
 }
 
 // observeCandidateSkip records a skip for a candidate, resolving its types.

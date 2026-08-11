@@ -85,7 +85,7 @@ func TestRetrySpotOnlyReplacementsExcludesSpikedZones(t *testing.T) {
 	if ok, reason, _ := c.filterReplacementsAndPublish([]*pscheduling.NodeClaim{nc}, nil, 13.0, false); ok || reason != CandidateSkipNoCheaperSingleReplacement {
 		t.Fatalf("filterReplacementsAndPublish() = (%t, %q), want rejection with %q", ok, reason, CandidateSkipNoCheaperSingleReplacement)
 	}
-	if !c.retrySpotOnlyReplacements(nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
+	if !c.retrySpotOnlyReplacements("", consolidationSimulationOptions{}, nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
 		t.Fatal("expected the spot-only retry to succeed")
 	}
 	if got := nc.Requirements.Get(v1.CapacityTypeLabelKey).Values(); len(got) != 1 || got[0] != v1.CapacityTypeSpot {
@@ -117,7 +117,7 @@ func TestRetrySpotOnlyReplacementsHandlesDisjointCheapZones(t *testing.T) {
 	snapshot := [][]*cloudprovider.InstanceType{append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)}
 
 	c := &consolidation{}
-	if !c.retrySpotOnlyReplacements(nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
+	if !c.retrySpotOnlyReplacements("", consolidationSimulationOptions{}, nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
 		t.Fatal("expected the spot-only retry to succeed")
 	}
 	if got := nc.Requirements.Get(corev1.LabelTopologyZone).Values(); len(got) != 1 || got[0] != "zone-a" {
@@ -149,7 +149,7 @@ func TestRetrySpotOnlyReplacementsUsesPerClaimBudgetForSplits(t *testing.T) {
 	// Aggregate budget 13: zone-b's 12.0 beats it but not the per-claim share of 6.5. If zone-b were
 	// pinned, each claim's worst-case price would be 12.0 and the 24.0 total would fail the final
 	// aggregate filter; anchored on the per-claim share, both land in zone-a at 1.35.
-	if !c.retrySpotOnlyReplacements(nil, []*pscheduling.NodeClaim{nc1, nc2}, snapshots, 13.0) {
+	if !c.retrySpotOnlyReplacements("", consolidationSimulationOptions{}, nil, []*pscheduling.NodeClaim{nc1, nc2}, snapshots, 13.0) {
 		t.Fatal("expected the spot-only retry to succeed for the split")
 	}
 	for _, nc := range []*pscheduling.NodeClaim{nc1, nc2} {
@@ -172,13 +172,13 @@ func TestRetrySpotOnlyReplacementsRespectsMinValues(t *testing.T) {
 	snapshot := [][]*cloudprovider.InstanceType{append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)}
 
 	c := &consolidation{}
-	if c.retrySpotOnlyReplacements(nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
+	if c.retrySpotOnlyReplacements("", consolidationSimulationOptions{}, nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
 		t.Fatal("expected the spot-only retry to bail when pinning would violate the zone minValues")
 	}
 
 	nc = odToSpotNodeClaim(it)
 	nc.Requirements.Add(scheduling.NewRequirementWithFlexibility(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, lo.ToPtr(2), v1.CapacityTypeOnDemand, v1.CapacityTypeSpot))
-	if c.retrySpotOnlyReplacements(nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
+	if c.retrySpotOnlyReplacements("", consolidationSimulationOptions{}, nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
 		t.Fatal("expected the spot-only retry to bail when pinning would violate the capacity type minValues")
 	}
 }
@@ -194,7 +194,7 @@ func TestRetrySpotOnlyReplacementsFailsWithoutCheapSpot(t *testing.T) {
 	snapshot := [][]*cloudprovider.InstanceType{append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)}
 
 	c := &consolidation{}
-	if c.retrySpotOnlyReplacements(nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
+	if c.retrySpotOnlyReplacements("", consolidationSimulationOptions{}, nil, []*pscheduling.NodeClaim{nc}, snapshot, 13.0) {
 		t.Fatal("expected the spot-only retry to fail")
 	}
 }
