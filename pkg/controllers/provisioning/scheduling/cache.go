@@ -40,9 +40,22 @@ type DaemonOverheadCache struct {
 	mu                       sync.RWMutex
 	daemonPodsByKey          map[string][]*corev1.Pod
 	daemonRequestsByKey      map[string]corev1.ResourceList
+	ingredientsByKey         map[string]existingNodeIngredients
 	overheadGroupsByTemplate map[string]overheadGroupsCacheEntry
 	daemonSetGeneration      string
 	daemonSetGenerationValid bool
+}
+
+// existingNodeIngredients holds the candidate-invariant inputs of one ExistingNode. Everything
+// here is a pure function of the node's own state and the daemonset pod set, both covered by the
+// cache key and the daemonset-generation flush; the values pin the view observed at first read for
+// the rest of the pass, like every other pass-scoped cache. taints and available are shared and
+// read-only; remainingBase is deep copied out because scheduling subtracts from an ExistingNode's
+// remaining resources in place.
+type existingNodeIngredients struct {
+	taints        []corev1.Taint
+	available     corev1.ResourceList
+	remainingBase corev1.ResourceList
 }
 
 // overheadGroupsCacheEntry stores the daemon overhead groups computed for one NodeClaimTemplate,
@@ -61,6 +74,7 @@ func NewDaemonOverheadCache() *DaemonOverheadCache {
 	return &DaemonOverheadCache{
 		daemonPodsByKey:          map[string][]*corev1.Pod{},
 		daemonRequestsByKey:      map[string]corev1.ResourceList{},
+		ingredientsByKey:         map[string]existingNodeIngredients{},
 		overheadGroupsByTemplate: map[string]overheadGroupsCacheEntry{},
 	}
 }
@@ -72,6 +86,7 @@ func (c *DaemonOverheadCache) updateDaemonSetGeneration(daemonSetPods []*corev1.
 	if !ok || !c.daemonSetGenerationValid || c.daemonSetGeneration != generation {
 		c.daemonPodsByKey = map[string][]*corev1.Pod{}
 		c.daemonRequestsByKey = map[string]corev1.ResourceList{}
+		c.ingredientsByKey = map[string]existingNodeIngredients{}
 		c.overheadGroupsByTemplate = map[string]overheadGroupsCacheEntry{}
 		c.daemonSetGeneration = generation
 		c.daemonSetGenerationValid = ok
@@ -157,6 +172,31 @@ func (c *DaemonOverheadCache) setDaemonPods(key string, pods []*corev1.Pod) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.daemonPodsByKey[key] = pods
+}
+
+// DropStateDerived flushes the entries that depend on cluster-state pod tracking rather than on
+// the keyed objects alone. An ExistingNode's available and remaining resources move when a pod
+// binds or a command executes, without the node's ResourceVersion moving, so every point that
+// drops the pass's pinned reads to observe churn must drop these too. The daemon pod and request
+// entries survive: they are pure functions of the node object and the daemonset set, both of
+// which the key and the generation flush cover.
+func (c *DaemonOverheadCache) DropStateDerived() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ingredientsByKey = map[string]existingNodeIngredients{}
+}
+
+func (c *DaemonOverheadCache) ingredients(key string) (existingNodeIngredients, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ing, ok := c.ingredientsByKey[key]
+	return ing, ok
+}
+
+func (c *DaemonOverheadCache) setIngredients(key string, ing existingNodeIngredients) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ingredientsByKey[key] = ing
 }
 
 // daemonRequests returns a deep copy of the cached summed daemon resource requests for a node.

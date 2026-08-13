@@ -42,6 +42,9 @@ const (
 	cacheOutcomeMiss   = "miss"
 	cacheOutcomeBypass = "bypass"
 
+	cacheOutcomeShadowMatch    = "shadow_match"
+	cacheOutcomeShadowMismatch = "shadow_mismatch"
+
 	modeLabel = "mode"
 
 	fingerprintModeRevision = "revision"
@@ -203,6 +206,18 @@ var (
 			Subsystem: schedulerSubsystem,
 			Name:      "topology_pass_cache_events_total",
 			Help:      "Number of pass-scoped topology pod list and node lookup cache events by outcome (hit, miss).",
+		},
+		[]string{
+			outcomeLabel,
+		},
+	)
+	TopologyCountCacheEventsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "topology_count_cache_events_total",
+			Help:      "Number of pass-scoped topology group pod domain count cache events by outcome (hit, miss, shadow_match, shadow_mismatch). Any shadow_mismatch means the replayed counts diverged from a fresh scan and the cache must stay off.",
 		},
 		[]string{
 			outcomeLabel,

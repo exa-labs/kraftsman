@@ -39,6 +39,18 @@ const (
 
 type MinValuesPolicy string
 
+// TopologyCountCacheMode controls whether one scheduling pass reuses the per-topology-group pod
+// domain counts across its candidate simulations. "off" scans the cluster's pods for every group
+// of every candidate, "shadow" reuses nothing but computes both and counts divergences, and "on"
+// scans once per group per pass and replays the records for every later candidate.
+type TopologyCountCacheMode string
+
+const (
+	TopologyCountCacheModeOff    TopologyCountCacheMode = "off"
+	TopologyCountCacheModeShadow TopologyCountCacheMode = "shadow"
+	TopologyCountCacheModeOn     TopologyCountCacheMode = "on"
+)
+
 const (
 	MinValuesPolicyStrict     MinValuesPolicy = "Strict"
 	MinValuesPolicyBestEffort MinValuesPolicy = "BestEffort"
@@ -99,6 +111,8 @@ type Options struct {
 	ConsolidationAttributeReplacements bool
 	NodeClaimInitializationTimeout     time.Duration
 	ODToSpotConsolidation              bool
+	topologyCountCacheModeRaw          string
+	TopologyCountCacheMode             TopologyCountCacheMode
 	FeatureGates                       FeatureGates
 }
 
@@ -150,6 +164,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.BoolVarWithEnv(&o.ODToSpotConsolidation, "od-to-spot-consolidation", "OD_TO_SPOT_CONSOLIDATION", false, "When set, a consolidation candidate running on-demand whose replacement found nothing cheaper is re-evaluated against spot offerings only, restricted to the zones whose spot price beats the candidate. The replacement launch is pinned to spot and those zones, so insufficient spot capacity fails the launch instead of falling back to on-demand.")
 	fs.Float64Var(&o.ConsolidationSplitMinSavings, "consolidation-split-min-savings", env.WithDefaultFloat64("CONSOLIDATION_SPLIT_MIN_SAVINGS", 0.05), "The fraction of a candidate's price that a split replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. Guards against churning a node into several nodes for a negligible price difference.")
 	fs.DurationVar(&o.NodeClaimInitializationTimeout, "nodeclaim-initialization-timeout", env.WithDefaultDuration("NODECLAIM_INITIALIZATION_TIMEOUT", 0), "The maximum time a registered NodeClaim may stay uninitialized before it is deleted. Registration only means the kubelet joined; a node whose startup taints are never removed, or whose requested extended resources never appear, stays registered and uninitialized indefinitely, holding an instance that runs no workload and that disruption still models with its full capacity. A bootstrap that fails every time replaces one stranded instance with a delete and reprovision once per timeout, as the registration timeout already does, so set it well above the slowest healthy bootstrap. 0 disables the timeout.")
+	fs.StringVar(&o.topologyCountCacheModeRaw, "topology-count-cache-mode", env.WithDefaultString("TOPOLOGY_COUNT_CACHE_MODE", string(TopologyCountCacheModeOff)), "Whether a scheduling pass reuses each topology group's pod domain counts across its candidate simulations. The counts are a pure function of inputs the pass already pins, so the replay is exact; 'shadow' computes both paths, uses the fresh one, and counts divergences in the topology_count_cache_events_total metric, which is the evidence to collect before switching to 'on'. Can be one of 'off', 'shadow', and 'on'.")
 	fs.BoolVarWithEnv(&o.IgnoreDRARequests, "ignore-dra-requests", "IGNORE_DRA_REQUESTS", true, "When set, Karpenter will ignore pods' DRA requests during scheduling simulations. NOTE: This flag will be removed once formal DRA support is GA in Karpenter.")
 	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", "NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false"), "Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, SpotToSpotConsolidation, NodeOverlay, StaticCapacity, and CapacityBuffer.")
 }
@@ -176,6 +191,9 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if err := o.validateConsolidation(); err != nil {
 		return err
 	}
+	if !lo.Contains([]TopologyCountCacheMode{TopologyCountCacheModeOff, TopologyCountCacheModeShadow, TopologyCountCacheModeOn}, TopologyCountCacheMode(o.topologyCountCacheModeRaw)) {
+		return fmt.Errorf("validating cli flags / env vars, invalid TOPOLOGY_COUNT_CACHE_MODE %q", o.topologyCountCacheModeRaw)
+	}
 	if o.NodeClaimInitializationTimeout < 0 {
 		return fmt.Errorf("validating cli flags / env vars, NODECLAIM_INITIALIZATION_TIMEOUT must be >= 0, got %s", o.NodeClaimInitializationTimeout)
 	}
@@ -186,6 +204,7 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	o.FeatureGates = gates
 	o.PreferencePolicy = PreferencePolicy(o.preferencePolicyRaw)
 	o.MinValuesPolicy = MinValuesPolicy(o.minValuesPolicyRaw)
+	o.TopologyCountCacheMode = TopologyCountCacheMode(o.topologyCountCacheModeRaw)
 	return nil
 }
 
