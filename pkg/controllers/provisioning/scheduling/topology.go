@@ -412,7 +412,7 @@ func scanTopologyPodDomains(ctx context.Context, kubeClient client.Client, tg *T
 	// collect the pods from all the specified namespaces (don't see a way to query multiple namespaces
 	// simultaneously)
 	var pods []corev1.Pod
-	for _, ns := range tg.namespaces.UnsortedList() {
+	for _, ns := range sets.List(tg.namespaces) {
 		nsPods, err := listTopologyPods(ctx, kubeClient, ns, tg.rawSelector)
 		if err != nil {
 			return nil, fmt.Errorf("listing pods, %w", err)
@@ -420,9 +420,17 @@ func scanTopologyPodDomains(ctx context.Context, kubeClient client.Client, tg *T
 		pods = append(pods, nsPods...)
 	}
 
-	// sort our pods by the node they are scheduled to
+	// sort our pods by the node they are scheduled to, with a total-order tiebreak so two scans of
+	// identical cluster state emit identical record sequences (the shadow-mode comparison depends
+	// on that determinism)
 	sort.Slice(pods, func(i, j int) bool {
-		return pods[i].Spec.NodeName < pods[j].Spec.NodeName
+		if pods[i].Spec.NodeName != pods[j].Spec.NodeName {
+			return pods[i].Spec.NodeName < pods[j].Spec.NodeName
+		}
+		if pods[i].Namespace != pods[j].Namespace {
+			return pods[i].Namespace < pods[j].Namespace
+		}
+		return pods[i].Name < pods[j].Name
 	})
 	var previousNode *corev1.Node
 	var previousNodeRequirements scheduling.Requirements

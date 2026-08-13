@@ -41,7 +41,9 @@ type podDomainRecord struct {
 func topologyPodRecords(ctx context.Context, kubeClient client.Client, tg *TopologyGroup) ([]podDomainRecord, error) {
 	mode := karpopts.FromContext(ctx).TopologyCountCacheMode
 	cache := TopologyPassCacheFromContext(ctx)
-	if cache == nil || mode == karpopts.TopologyCountCacheModeOff {
+	// Only the two explicitly requested modes leave the fresh scan; anything else — including an
+	// Options value built without Parse, where the mode is the empty string — fails safe.
+	if cache == nil || (mode != karpopts.TopologyCountCacheModeShadow && mode != karpopts.TopologyCountCacheModeOn) {
 		return scanTopologyPodDomains(ctx, kubeClient, tg)
 	}
 	hash := tg.Hash()
