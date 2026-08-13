@@ -838,11 +838,11 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
 	for _, node := range stateNodes {
-		taints, available, remaining := s.existingNodeIngredients(ctx, node, daemonSetPods)
+		nodeRequirements := labelRequirementsForStateNode(s.nodeRequirementsCache, node)
+		taints, available, remaining := s.existingNodeIngredients(ctx, node, nodeRequirements, daemonSetPods)
 		// isUnderConsolidateAfter depends on the clock, so it is recomputed for every candidate
 		// rather than cached: caching it could pin a consolidateAfter verdict past its expiry.
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
-		nodeRequirements := labelRequirementsForStateNode(s.nodeRequirementsCache, node)
 		existingNodeRequirements := existingNodeRequirementsForStateNode(s.nodeRequirementsCache, node, nodeRequirements)
 		s.existingNodes = append(s.existingNodes, newExistingNodeWithResources(node, s.topology, taints, existingNodeRequirements, available, remaining, s.instanceTypeForNode(node), isUnderConsolidateAfter))
 		s.updateRemainingResources(node)
@@ -857,10 +857,9 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 // flush. taints are shared and read-only across candidates; available and remaining are deep
 // copied out because an ExistingNode's resource lists were always freshly allocated per
 // construction and scheduling subtracts from remaining in place.
-func (s *Scheduler) existingNodeIngredients(ctx context.Context, node *state.StateNode, daemonSetPods []*corev1.Pod) ([]corev1.Taint, corev1.ResourceList, corev1.ResourceList) {
+func (s *Scheduler) existingNodeIngredients(ctx context.Context, node *state.StateNode, nodeRequirements scheduling.Requirements, daemonSetPods []*corev1.Pod) ([]corev1.Taint, corev1.ResourceList, corev1.ResourceList) {
 	build := func() ([]corev1.Taint, corev1.ResourceList, corev1.ResourceList) {
 		taints := node.Taints()
-		nodeRequirements := labelRequirementsForStateNode(s.nodeRequirementsCache, node)
 		daemonRequests := s.getDaemonRequests(ctx, node, taints, nodeRequirements, daemonSetPods)
 		available, remaining := existingNodeResources(node, daemonRequests)
 		return taints, available, remaining
