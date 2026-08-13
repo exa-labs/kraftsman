@@ -18,6 +18,7 @@ package scheduling
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -93,7 +94,7 @@ func listTopologyPods(ctx context.Context, kubeClient client.Client, namespace s
 	// labels.Nothing() (unparseable selector) both stringify to "" and must not share an entry.
 	rawKey := "<nil>"
 	if rawSelector != nil {
-		rawKey = rawSelector.String()
+		rawKey = fmt.Sprintf("%v", rawSelector)
 	}
 	key := strings.Join([]string{namespace, rawKey}, "\x00")
 	cache.mu.Lock()
