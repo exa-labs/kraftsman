@@ -36,6 +36,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 )
 
@@ -49,9 +50,10 @@ type Liveness struct {
 // If we don't see the node within this time, then we should delete the NodeClaim and try again
 
 const (
-	registrationTimeout       = time.Minute * 15
-	registrationTimeoutReason = "registration_timeout"
-	launchTimeoutReason       = "launch_timeout"
+	registrationTimeout         = time.Minute * 15
+	registrationTimeoutReason   = "registration_timeout"
+	launchTimeoutReason         = "launch_timeout"
+	initializationTimeoutReason = "initialization_timeout"
 )
 
 // LaunchTimeout is a heuristic time that we expect to be able to launch within
@@ -62,7 +64,7 @@ var LaunchTimeout = time.Minute * 5
 func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	registered := nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered)
 	if registered.IsTrue() {
-		return reconcile.Result{}, nil
+		return l.reconcileInitializationTimeout(ctx, nodeClaim, registered)
 	}
 	launched := nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched)
 	if launched == nil {
@@ -106,6 +108,37 @@ func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reco
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
+	}
+	return reconcile.Result{}, nil
+}
+
+// reconcileInitializationTimeout deletes a NodeClaim whose node registered but never initialized. Registration only
+// means the kubelet joined; initialization additionally waits for the node to go Ready, for its startup taints to be
+// removed, and for its requested extended resources to be registered. A bootstrap DaemonSet that never converges
+// leaves the NodeClaim registered and uninitialized forever: it holds an instance we pay for, it runs no workload,
+// and the scheduler still models it with its full instance type capacity, so disruption keeps simulating pods onto a
+// node it can never act on.
+func (l *Liveness) reconcileInitializationTimeout(ctx context.Context, nodeClaim *v1.NodeClaim, registered *status.Condition) (reconcile.Result, error) {
+	initializationTimeout := options.FromContext(ctx).NodeClaimInitializationTimeout
+	if initializationTimeout <= 0 {
+		return reconcile.Result{}, nil
+	}
+	if nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() {
+		return reconcile.Result{}, nil
+	}
+	// The clock is measured from the registration transition rather than the NodeClaim's creation so that a slow launch
+	// or a slow registration doesn't eat into the time a node gets to initialize.
+	if registered.LastTransitionTime.IsZero() {
+		return reconcile.Result{Requeue: true}, nil
+	}
+	// NOTE: Timeout has to be stored and checked in the same place since l.clock can advance after the check causing a race
+	if timeUntilTimeout := initializationTimeout - l.clock.Since(registered.LastTransitionTime.Time); timeUntilTimeout > 0 {
+		return reconcile.Result{RequeueAfter: timeUntilTimeout}, nil
+	}
+	if err := l.deleteNodeClaimForTimeout(ctx, initializationTimeout, initializationTimeoutReason, nodeClaim); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			return reconcile.Result{}, err
+		}
 	}
 	return reconcile.Result{}, nil
 }

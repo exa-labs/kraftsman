@@ -25,6 +25,7 @@ import (
 	operatorpkg "github.com/awslabs/operatorpkg/test/expectations"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +33,8 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -448,5 +451,111 @@ var _ = Describe("Liveness", func() {
 		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionUnknown})
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
+	})
+	Context("InitializationTimeout", func() {
+		// registeredUninitializedNodeClaim drives a NodeClaim to Registered=True with a startup taint its node never
+		// loses, which is what a bootstrap DaemonSet that never converges leaves behind.
+		registeredUninitializedNodeClaim := func() *v1.NodeClaim {
+			nodeClaim := test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey: nodePool.Name,
+					},
+				},
+				Spec: v1.NodeClaimSpec{
+					StartupTaints: []corev1.Taint{{Key: "example.com/bootstrap", Effect: corev1.TaintEffectNoSchedule}},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+
+			node := test.NodeClaimLinkedNode(nodeClaim)
+			ExpectApplied(ctx, env.Client, node)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectMakeNodesReady(ctx, env.Client, env.Clock, node)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue()).To(BeTrue())
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeFalse())
+			return nodeClaim
+		}
+		It("should delete a registered NodeClaim that never initializes past the initialization timeout", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{NodeClaimInitializationTimeout: lo.ToPtr(time.Hour)}))
+			DeferCleanup(func() { ctx = options.ToContext(ctx, test.Options()) })
+			metrics.NodeClaimsDisruptedTotal.Reset()
+			nodeClaim := registeredUninitializedNodeClaim()
+
+			// Before the timeout the NodeClaim is kept, and the reconcile asks to be retried when it expires
+			env.Clock.Step(30 * time.Minute)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter > 0 && result.RequeueAfter <= time.Hour).To(BeTrue())
+			ExpectExists(ctx, env.Client, nodeClaim)
+
+			env.Clock.Step(31 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel:   "initialization_timeout",
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+		})
+		It("shouldn't delete a registered NodeClaim that never initializes when the timeout is disabled", func() {
+			nodeClaim := registeredUninitializedNodeClaim()
+
+			env.Clock.Step(24 * time.Hour)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter).To(Equal(time.Duration(0)))
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+		It("shouldn't delete an initialized NodeClaim past the initialization timeout", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{NodeClaimInitializationTimeout: lo.ToPtr(time.Hour)}))
+			DeferCleanup(func() { ctx = options.ToContext(ctx, test.Options()) })
+			nodeClaim := test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey: nodePool.Name,
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+
+			node := test.NodeClaimLinkedNode(nodeClaim)
+			ExpectApplied(ctx, env.Client, node)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectMakeNodesReady(ctx, env.Client, env.Clock, node)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+
+			env.Clock.Step(2 * time.Hour)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectExists(ctx, env.Client, node)
+		})
+		It("should measure the initialization timeout from registration, not from the NodeClaim's creation", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{NodeClaimInitializationTimeout: lo.ToPtr(time.Hour)}))
+			DeferCleanup(func() { ctx = options.ToContext(ctx, test.Options()) })
+			nodeClaim := registeredUninitializedNodeClaim()
+
+			conditions := nodeClaim.Status.Conditions
+			newConditions := make([]status.Condition, len(conditions))
+			for i, condition := range conditions {
+				condition.LastTransitionTime = metav1.NewTime(env.Clock.Now().Add(50 * time.Minute))
+				newConditions[i] = condition
+			}
+			nodeClaim.Status.Conditions = newConditions
+			ExpectApplied(ctx, env.Client, nodeClaim)
+
+			// The NodeClaim is now older than the timeout, but its registration transitioned 20 minutes ago
+			env.Clock.Step(70 * time.Minute)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter > 0).To(BeTrue())
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
 	})
 })
