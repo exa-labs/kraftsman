@@ -46,15 +46,18 @@ import (
 type Topology struct {
 	kubeClient       client.Client
 	preferencePolicy PreferencePolicy
-	// Both the topologyGroups and inverseTopologies are maps of the hash from TopologyGroup.Hash() to the topology group
-	// itself. This is used to allow us to store one topology group that tracks the topology of many pods instead of
-	// having a 1<->1 mapping between topology groups and pods owned/selected by that group.
+	// topologyGroups is a map of the hash from TopologyGroup.Hash() to the topology group itself.
+	// This is used to allow us to store one topology group that tracks the topology of many pods
+	// instead of having a 1<->1 mapping between topology groups and pods owned/selected by that group.
 	topologyGroups map[uint64]*TopologyGroup
 	// Anti-affinity works both ways (if a zone has a pod foo with anti-affinity to a pod bar, we can't schedule bar to
 	// that zone, even though bar has no anti affinity terms on it. For this to work, we need to separately track the
 	// topologies of pods with anti-affinity terms, so we can prevent scheduling the pods they have anti-affinity to
 	// in some cases.
-	inverseTopologyGroups map[uint64]*TopologyGroup
+	// inverseTopologyGroups is keyed by inverseTopologyGroupKey rather than TopologyGroup.Hash:
+	// the canonical key groups identically to the hash but is computable from the anti-affinity
+	// term alone, so a group only needs to be constructed the first time its key is seen.
+	inverseTopologyGroups map[string]*TopologyGroup
 	// The universe of domains by topology key
 	domainGroups map[string]TopologyDomainGroup
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
@@ -81,7 +84,7 @@ func NewTopology(
 		stateNodes:            stateNodes,
 		domainGroups:          domainGroupsWithCache(ctx, nodePools, instanceTypes),
 		topologyGroups:        map[uint64]*TopologyGroup{},
-		inverseTopologyGroups: map[uint64]*TopologyGroup{},
+		inverseTopologyGroups: map[string]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
 	}
 
@@ -333,19 +336,15 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 	// required to enforce them so it just adds complexity for very little
 	// value.  The problem with them comes from the relaxation process, the pod
 	// we are relaxing is not the pod with the anti-affinity term.
-	for _, term := range pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-		namespaces, err := t.buildNamespaceList(ctx, pod.Namespace, term.Namespaces, term.NamespaceSelector)
+	for i, term := range pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		groupKey, namespaces, err := t.inverseGroupKeyAndNamespaces(ctx, pod, i, term)
 		if err != nil {
 			return err
 		}
-
-		tg := NewTopologyGroup(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey])
-
-		hash := tg.Hash()
-		if existing, ok := t.inverseTopologyGroups[hash]; !ok {
-			t.inverseTopologyGroups[hash] = tg
-		} else {
-			tg = existing
+		tg, ok := t.inverseTopologyGroups[groupKey]
+		if !ok {
+			tg = NewTopologyGroup(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey])
+			t.inverseTopologyGroups[groupKey] = tg
 		}
 		if domain, ok := domains[tg.Key]; ok {
 			tg.Record(domain)

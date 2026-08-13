@@ -2722,6 +2722,138 @@ var _ = Describe("Consolidation", func() {
 			Expect(ok).To(BeTrue())
 		})
 	})
+	Context("OD to spot retry", func() {
+		var currentInstance *cloudprovider.InstanceType
+		var rs *appsv1.ReplicaSet
+		BeforeEach(func() {
+			// the candidate's own type is the only feasible single replacement, and the worst spot
+			// offering across the claim's zones is above the on-demand price - the ordinary filter
+			// empties the replacement, which is the case the spot-only retry exists for
+			currentInstance = fake.NewInstanceType("od-current",
+				fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("32"), corev1.ResourcePods: resource.MustParse("10")}),
+				fake.WithOfferings(
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
+						Price:        13.0,
+					},
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1a"}),
+						Price:        1.35,
+					},
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1b"}),
+						Price:        19.5,
+					},
+				),
+			)
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{currentInstance}
+			ExpectSingletonReconciled(ctx, pricingController)
+
+			rs = test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+
+			nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: currentInstance.Name,
+						v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+						corev1.LabelTopologyZone:       "test-zone-1a",
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32"), corev1.ResourcePods: resource.MustParse("10")},
+				},
+			})
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		})
+		applyPackedNode := func() {
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}},
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("20")},
+				},
+			})
+			ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, nodePool)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		}
+		It("leaves the node alone while the retry is disabled", func() {
+			applyPackedNode()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+		It("replaces an on-demand node with a spot node pinned to the cheap zones", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidation: lo.ToPtr(true)}))
+			applyPackedNode()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+
+			nodeClaims := ExpectNodeClaims(ctx, env.Client)
+			Expect(nodeClaims).To(HaveLen(1))
+			Expect(nodeClaims[0].Name).ToNot(Equal(nodeClaim.Name))
+			reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...)
+			// priced against the cheap spot zone only, so the launch must be pinned to spot and that zone
+			Expect(reqs.Get(v1.CapacityTypeLabelKey).Values()).To(ConsistOf(v1.CapacityTypeSpot))
+			Expect(reqs.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("test-zone-1a"))
+			ExpectNotFound(ctx, env.Client, nodeClaim, node)
+		})
+		It("still reports the skip when every spot offering is above the budget", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidation: lo.ToPtr(true)}))
+			for _, o := range currentInstance.Offerings {
+				if o.CapacityType() == v1.CapacityTypeSpot {
+					o.Price = 19.5
+				}
+			}
+			ExpectSingletonReconciled(ctx, pricingController)
+			applyPackedNode()
+			recorder.Reset()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectExists(ctx, env.Client, nodeClaim)
+			evt, ok := lo.Find(recorder.Events(), func(e events.Event) bool {
+				return strings.Contains(e.Message, "Can't replace with a cheaper node")
+			})
+			Expect(ok).To(BeTrue())
+			// The event names the offering the price comparison was made against, making it auditable
+			// that the priced capacity type was spot (not on-demand) and which zone set the worst case.
+			Expect(evt.Message).To(ContainSubstring("prices worst-case at"))
+			Expect(evt.Message).To(ContainSubstring("for spot in"))
+		})
+		It("does not retry a spot candidate", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidation: lo.ToPtr(true)}))
+			nodeClaim.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeSpot
+			node.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeSpot
+			applyPackedNode()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+	})
 	Context("Split fallback", func() {
 		var currentInstance, mediumInstance *cloudprovider.InstanceType
 		var rs *appsv1.ReplicaSet

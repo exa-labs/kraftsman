@@ -58,6 +58,7 @@ type OptionsFields struct {
 	ConsolidationCandidateTimeout      *time.Duration
 	ConsolidationAttributeReplacements *bool
 	NodeClaimInitializationTimeout     *time.Duration
+	ODToSpotConsolidation              *bool
 	FeatureGates                       FeatureGates
 }
 
@@ -109,6 +110,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		ConsolidationCandidateTimeout:      lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
 		ConsolidationAttributeReplacements: lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
 		NodeClaimInitializationTimeout:     lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
+		ODToSpotConsolidation:              lo.FromPtrOr(opts.ODToSpotConsolidation, false),
 		FeatureGates: options.FeatureGates{
 			NodeRepair:              lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),
 			ReservedCapacity:        lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, true),

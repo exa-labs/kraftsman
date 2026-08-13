@@ -101,7 +101,7 @@ func TestFilterReplacementsAndPublishSkipReasons(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &consolidation{}
-			ok, reason := c.filterReplacementsAndPublish(tc.newNodeClaims, nil, tc.candidatePrice, false)
+			ok, reason, _ := c.filterReplacementsAndPublish(tc.newNodeClaims, nil, tc.candidatePrice, false)
 			if ok {
 				t.Fatalf("expected the replacements to be rejected")
 			}
@@ -115,7 +115,7 @@ func TestFilterReplacementsAndPublishSkipReasons(t *testing.T) {
 func TestFilterReplacementsAndPublishKeepsCheaperOptions(t *testing.T) {
 	c := &consolidation{}
 	nc := priceFilterNodeClaim(1, priceFilterInstanceType("cheap", 0.2))
-	ok, reason := c.filterReplacementsAndPublish([]*pscheduling.NodeClaim{nc}, nil, 1.0, false)
+	ok, reason, _ := c.filterReplacementsAndPublish([]*pscheduling.NodeClaim{nc}, nil, 1.0, false)
 	if !ok || reason != "" {
 		t.Fatalf("filterReplacementsAndPublish() = (%t, %q), want (true, \"\")", ok, reason)
 	}

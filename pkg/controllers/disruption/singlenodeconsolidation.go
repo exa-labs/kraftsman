@@ -90,6 +90,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	ctx = scheduling.WithReservationCapacityCache(ctx, scheduling.NewReservationCapacityCache())
 	ctx = scheduling.WithNodeClaimTemplateCache(ctx, scheduling.NewNodeClaimTemplateCache())
 	ctx = scheduling.WithTopologyPassCache(ctx, scheduling.NewTopologyPassCache())
+	ctx = scheduling.WithInverseAffinityCache(ctx, scheduling.NewInverseAffinityCache())
 	ctx = WithSplitAttemptBudget(ctx, NewSplitAttemptBudget(options.FromContext(ctx).ConsolidationSplitMaxAttempts))
 	ctx = WithPassReads(ctx, NewPassReads())
 	depth := 0
@@ -296,6 +297,7 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 			// this one moved pods and launched replacements, so drop them here as well: this
 			// proposal has to be judged against the cluster those commands left behind.
 			ctx = scheduling.WithTopologyPassCache(ctx, scheduling.NewTopologyPassCache())
+			ctx = scheduling.WithInverseAffinityCache(ctx, scheduling.NewInverseAffinityCache())
 			ctx = WithPassReads(ctx, NewPassReads())
 		}
 		_, err := s.validator.Validate(ctx, proposal.cmd, validationDelay)

@@ -58,6 +58,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	ctx = scheduling.WithReservationCapacityCache(ctx, scheduling.NewReservationCapacityCache())
 	ctx = scheduling.WithNodeClaimTemplateCache(ctx, scheduling.NewNodeClaimTemplateCache())
 	ctx = scheduling.WithTopologyPassCache(ctx, scheduling.NewTopologyPassCache())
+	ctx = scheduling.WithInverseAffinityCache(ctx, scheduling.NewInverseAffinityCache())
 	ctx = WithPassReads(ctx, NewPassReads())
 	// Depth is the deepest batch actually attempted, so passes that do not
 	// reach simulation (for example, budget-constrained passes) report zero.

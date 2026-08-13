@@ -344,24 +344,35 @@ func (i *InstanceType) Allocatable() corev1.ResourceList {
 }
 
 func (its InstanceTypes) OrderByPrice(reqs scheduling.Requirements) InstanceTypes {
-	// Order instance types so that we get the cheapest instance types of the available offerings
-	sort.Slice(its, func(i, j int) bool {
-		iPrice := math.MaxFloat64
-		jPrice := math.MaxFloat64
-
-		for _, of := range its[i].Offerings {
-			if of.Available && reqs.IsCompatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) && of.Price < iPrice {
-				iPrice = of.Price
+	// Order instance types so that we get the cheapest instance types of the available offerings.
+	// The minimum compatible offering price for each instance type is computed once up front rather
+	// than inside the sort comparator, where it would be recomputed O(n log n) times per sort.
+	prices := make([]float64, len(its))
+	for i, it := range its {
+		price := math.MaxFloat64
+		for _, of := range it.Offerings {
+			if of.Available && of.Price < price && reqs.IsCompatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
+				price = of.Price
 			}
 		}
-		for _, of := range its[j].Offerings {
-			if of.Available && reqs.IsCompatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) && of.Price < jPrice {
-				jPrice = of.Price
-			}
-		}
-		return iPrice < jPrice
-	})
+		prices[i] = price
+	}
+	sort.Sort(&instanceTypesByPrice{instanceTypes: its, prices: prices})
 	return its
+}
+
+// instanceTypesByPrice sorts instance types by a precomputed price key, keeping the two slices in
+// lockstep. Ties keep no particular order, matching the previous sort.Slice behavior.
+type instanceTypesByPrice struct {
+	instanceTypes InstanceTypes
+	prices        []float64
+}
+
+func (s *instanceTypesByPrice) Len() int           { return len(s.instanceTypes) }
+func (s *instanceTypesByPrice) Less(i, j int) bool { return s.prices[i] < s.prices[j] }
+func (s *instanceTypesByPrice) Swap(i, j int) {
+	s.instanceTypes[i], s.instanceTypes[j] = s.instanceTypes[j], s.instanceTypes[i]
+	s.prices[i], s.prices[j] = s.prices[j], s.prices[i]
 }
 
 // Compatible returns the list of instanceTypes based on the supported capacityType and zones in the requirements
@@ -593,7 +604,11 @@ func (ofs Offerings) MostExpensive() *Offering {
 
 // WorstLaunchPrice gets the worst-case launch price from the offerings that are offered on an instance type. Only
 // offerings for the capacity type we will launch with are considered. The following precedence order is used to
-// determine which capacity type is used: reserved, spot, on-demand.
+// determine which capacity type is used: reserved, spot, on-demand. Because only the single preferred capacity
+// type's offerings are priced, a claim that allows both spot and on-demand is priced against its spot offerings
+// only — the on-demand prices never enter the comparison. The worst case is instead the most expensive compatible
+// offering of that capacity type across every zone the requirements allow, so a single price-spiked spot zone can
+// dominate the result.
 func (ofs Offerings) WorstLaunchPrice(reqs scheduling.Requirements) float64 {
 	for _, ctReqs := range []scheduling.Requirements{
 		ReservedRequirement,

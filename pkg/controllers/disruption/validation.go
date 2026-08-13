@@ -213,6 +213,9 @@ func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, valid
 		if scheduling.TopologyPassCacheFromContext(ctx) != nil {
 			ctx = scheduling.WithTopologyPassCache(ctx, scheduling.NewTopologyPassCache())
 		}
+		if scheduling.InverseAffinityCacheFromContext(ctx) != nil {
+			ctx = scheduling.WithInverseAffinityCache(ctx, scheduling.NewInverseAffinityCache())
+		}
 		if PassReadsFromContext(ctx) != nil {
 			ctx = WithPassReads(ctx, NewPassReads())
 		}

@@ -95,6 +95,7 @@ func (c *CensusController) Reconcile(ctx context.Context) (reconciler.Result, er
 	ctx = scheduling.WithNodeRequirementsCache(ctx, scheduling.NewNodeRequirementsCache())
 	ctx = scheduling.WithReservationCapacityCache(ctx, scheduling.NewReservationCapacityCache())
 	ctx = scheduling.WithNodeClaimTemplateCache(ctx, scheduling.NewNodeClaimTemplateCache())
+	ctx = scheduling.WithInverseAffinityCache(ctx, scheduling.NewInverseAffinityCache())
 	// One split retry per candidate, unlike the real pass's fixed cap: the census exists to count
 	// every actionable node, and capping retries would report candidates the pass would split as
 	// non-actionable. CensusSweepTimeout still bounds what the extra simulations can cost.

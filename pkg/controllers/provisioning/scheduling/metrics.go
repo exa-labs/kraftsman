@@ -184,6 +184,18 @@ var (
 			outcomeLabel,
 		},
 	)
+	InverseAffinityCacheEventsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "inverse_affinity_cache_events_total",
+			Help:      "Number of pass-scoped inverse anti-affinity term cache lookups by outcome (hit, miss, bypass).",
+		},
+		[]string{
+			outcomeLabel,
+		},
+	)
 	TopologyPassCacheEventsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
