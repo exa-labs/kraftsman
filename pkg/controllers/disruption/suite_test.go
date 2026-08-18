@@ -175,6 +175,7 @@ var _ = AfterEach(func() {
 	// Reset the metrics collectors
 	disruption.DecisionsPerformedTotal.Reset()
 	disruption.NodepoolDecisionsPerformed.Reset()
+	disruption.ConsolidationODToSpotRetryTotal.Reset()
 })
 
 var _ = Describe("Simulate Scheduling", func() {
