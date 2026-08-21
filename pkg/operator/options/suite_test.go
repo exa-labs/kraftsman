@@ -65,6 +65,7 @@ var _ = Describe("Options", func() {
 		"PREFERENCE_POLICY",
 		"MIN_VALUES_POLICY",
 		"FEATURE_GATES",
+		"OD_TO_SPOT_CONSOLIDATION",
 	}
 
 	BeforeEach(func() {
@@ -309,6 +310,26 @@ var _ = Describe("Options", func() {
 				},
 				IgnoreDRARequests: new(true),
 			}))
+		})
+
+		It("should default od-to-spot-consolidation to true", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ODToSpotConsolidation).To(BeTrue())
+		})
+
+		It("should opt out of od-to-spot-consolidation via the environment variable", func() {
+			os.Setenv("OD_TO_SPOT_CONSOLIDATION", "false")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ODToSpotConsolidation).To(BeFalse())
+		})
+
+		It("should opt out of od-to-spot-consolidation via the CLI flag", func() {
+			Expect(opts.Parse(fs, "--od-to-spot-consolidation=false")).To(Succeed())
+			Expect(opts.ODToSpotConsolidation).To(BeFalse())
 		})
 
 		DescribeTable(
