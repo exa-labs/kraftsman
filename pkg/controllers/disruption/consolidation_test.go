@@ -1349,6 +1349,109 @@ var _ = Describe("Consolidation", func() {
 			// and delete the old one
 			ExpectNotFound(ctx, env.Client, spotNodeClaim, spotNode)
 		})
+		It("caps the launch to the cheapest spot types in a mixed-capacity NodePool", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				SpotToSpotMinInstanceTypes: lo.ToPtr(1),
+				FeatureGates:               test.FeatureGates{SpotToSpotConsolidation: new(true)},
+			}))
+			// odCheap sorts first under mixed-capacity pricing (on-demand $1) but is the pricier spot
+			// type ($10); spotCheap is the cheapest spot type ($2). The launch cap must be taken from
+			// the spot-only price order, otherwise the replacement launches odCheap's spot offering and
+			// is immediately consolidatable again into spotCheap.
+			odCheap := fake.NewInstanceType("od-cheap-spot-pricey",
+				fake.WithOfferings(
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-2"}),
+						Price:        1.0,
+					},
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-2"}),
+						Price:        10.0,
+					},
+				),
+			)
+			spotCheap := fake.NewInstanceType("spot-cheapest",
+				fake.WithOfferings(
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-2"}),
+						Price:        2.0,
+					},
+				),
+			)
+			currentSpot := fake.NewInstanceType("current-spot",
+				fake.WithOfferings(
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-2"}),
+						Price:        20.0,
+					},
+				),
+			)
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{odCheap, spotCheap, currentSpot}
+
+			spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: currentSpot.Name,
+				v1.CapacityTypeLabelKey:        v1.CapacityTypeSpot,
+				corev1.LabelTopologyZone:       "test-zone-2",
+			})
+			spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: currentSpot.Name,
+				v1.CapacityTypeLabelKey:        v1.CapacityTypeSpot,
+				corev1.LabelTopologyZone:       "test-zone-2",
+			})
+
+			ExpectSingletonReconciled(ctx, pricingController)
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}}})
+			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
+
+			// bind pods to node
+			ExpectManualBinding(ctx, env.Client, pod, spotNode)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{spotNode}, []*v1.NodeClaim{spotNodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			// Process the item so that the nodes can be deleted.
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			// Cascade any deletion of the nodeclaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
+
+			nodeClaims := ExpectNodeClaims(ctx, env.Client)
+			Expect(nodeClaims).To(HaveLen(1))
+			Expect(nodeClaims[0].Name).ToNot(Equal(spotNodeClaim.Name))
+
+			// The launch must pin the cheapest spot type, not the type that sorts first under
+			// mixed-capacity pricing: nothing spot-cheaper than the launched type may remain, so the
+			// replacement cannot be consolidated again on the next pass.
+			launchTypes := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).Values()
+			Expect(launchTypes).To(Equal([]string{spotCheap.Name}))
+
+			// and delete the old one
+			ExpectNotFound(ctx, env.Client, spotNodeClaim, spotNode)
+		})
 		It("cannot replace spot with spot if the spotToSpotConsolidation is disabled", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{SpotToSpotConsolidation: new(false)}}))
 			// create our RS so we can link a pod to it

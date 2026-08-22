@@ -519,6 +519,10 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot))
 		// All possible replacements for the current candidate compatible with spot offerings
 		nc.InstanceTypeOptions = nc.InstanceTypeOptions.Compatible(nc.Requirements)
+		// The earlier price ordering ran before the spot requirement existed, so in a mixed-capacity
+		// NodePool it may reflect on-demand offering prices. Re-order under the spot-only requirements
+		// so the price filter and launch truncation below operate on the cheapest *spot* types.
+		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 
 	// filterByPrice returns the instanceTypes that are lower priced than the current candidate and any error that indicates the input couldn't be filtered.
