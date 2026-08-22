@@ -1339,6 +1339,13 @@ var _ = Describe("Consolidation", func() {
 			Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Has(corev1.LabelInstanceTypeStable)).To(BeTrue())
 			Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).Has(mostExpSpotInstance.Name)).To(BeFalse())
 
+			// The launch options are capped to the configured minimum, so with a minimum of 1 the
+			// replacement may only launch the single cheapest type: whatever launches is inside the
+			// priced set and can never be consolidated again by the next pass.
+			launchTypes := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).Values()
+			Expect(launchTypes).To(HaveLen(1))
+			Expect(launchTypes[0]).To(Equal(spotInstances[0].Name))
+
 			// and delete the old one
 			ExpectNotFound(ctx, env.Client, spotNodeClaim, spotNode)
 		})
