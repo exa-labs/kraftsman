@@ -66,6 +66,7 @@ var _ = Describe("Options", func() {
 		"MIN_VALUES_POLICY",
 		"FEATURE_GATES",
 		"OD_TO_SPOT_CONSOLIDATION",
+		"SPOT_TO_SPOT_MIN_INSTANCE_TYPES",
 	}
 
 	BeforeEach(func() {
@@ -330,6 +331,30 @@ var _ = Describe("Options", func() {
 		It("should opt out of od-to-spot-consolidation via the CLI flag", func() {
 			Expect(opts.Parse(fs, "--od-to-spot-consolidation=false")).To(Succeed())
 			Expect(opts.ODToSpotConsolidation).To(BeFalse())
+		})
+
+		It("should default spot-to-spot-min-instance-types to 15", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.SpotToSpotMinInstanceTypes).To(Equal(15))
+		})
+
+		It("should set spot-to-spot-min-instance-types via the environment variable", func() {
+			os.Setenv("SPOT_TO_SPOT_MIN_INSTANCE_TYPES", "1")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.SpotToSpotMinInstanceTypes).To(Equal(1))
+		})
+
+		It("should set spot-to-spot-min-instance-types via the CLI flag", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-min-instance-types=3")).To(Succeed())
+			Expect(opts.SpotToSpotMinInstanceTypes).To(Equal(3))
+		})
+
+		It("should fail validation when spot-to-spot-min-instance-types is below 1", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-min-instance-types=0")).ToNot(Succeed())
 		})
 
 		DescribeTable(

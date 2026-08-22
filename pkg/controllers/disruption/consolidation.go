@@ -57,7 +57,13 @@ func consolidationTypeFromContext(ctx context.Context) string {
 // commandValidationDelay is the time we wait between creating a consolidation command and validating that it still works.
 const commandValidationDelay = 15 * time.Second
 
-// MinInstanceTypesForSpotToSpotConsolidation is the minimum number of instanceTypes in a NodeClaim needed to trigger spot-to-spot single-node consolidation
+// MinInstanceTypesForSpotToSpotConsolidation is the default minimum number of instanceTypes in a
+// NodeClaim needed to trigger spot-to-spot single-node consolidation, and the default cap on how
+// many options a spot replacement launches from. The minimum is configurable per deployment
+// (SPOT_TO_SPOT_MIN_INSTANCE_TYPES) because a workload pinned to one small instance family can
+// never present 15 cheaper types; the launch cap follows the configured minimum so the launched
+// type is always within the set consolidation priced against and is never immediately
+// re-consolidatable, whatever the minimum is.
 const MinInstanceTypesForSpotToSpotConsolidation = 15
 
 // consolidation provides common functionality for single-node and multi-node consolidation.
@@ -340,7 +346,7 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 			if !simOpts.silent {
 				ObserveConsolidationODToSpotRetry(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
 			}
-			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, replacementPriceBudget) {
+			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, replacementPriceBudget, options.FromContext(ctx).SpotToSpotMinInstanceTypes) {
 				cmd := Command{
 					Candidates:            candidates,
 					Replacements:          replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -413,7 +419,7 @@ func satisfiesMinValues(r *scheduling.Requirement, n int) bool {
 // and insufficient spot capacity fails the launch rather than falling back to on-demand.
 // It reports whether every claim retained a viable option; claims are mutated only on success
 // being meaningful (callers discard them otherwise).
-func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, priceBudget float64) bool {
+func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, priceBudget float64, spotLaunchCap int) bool {
 	observeOutcome := func(outcome string) {
 		if !simOpts.silent {
 			ObserveConsolidationODToSpotRetry(consolidationType, candidates, outcome)
@@ -471,7 +477,7 @@ func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simO
 	// The replacement lands on spot; cap its options like spot-to-spot consolidation does so the
 	// launched type is within the priced set and doesn't churn straight back into consolidation.
 	for _, nc := range newNodeClaims {
-		truncateSpotInstanceTypeOptions(nc)
+		truncateSpotInstanceTypeOptions(nc, spotLaunchCap)
 	}
 	observeOutcome(ODToSpotRetryOutcomeAdmitted)
 	return true
@@ -513,6 +519,10 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot))
 		// All possible replacements for the current candidate compatible with spot offerings
 		nc.InstanceTypeOptions = nc.InstanceTypeOptions.Compatible(nc.Requirements)
+		// The earlier price ordering ran before the spot requirement existed, so in a mixed-capacity
+		// NodePool it may reflect on-demand offering prices. Re-order under the spot-only requirements
+		// so the price filter and launch truncation below operate on the cheapest *spot* types.
+		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 
 	// filterByPrice returns the instanceTypes that are lower priced than the current candidate and any error that indicates the input couldn't be filtered.
@@ -539,27 +549,29 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	// We check whether we have 15 cheaper instances than the current candidate instance. If this is the case, we know the following things:
 	//   1) The current candidate is not in the set of the 15 cheapest instance types and
 	//   2) There were at least 15 options cheaper than the current candidate.
+	minInstanceTypes := options.FromContext(ctx).SpotToSpotMinInstanceTypes
 	for _, nc := range results.NewNodeClaims {
-		if len(nc.InstanceTypeOptions) < MinInstanceTypesForSpotToSpotConsolidation {
+		if len(nc.InstanceTypeOptions) < minInstanceTypes {
 			if publishEvents {
 				c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("SpotToSpotConsolidation requires %d cheaper instance type options than the current candidate to consolidate, got %d",
-					MinInstanceTypesForSpotToSpotConsolidation, len(nc.InstanceTypeOptions)))...)
+					minInstanceTypes, len(nc.InstanceTypeOptions)))...)
 			}
 			return Command{}, CandidateSkipSpotToSpotFlexibility, nil
 		}
 	}
 
 	// If a user has minValues set in their NodePool requirements, then we cap the number of instancetypes at 100 which would be the actual number of instancetypes sent for launch to enable spot-to-spot consolidation.
-	// If no minValues in the NodePool requirement, then we follow the default 15 to cap the instance types for launch to enable a spot-to-spot consolidation.
-	// Restrict the InstanceTypeOptions for launch to 15(if default) so we don't get into a continual consolidation situation.
+	// If no minValues in the NodePool requirement, then we follow the configured minimum (default 15) to cap the instance types for launch to enable a spot-to-spot consolidation.
+	// Restrict the InstanceTypeOptions for launch to the configured minimum so we don't get into a continual consolidation situation.
 	// For example:
 	// 1) Suppose we have 5 instance types, (A, B, C, D, E) in order of price with the minimum flexibility 3 and they’ll all work for our pod.  We send CreateInstanceFromTypes(A,B,C,D,E) and it gives us a E type based on price and availability of spot.
 	// 2) We check if E is part of (A,B,C,D) and it isn't, so we will immediately have consolidation send a CreateInstanceFromTypes(A,B,C,D), since they’re cheaper than E.
 	// 3) Assuming CreateInstanceFromTypes(A,B,C,D) returned D, we check if D is part of (A,B,C) and it isn't, so will have another consolidation send a CreateInstanceFromTypes(A,B,C), since they’re cheaper than D resulting in continual consolidation.
 	// If we had restricted instance types to min flexibility at launch at step (1) i.e CreateInstanceFromTypes(A,B,C), we would have received the instance type part of the list preventing immediate consolidation.
-	// Taking this to 15 types, we need to only send the 15 cheapest types in the CreateInstanceFromTypes call so that the resulting instance is always in that set of 15 and we won’t immediately consolidate.
+	// The launch cap therefore follows the same configured minimum as the flexibility gate above: the launched
+	// instance is always within the cheapest set of that size, so it can never be immediately consolidated again.
 	for _, nc := range results.NewNodeClaims {
-		truncateSpotInstanceTypeOptions(nc)
+		truncateSpotInstanceTypeOptions(nc, minInstanceTypes)
 	}
 
 	cmd := Command{
@@ -673,16 +685,18 @@ func (c *consolidation) publishReplacementSkip(newNodeClaims []*pscheduling.Node
 	c.publishCantReplace(newNodeClaims, candidates, publishEvents, priceDetail)
 }
 
-// truncateSpotInstanceTypeOptions caps a replacement NodeClaim's instance type options to the 15 cheapest (or the
-// minimum required to satisfy minValues, if greater) so the launched instance is always within the set consolidation
-// priced against, preventing continual spot-to-spot consolidation churn.
-func truncateSpotInstanceTypeOptions(nc *pscheduling.NodeClaim) {
+// truncateSpotInstanceTypeOptions caps a replacement NodeClaim's instance type options to the maxOptions cheapest
+// (or the minimum required to satisfy minValues, if greater) so the launched instance is always within the set
+// consolidation priced against, preventing continual spot-to-spot consolidation churn. maxOptions is the same
+// configured minimum the flexibility gate checks, so a launch can never land on a type outside the cheapest set of
+// that size and become eligible for another immediate cheaper replacement.
+func truncateSpotInstanceTypeOptions(nc *pscheduling.NodeClaim, maxOptions int) {
 	if nc.Requirements.HasMinValues() {
-		// Here we are trying to get the max of the minimum instances required to satisfy the minimum requirement and the default 15 to cap the instances for spot-to-spot consolidation.
+		// Here we are trying to get the max of the minimum instances required to satisfy the minimum requirement and the configured cap for spot-to-spot consolidation.
 		minInstanceTypes, _, _ := nc.InstanceTypeOptions.SatisfiesMinValues(nc.Requirements)
-		nc.InstanceTypeOptions = lo.Slice(nc.InstanceTypeOptions, 0, lo.Max([]int{MinInstanceTypesForSpotToSpotConsolidation, minInstanceTypes}))
+		nc.InstanceTypeOptions = lo.Slice(nc.InstanceTypeOptions, 0, lo.Max([]int{maxOptions, minInstanceTypes}))
 	} else {
-		nc.InstanceTypeOptions = lo.Slice(nc.InstanceTypeOptions, 0, MinInstanceTypesForSpotToSpotConsolidation)
+		nc.InstanceTypeOptions = lo.Slice(nc.InstanceTypeOptions, 0, maxOptions)
 	}
 }
 
