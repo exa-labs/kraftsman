@@ -500,6 +500,16 @@ var (
 		},
 		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, outcomeLabel},
 	)
+	ConsolidationSpotZoneRetryTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_spot_zone_retries_total",
+			Help:      "Number of spot-to-spot zone-narrowing retries by outcome, consolidation type, and NodePool. Counted per candidate, so a retry over a multi-node command records every candidate's NodePool. armed means the aggregate price filter emptied the spot replacements at their worst-case zone pricing and started the retry; admitted means narrowing the claims to their cheap spot zones produced a command; the rejection outcomes identify the retry constraint that prevented admission.",
+		},
+		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, outcomeLabel},
+	)
 	ConsolidationSplitSecondsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
@@ -676,6 +686,16 @@ func ObserveConsolidationCandidateSkip(consolidationType, nodePool, instanceType
 func ObserveConsolidationODToSpotRetry(consolidationType string, candidates []*Candidate, outcome string) {
 	for _, candidate := range candidates {
 		ConsolidationODToSpotRetryTotal.Inc(map[string]string{
+			ConsolidationTypeLabel: consolidationType,
+			metrics.NodePoolLabel:  candidate.NodePool.Name,
+			outcomeLabel:           outcome,
+		})
+	}
+}
+
+func ObserveConsolidationSpotZoneRetry(consolidationType string, candidates []*Candidate, outcome string) {
+	for _, candidate := range candidates {
+		ConsolidationSpotZoneRetryTotal.Inc(map[string]string{
 			ConsolidationTypeLabel: consolidationType,
 			metrics.NodePoolLabel:  candidate.NodePool.Name,
 			outcomeLabel:           outcome,

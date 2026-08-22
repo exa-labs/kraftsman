@@ -432,43 +432,10 @@ func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simO
 	claimBudget := priceBudget / float64(len(newNodeClaims))
 	for i, nc := range newNodeClaims {
 		nc.InstanceTypeOptions = snapshots[i]
-		// Requirements.Add keeps the larger minValues when intersecting, and the NodeClaim CRD rejects
-		// an In requirement carrying fewer values than its minValues — pinning below that floor would
-		// produce a command whose launch the API server refuses, so bail to the ordinary skip instead.
-		if !satisfiesMinValues(nc.Requirements.Get(v1.CapacityTypeLabelKey), 1) {
-			observeOutcome(ODToSpotRetryOutcomeCapacityTypeMinValues)
+		if outcome, ok := narrowClaimToCheapSpotZones(nc, claimBudget); !ok {
+			observeOutcome(outcome)
 			return false
 		}
-		nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot))
-		// Anchor the zone restriction on the cheapest instance type's own cheap zones rather than the
-		// union over every type: a zone that is cheap for one type but spiked for another would put
-		// the spike right back into the other type's worst-case price and re-empty the claim.
-		var zones []string
-		for _, it := range nc.InstanceTypeOptions.Compatible(nc.Requirements).OrderByPrice(nc.Requirements) {
-			cheap := lo.Uniq(lo.FilterMap(it.Offerings.Available().Compatible(nc.Requirements), func(of *cloudprovider.Offering, _ int) (string, bool) {
-				return of.Zone(), of.Price < claimBudget
-			}))
-			if len(cheap) != 0 {
-				zones = cheap
-				break
-			}
-		}
-		if len(zones) == 0 {
-			observeOutcome(ODToSpotRetryOutcomeNoCheapZone)
-			return false
-		}
-		if !satisfiesMinValues(nc.Requirements.Get(corev1.LabelTopologyZone), len(zones)) {
-			observeOutcome(ODToSpotRetryOutcomeZoneMinValues)
-			return false
-		}
-		nc.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zones...))
-		// Types spiked inside the anchor's zones would fail the worst-case re-pricing for the whole
-		// claim, so keep only the types cheap everywhere the launch may land. The anchor type survives
-		// by construction: every zone kept is one of its own cheap zones.
-		nc.InstanceTypeOptions = lo.Filter(nc.InstanceTypeOptions.Compatible(nc.Requirements), func(it *cloudprovider.InstanceType, _ int) bool {
-			return it.Offerings.Available().WorstLaunchPrice(nc.Requirements) < claimBudget
-		})
-		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 	if ok, _, _ := c.filterReplacementsAndPublish(newNodeClaims, candidates, priceBudget, false); !ok {
 		observeOutcome(ODToSpotRetryOutcomeAggregatePrice)
@@ -481,6 +448,48 @@ func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simO
 	}
 	observeOutcome(ODToSpotRetryOutcomeAdmitted)
 	return true
+}
+
+// narrowClaimToCheapSpotZones pins a replacement NodeClaim to spot and to the zones whose spot
+// offerings beat claimBudget, then re-prices its instance type options against that narrowed worst
+// case. The zone restriction is anchored on the cheapest instance type's own cheap zones rather
+// than the union over every type: a zone that is cheap for one type but spiked for another would
+// put the spike right back into the other type's worst-case price and re-empty the claim. Types
+// spiked inside the anchor's zones would fail the worst-case re-pricing for the whole claim, so
+// only the types cheap everywhere the launch may land are kept; the anchor type survives by
+// construction, every zone kept being one of its own cheap zones. On failure it returns the retry
+// outcome naming the constraint that could not be met; the claim is mutated either way, so callers
+// must restore its options before reusing it.
+func narrowClaimToCheapSpotZones(nc *pscheduling.NodeClaim, claimBudget float64) (string, bool) {
+	// Requirements.Add keeps the larger minValues when intersecting, and the NodeClaim CRD rejects
+	// an In requirement carrying fewer values than its minValues — pinning below that floor would
+	// produce a command whose launch the API server refuses, so bail to the ordinary skip instead.
+	if !satisfiesMinValues(nc.Requirements.Get(v1.CapacityTypeLabelKey), 1) {
+		return ODToSpotRetryOutcomeCapacityTypeMinValues, false
+	}
+	nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot))
+	var zones []string
+	for _, it := range nc.InstanceTypeOptions.Compatible(nc.Requirements).OrderByPrice(nc.Requirements) {
+		cheap := lo.Uniq(lo.FilterMap(it.Offerings.Available().Compatible(nc.Requirements), func(of *cloudprovider.Offering, _ int) (string, bool) {
+			return of.Zone(), of.Price < claimBudget
+		}))
+		if len(cheap) != 0 {
+			zones = cheap
+			break
+		}
+	}
+	if len(zones) == 0 {
+		return ODToSpotRetryOutcomeNoCheapZone, false
+	}
+	if !satisfiesMinValues(nc.Requirements.Get(corev1.LabelTopologyZone), len(zones)) {
+		return ODToSpotRetryOutcomeZoneMinValues, false
+	}
+	nc.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zones...))
+	nc.InstanceTypeOptions = lo.Filter(nc.InstanceTypeOptions.Compatible(nc.Requirements), func(it *cloudprovider.InstanceType, _ int) bool {
+		return it.Offerings.Available().WorstLaunchPrice(nc.Requirements) < claimBudget
+	})
+	nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
+	return "", true
 }
 
 // consolidationSchedulerOptions returns the scheduler options a consolidation simulation runs under, capping the
@@ -525,9 +534,47 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 
+	// The aggregate price filter prices each instance type at its worst-case compatible offering
+	// across every zone the claim allows, so on a NodePool spanning many zones one spiked spot pool
+	// anywhere vetoes replacements most zones offer large savings on. Keep a copy of each claim's
+	// options so a price-emptied filter can be retried with the claims narrowed to their cheap spot
+	// zones, mirroring the on-demand to spot repricing retry.
+	snapshots := lo.Map(results.NewNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []*cloudprovider.InstanceType {
+		return append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)
+	})
+	observeRetryOutcome := func(outcome string) {
+		if publishEvents {
+			ObserveConsolidationSpotZoneRetry(consolidationTypeFromContext(ctx), candidates, outcome)
+		}
+	}
 	// filterByPrice returns the instanceTypes that are lower priced than the current candidate and any error that indicates the input couldn't be filtered.
-	if ok, skipReason, _ := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, candidatePrice, publishEvents); !ok {
-		return Command{}, skipReason, nil
+	// Events are held back until the zone-narrowed retry below also fails: it may still turn the
+	// candidate into a replace command.
+	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, candidatePrice, false); !ok {
+		// Only a claim the price ceiling emptied can be saved by zone narrowing; a minValues or
+		// compatibility rejection fails for reasons no zone subset changes.
+		if skipReason != CandidateSkipNoCheaperSingleReplacement && skipReason != CandidateSkipNoCheaperReplacementSet {
+			c.publishReplacementSkip(results.NewNodeClaims, candidates, skipReason, priceDetail, publishEvents)
+			return Command{}, skipReason, nil
+		}
+		observeRetryOutcome(ODToSpotRetryOutcomeArmed)
+		// See the equal-share rationale on retrySpotOnlyReplacements: a zone that is only cheap
+		// relative to the whole budget would inflate one claim's worst case past its share.
+		claimBudget := candidatePrice / float64(len(results.NewNodeClaims))
+		for i, nc := range results.NewNodeClaims {
+			nc.InstanceTypeOptions = snapshots[i]
+			if outcome, narrowed := narrowClaimToCheapSpotZones(nc, claimBudget); !narrowed {
+				observeRetryOutcome(outcome)
+				c.publishReplacementSkip(results.NewNodeClaims, candidates, skipReason, priceDetail, publishEvents)
+				return Command{}, skipReason, nil
+			}
+		}
+		if retried, _, _ := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, candidatePrice, false); !retried {
+			observeRetryOutcome(ODToSpotRetryOutcomeAggregatePrice)
+			c.publishReplacementSkip(results.NewNodeClaims, candidates, skipReason, priceDetail, publishEvents)
+			return Command{}, skipReason, nil
+		}
+		observeRetryOutcome(ODToSpotRetryOutcomeAdmitted)
 	}
 
 	// For multi-node consolidation:
