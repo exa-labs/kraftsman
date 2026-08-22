@@ -1254,6 +1254,94 @@ var _ = Describe("Consolidation", func() {
 			})
 			Expect(ok).To(BeTrue())
 		})
+		It("can replace spot with spot below the default flexibility when SpotToSpotMinInstanceTypes is lowered", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				SpotToSpotMinInstanceTypes: lo.ToPtr(1),
+				FeatureGates:               test.FeatureGates{SpotToSpotConsolidation: new(true)},
+			}))
+			// Forcefully shrink the possible instanceTypes to be lower than the default minimum of 15.
+			cloudProvider.InstanceTypes = lo.Slice(fake.InstanceTypesAssorted(), 0, 5)
+			// Forcefully assign lowest possible instancePrice to make sure we have atleast one instance
+			// that is lower than the current node.
+			cloudProvider.InstanceTypes[0].Offerings[0].Price = 0.001
+			cloudProvider.InstanceTypes[0].Offerings[0].Requirements[v1.CapacityTypeLabelKey] = scheduling.NewRequirement(
+				v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot)
+			spotInstances = lo.Filter(cloudProvider.InstanceTypes, func(i *cloudprovider.InstanceType, _ int) bool {
+				for _, o := range i.Offerings {
+					if o.Requirements.Get(v1.CapacityTypeLabelKey).Any() == v1.CapacityTypeSpot {
+						return true
+					}
+				}
+				return false
+			})
+			// Sort the spot instances by pricing from low to high
+			sort.Slice(spotInstances, func(i, j int) bool {
+				return spotInstances[i].Offerings.Cheapest().Price < spotInstances[j].Offerings.Cheapest().Price
+			})
+			mostExpSpotInstance := spotInstances[len(spotInstances)-1]
+			mostExpSpotOffering := mostExpSpotInstance.Offerings[0]
+			spotNodeClaim.Labels = lo.Assign(spotNodeClaim.Labels, map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: mostExpSpotInstance.Name,
+				v1.CapacityTypeLabelKey:        mostExpSpotOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+				corev1.LabelTopologyZone:       mostExpSpotOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+			})
+
+			spotNode.Labels = lo.Assign(spotNode.Labels, map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: mostExpSpotInstance.Name,
+				v1.CapacityTypeLabelKey:        mostExpSpotOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+				corev1.LabelTopologyZone:       mostExpSpotOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+			})
+
+			ExpectSingletonReconciled(ctx, pricingController)
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}}})
+			ExpectApplied(ctx, env.Client, rs, pod, spotNode, spotNodeClaim, nodePool)
+
+			// bind pods to node
+			ExpectManualBinding(ctx, env.Client, pod, spotNode)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{spotNode}, []*v1.NodeClaim{spotNodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			// Process the item so that the nodes can be deleted.
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			// Cascade any deletion of the nodeclaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
+
+			// should create a new nodeclaim as there is a cheaper one that can hold the pod
+			nodeClaims := ExpectNodeClaims(ctx, env.Client)
+			nodes := ExpectNodes(ctx, env.Client)
+			Expect(nodeClaims).To(HaveLen(1))
+			Expect(nodes).To(HaveLen(1))
+
+			// Expect that the new nodeclaim does not request the most expensive spot instance type
+			Expect(nodeClaims[0].Name).ToNot(Equal(spotNodeClaim.Name))
+			Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Has(corev1.LabelInstanceTypeStable)).To(BeTrue())
+			Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).Has(mostExpSpotInstance.Name)).To(BeFalse())
+
+			// and delete the old one
+			ExpectNotFound(ctx, env.Client, spotNodeClaim, spotNode)
+		})
 		It("cannot replace spot with spot if the spotToSpotConsolidation is disabled", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{SpotToSpotConsolidation: new(false)}}))
 			// create our RS so we can link a pod to it

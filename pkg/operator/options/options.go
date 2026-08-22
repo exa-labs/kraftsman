@@ -95,6 +95,7 @@ type Options struct {
 	ConsolidationSplitFallback         bool
 	ConsolidationSplitMaxAttempts      int
 	ConsolidationSplitMinSavings       float64
+	SpotToSpotMinInstanceTypes         int
 	ConsolidationCandidateTimeout      time.Duration
 	ConsolidationAttributeReplacements bool
 	NodeClaimInitializationTimeout     time.Duration
@@ -145,6 +146,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.IntVar(&o.MaxConsolidationCommandsPerPass, "max-consolidation-commands-per-pass", env.WithDefaultInt("MAX_CONSOLIDATION_COMMANDS_PER_PASS", 1), "The maximum number of disruption commands a single single-node consolidation pass may admit. 1 preserves the classic one-command-per-pass behavior; higher values let a pass that has already paid for candidate discovery admit several non-overlapping commands, each still validated against live cluster state immediately before it is queued.")
 	fs.BoolVarWithEnv(&o.ConsolidationSplitFallback, "consolidation-split-fallback", "CONSOLIDATION_SPLIT_FALLBACK", false, "When set, a single-node consolidation candidate that no cheaper single replacement can absorb is re-simulated with the candidate's own price as a ceiling on new capacity, so the scheduler packs its pods onto several cheaper nodes instead. Bounded by max-consolidation-replacements and consolidation-split-max-attempts.")
 	fs.IntVar(&o.ConsolidationSplitMaxAttempts, "consolidation-split-max-attempts", env.WithDefaultInt("CONSOLIDATION_SPLIT_MAX_ATTEMPTS", 50), "The maximum number of split fallback simulations a single consolidation pass may run. Each attempt costs an extra scheduling simulation, so this caps how much of the pass timeout the fallback can consume at the expense of candidate traversal depth. 0 disables the fallback.")
+	fs.IntVar(&o.SpotToSpotMinInstanceTypes, "spot-to-spot-min-instance-types", env.WithDefaultInt("SPOT_TO_SPOT_MIN_INSTANCE_TYPES", 15), "The minimum number of cheaper instance type options a replacement NodeClaim must have for spot-to-spot single-node consolidation to proceed. The upstream default of 15 assumes broad instance-type flexibility; a fleet whose pods pin a single small instance family can never present that many cheaper types and needs a lower minimum. Launches are always capped to the cheapest priced options, which is what prevents continual consolidation regardless of this minimum.")
 	fs.DurationVar(&o.ConsolidationCandidateTimeout, "consolidation-candidate-timeout", env.WithDefaultDuration("CONSOLIDATION_CANDIDATE_TIMEOUT", 10*time.Second), "The maximum time a single consolidation candidate's scheduling simulation may run before it is abandoned and the walk moves on. The pass timeout bounds discovery in aggregate; this bounds one candidate, so a pass degrades into finding fewer commands rather than none. 0 disables the per-candidate bound.")
 	fs.BoolVar(&o.ConsolidationAttributeReplacements, "consolidation-attribute-replacements", env.WithDefaultBool("CONSOLIDATION_ATTRIBUTE_REPLACEMENTS", true), "Count only the new NodeClaims that host a disrupted pod as a command's replacements. A consolidation simulation also schedules the cluster's pending pods, and the capacity it opens for them would otherwise be priced against the candidate and counted against the replacement bound. Disable to restore the unattributed behavior.")
 	fs.BoolVarWithEnv(&o.ODToSpotConsolidation, "od-to-spot-consolidation", "OD_TO_SPOT_CONSOLIDATION", true, "When set, a consolidation candidate running on-demand whose replacement found nothing cheaper is re-evaluated against spot offerings only, restricted to the zones whose spot price beats the candidate. The replacement launch is pinned to spot and those zones, so insufficient spot capacity fails the launch instead of falling back to on-demand. Enabled by default; set to false to opt out.")
@@ -201,6 +203,9 @@ func (o *Options) validateConsolidation() error {
 	}
 	if o.ConsolidationCandidateTimeout < 0 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_CANDIDATE_TIMEOUT must be >= 0, got %s", o.ConsolidationCandidateTimeout)
+	}
+	if o.SpotToSpotMinInstanceTypes < 1 {
+		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_INSTANCE_TYPES must be >= 1, got %d", o.SpotToSpotMinInstanceTypes)
 	}
 	if o.ConsolidationSplitMinSavings < 0 || o.ConsolidationSplitMinSavings >= 1 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_SPLIT_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationSplitMinSavings)

@@ -57,7 +57,12 @@ func consolidationTypeFromContext(ctx context.Context) string {
 // commandValidationDelay is the time we wait between creating a consolidation command and validating that it still works.
 const commandValidationDelay = 15 * time.Second
 
-// MinInstanceTypesForSpotToSpotConsolidation is the minimum number of instanceTypes in a NodeClaim needed to trigger spot-to-spot single-node consolidation
+// MinInstanceTypesForSpotToSpotConsolidation is the default minimum number of instanceTypes in a
+// NodeClaim needed to trigger spot-to-spot single-node consolidation, and the cap on how many
+// options a spot replacement launches from. The minimum is configurable per deployment
+// (SPOT_TO_SPOT_MIN_INSTANCE_TYPES) because a workload pinned to one small instance family can
+// never present 15 cheaper types, while the launch cap stays fixed: launching from the cheapest
+// priced set is what prevents continual consolidation regardless of how low the minimum is.
 const MinInstanceTypesForSpotToSpotConsolidation = 15
 
 // consolidation provides common functionality for single-node and multi-node consolidation.
@@ -539,11 +544,12 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	// We check whether we have 15 cheaper instances than the current candidate instance. If this is the case, we know the following things:
 	//   1) The current candidate is not in the set of the 15 cheapest instance types and
 	//   2) There were at least 15 options cheaper than the current candidate.
+	minInstanceTypes := options.FromContext(ctx).SpotToSpotMinInstanceTypes
 	for _, nc := range results.NewNodeClaims {
-		if len(nc.InstanceTypeOptions) < MinInstanceTypesForSpotToSpotConsolidation {
+		if len(nc.InstanceTypeOptions) < minInstanceTypes {
 			if publishEvents {
 				c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("SpotToSpotConsolidation requires %d cheaper instance type options than the current candidate to consolidate, got %d",
-					MinInstanceTypesForSpotToSpotConsolidation, len(nc.InstanceTypeOptions)))...)
+					minInstanceTypes, len(nc.InstanceTypeOptions)))...)
 			}
 			return Command{}, CandidateSkipSpotToSpotFlexibility, nil
 		}
