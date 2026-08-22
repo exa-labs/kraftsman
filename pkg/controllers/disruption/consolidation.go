@@ -492,6 +492,61 @@ func narrowClaimToCheapSpotZones(nc *pscheduling.NodeClaim, claimBudget float64)
 	return "", true
 }
 
+// filterSpotReplacementsWithZoneRetry runs the aggregate price filter over spot replacement
+// claims, retrying a price-emptied result with the claims narrowed to their cheap spot zones. The
+// ordinary filter prices each instance type at its worst-case compatible offering across every
+// zone the claim allows, so on a NodePool spanning many zones one spiked spot pool anywhere
+// vetoes replacements most zones offer large savings on — the retry mirrors the on-demand to spot
+// repricing retry. Events are held back until the retry also fails: it may still turn the
+// candidate into a replace command.
+func (c *consolidation) filterSpotReplacementsWithZoneRetry(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, candidatePrice float64, publishEvents bool) (bool, string) {
+	snapshots := lo.Map(newNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []*cloudprovider.InstanceType {
+		return append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)
+	})
+	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(newNodeClaims, candidates, candidatePrice, false); !ok {
+		if !c.retrySpotZoneNarrowedReplacements(ctx, candidates, newNodeClaims, snapshots, candidatePrice, skipReason, priceDetail, publishEvents) {
+			return false, skipReason
+		}
+	}
+	return true, ""
+}
+
+// retrySpotZoneNarrowedReplacements re-runs the aggregate price filter after the ordinary spot
+// filter emptied the replacements, with each claim restored from its snapshot and narrowed to its
+// cheap spot zones. Only a price-emptied skip can be saved by zone narrowing — a minValues or
+// compatibility rejection fails for reasons no zone subset changes. On any failure the original
+// skip's events are published with the original price detail; the claims are only meaningfully
+// mutated on success. See the equal-share rationale on retrySpotOnlyReplacements for why each
+// claim is priced against candidatePrice split evenly across the claims.
+func (c *consolidation) retrySpotZoneNarrowedReplacements(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, candidatePrice float64, skipReason, priceDetail string, publishEvents bool) bool {
+	observeOutcome := func(outcome string) {
+		if publishEvents {
+			ObserveConsolidationSpotZoneRetry(consolidationTypeFromContext(ctx), candidates, outcome)
+		}
+	}
+	if skipReason != CandidateSkipNoCheaperSingleReplacement && skipReason != CandidateSkipNoCheaperReplacementSet {
+		c.publishReplacementSkip(newNodeClaims, candidates, skipReason, priceDetail, publishEvents)
+		return false
+	}
+	observeOutcome(ODToSpotRetryOutcomeArmed)
+	claimBudget := candidatePrice / float64(len(newNodeClaims))
+	for i, nc := range newNodeClaims {
+		nc.InstanceTypeOptions = snapshots[i]
+		if outcome, narrowed := narrowClaimToCheapSpotZones(nc, claimBudget); !narrowed {
+			observeOutcome(outcome)
+			c.publishReplacementSkip(newNodeClaims, candidates, skipReason, priceDetail, publishEvents)
+			return false
+		}
+	}
+	if retried, _, _ := c.filterReplacementsAndPublish(newNodeClaims, candidates, candidatePrice, false); !retried {
+		observeOutcome(ODToSpotRetryOutcomeAggregatePrice)
+		c.publishReplacementSkip(newNodeClaims, candidates, skipReason, priceDetail, publishEvents)
+		return false
+	}
+	observeOutcome(ODToSpotRetryOutcomeAdmitted)
+	return true
+}
+
 // consolidationSchedulerOptions returns the scheduler options a consolidation simulation runs under, capping the
 // price of the instance types new capacity may be launched from when the caller set a limit.
 func consolidationSchedulerOptions(newCapacityPriceLimit float64) []pscheduling.Options {
@@ -534,47 +589,8 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 
-	// The aggregate price filter prices each instance type at its worst-case compatible offering
-	// across every zone the claim allows, so on a NodePool spanning many zones one spiked spot pool
-	// anywhere vetoes replacements most zones offer large savings on. Keep a copy of each claim's
-	// options so a price-emptied filter can be retried with the claims narrowed to their cheap spot
-	// zones, mirroring the on-demand to spot repricing retry.
-	snapshots := lo.Map(results.NewNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []*cloudprovider.InstanceType {
-		return append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)
-	})
-	observeRetryOutcome := func(outcome string) {
-		if publishEvents {
-			ObserveConsolidationSpotZoneRetry(consolidationTypeFromContext(ctx), candidates, outcome)
-		}
-	}
-	// filterByPrice returns the instanceTypes that are lower priced than the current candidate and any error that indicates the input couldn't be filtered.
-	// Events are held back until the zone-narrowed retry below also fails: it may still turn the
-	// candidate into a replace command.
-	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, candidatePrice, false); !ok {
-		// Only a claim the price ceiling emptied can be saved by zone narrowing; a minValues or
-		// compatibility rejection fails for reasons no zone subset changes.
-		if skipReason != CandidateSkipNoCheaperSingleReplacement && skipReason != CandidateSkipNoCheaperReplacementSet {
-			c.publishReplacementSkip(results.NewNodeClaims, candidates, skipReason, priceDetail, publishEvents)
-			return Command{}, skipReason, nil
-		}
-		observeRetryOutcome(ODToSpotRetryOutcomeArmed)
-		// See the equal-share rationale on retrySpotOnlyReplacements: a zone that is only cheap
-		// relative to the whole budget would inflate one claim's worst case past its share.
-		claimBudget := candidatePrice / float64(len(results.NewNodeClaims))
-		for i, nc := range results.NewNodeClaims {
-			nc.InstanceTypeOptions = snapshots[i]
-			if outcome, narrowed := narrowClaimToCheapSpotZones(nc, claimBudget); !narrowed {
-				observeRetryOutcome(outcome)
-				c.publishReplacementSkip(results.NewNodeClaims, candidates, skipReason, priceDetail, publishEvents)
-				return Command{}, skipReason, nil
-			}
-		}
-		if retried, _, _ := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, candidatePrice, false); !retried {
-			observeRetryOutcome(ODToSpotRetryOutcomeAggregatePrice)
-			c.publishReplacementSkip(results.NewNodeClaims, candidates, skipReason, priceDetail, publishEvents)
-			return Command{}, skipReason, nil
-		}
-		observeRetryOutcome(ODToSpotRetryOutcomeAdmitted)
+	if ok, skipReason := c.filterSpotReplacementsWithZoneRetry(ctx, candidates, results.NewNodeClaims, candidatePrice, publishEvents); !ok {
+		return Command{}, skipReason, nil
 	}
 
 	// For multi-node consolidation:
