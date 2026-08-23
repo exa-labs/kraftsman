@@ -471,21 +471,25 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 		// rather than appended to the pod's own; otherwise each scheduler construction would grow
 		// the pod's selector by another requirement.
 		selector := tsc.LabelSelector
-		if len(tsc.MatchLabelKeys) > 0 {
+		var matchLabelKeyRequirements []metav1.LabelSelectorRequirement
+		for _, key := range tsc.MatchLabelKeys {
+			if value, ok := p.Labels[key]; ok {
+				matchLabelKeyRequirements = append(matchLabelKeyRequirements, metav1.LabelSelectorRequirement{
+					Key:      key,
+					Operator: metav1.LabelSelectorOpIn,
+					Values:   []string{value},
+				})
+			}
+		}
+		// Only materialize a selector when there is something to add: a nil selector matches
+		// nothing, while an empty one matches everything.
+		if len(matchLabelKeyRequirements) > 0 {
 			if selector == nil {
 				selector = &metav1.LabelSelector{}
 			} else {
 				selector = selector.DeepCopy()
 			}
-			for _, key := range tsc.MatchLabelKeys {
-				if value, ok := p.Labels[key]; ok {
-					selector.MatchExpressions = append(selector.MatchExpressions, metav1.LabelSelectorRequirement{
-						Key:      key,
-						Operator: metav1.LabelSelectorOpIn,
-						Values:   []string{value},
-					})
-				}
-			}
+			selector.MatchExpressions = append(selector.MatchExpressions, matchLabelKeyRequirements...)
 		}
 		topologyGroups = append(topologyGroups, NewTopologyGroup(
 			TopologyTypeSpread,

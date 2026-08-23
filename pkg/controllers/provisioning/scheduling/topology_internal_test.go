@@ -79,4 +79,12 @@ func TestNewForTopologiesNilSelectorWithMatchLabelKeys(t *testing.T) {
 	if len(groups) != 1 || groups[0].rawSelector == nil || len(groups[0].rawSelector.MatchExpressions) != 1 {
 		t.Fatalf("expected a selector built from matchLabelKeys, got %+v", groups)
 	}
+
+	// With none of the keys present on the pod the selector must stay nil: an empty selector
+	// would match every pod in the namespace rather than none.
+	pod.Labels = map[string]string{}
+	groups = topology.newForTopologies(pod)
+	if len(groups) != 1 || groups[0].rawSelector != nil {
+		t.Fatalf("expected a nil selector when no matchLabelKeys are present, got %+v", groups[0].rawSelector)
+	}
 }
