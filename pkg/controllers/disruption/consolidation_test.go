@@ -5089,6 +5089,8 @@ var _ = Describe("Consolidation", func() {
 		It("should not mark the cluster consolidated when the pass times out without a command", func() {
 			disruption.MultiNodeConsolidationTimeoutDuration = -1 * time.Second
 			DeferCleanup(func() { disruption.MultiNodeConsolidationTimeoutDuration = time.Minute })
+			// The timeout counter is package-global and not reset between specs.
+			disruption.ConsolidationTimeoutsTotal.Reset()
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
 			pods := test.Pods(3, test.PodOptions{
