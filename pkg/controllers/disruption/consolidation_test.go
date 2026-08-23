@@ -5086,6 +5086,44 @@ var _ = Describe("Consolidation", func() {
 				spotNodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			}
 		})
+		It("should not mark the cluster consolidated when the pass times out without a command", func() {
+			disruption.MultiNodeConsolidationTimeoutDuration = -1 * time.Second
+			DeferCleanup(func() { disruption.MultiNodeConsolidationTimeoutDuration = time.Minute })
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			pods := test.Pods(3, test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}}})
+			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodeClaims[2], nodes[2], nodePool)
+			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, nodes[0], nodes[1], nodes[2])
+			ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+			ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1], nodes[2]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1], nodeClaims[2]})
+
+			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+			multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c)
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, multiNodeConsolidation.Reason())
+			Expect(err).To(Succeed())
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, multiNodeConsolidation.ShouldDisrupt, multiNodeConsolidation.Class(), queue)
+			Expect(err).To(Succeed())
+			Expect(candidates).To(HaveLen(3))
+
+			cmds, err := multiNodeConsolidation.ComputeCommands(ctx, budgets, candidates...)
+			Expect(err).To(Succeed())
+			Expect(cmds).To(BeEmpty())
+			ExpectMetricCounterValue(disruption.ConsolidationTimeoutsTotal, 1, map[string]string{disruption.ConsolidationTypeLabel: multiNodeConsolidation.ConsolidationType()})
+			Expect(multiNodeConsolidation.IsConsolidated()).To(BeFalse())
+		})
 		DescribeTable("can merge 3 nodes into 1", func(spotToSpot bool) {
 			nodeClaims = lo.Ternary(spotToSpot, spotNodeClaims, nodeClaims)
 			nodes = lo.Ternary(spotToSpot, spotNodes, nodes)

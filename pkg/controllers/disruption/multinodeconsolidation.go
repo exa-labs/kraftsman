@@ -33,7 +33,9 @@ import (
 	scheduler "sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-const MultiNodeConsolidationTimeoutDuration = 1 * time.Minute
+// MultiNodeConsolidationTimeoutDuration bounds the binary search for a multi-node command.
+var MultiNodeConsolidationTimeoutDuration = 1 * time.Minute
+
 const MultiNodeConsolidationType = "multi"
 
 type MultiNodeConsolidation struct {
@@ -121,8 +123,10 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	if cmd.Decision() == NoOpDecision {
 		// if there are no candidates because of a budget, don't mark
 		// as consolidated, as it's possible it should be consolidatable
-		// the next time we try to disrupt.
-		if !constrainedByBudgets {
+		// the next time we try to disrupt. A pass that ran out of time
+		// before finding a command has not shown the cluster is
+		// consolidated either.
+		if !constrainedByBudgets && !timedOut {
 			m.markConsolidated()
 		}
 		return []Command{}, nil
