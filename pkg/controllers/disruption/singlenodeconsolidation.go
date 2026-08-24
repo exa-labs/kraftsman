@@ -139,10 +139,9 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	defer func() {
 		if !timedOut {
 			s.evaluatedThisCycle = sets.New[string]()
-			// The gauge is otherwise only written by timed-out walks, so mark the cycle
-			// complete here or it would hold the last timed-out pass's partial fraction
-			// long after coverage recovered.
-			ObserveWalkCycleCoverage(s.ConsolidationType(), 1, 1)
+			// The gauge is only written by timed-out walks; drop the series so it does not
+			// hold the last timed-out pass's partial fraction after coverage recovered.
+			ResetWalkCycleCoverage(s.ConsolidationType())
 		}
 	}()
 	for i, candidate := range candidates {
@@ -165,9 +164,8 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			// budget, which buys the commands a timed-out pass used to throw away.
 			break
 		}
-		// Track that we've seen this nodepool and this candidate
+		// Track that we've seen this nodepool
 		unseenNodePools.Delete(candidate.NodePool.Name)
-		s.evaluatedThisCycle.Insert(candidate.ProviderID())
 		evaluatedCandidateDepthByNodePool[candidate.NodePool.Name]++
 
 		// Candidates an earlier proposal in this pass already claims cannot be part of a second
@@ -201,6 +199,10 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 
+		// The coverage cycle only counts candidates that reach simulation: a candidate skipped
+		// above (claimed, pool held, budget exhausted, below threshold) was never evaluated, and
+		// marking it reached would demote it behind the tail on the next resumed walk.
+		s.evaluatedThisCycle.Insert(candidate.ProviderID())
 		// compute a possible consolidation option
 		cmd, err := s.computeConsolidationWithinCandidateBudget(ctx, candidate)
 		depth = i + 1

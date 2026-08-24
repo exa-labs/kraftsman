@@ -211,6 +211,39 @@ var _ = Describe("SingleNodeConsolidation", func() {
 			Expect(consolidation.PreviouslyUnseenNodePools.Has(nodePool2.Name)).To(BeTrue())
 			Expect(consolidation.PreviouslyUnseenNodePools.Has(nodePool3.Name)).To(BeTrue())
 		})
+
+		It("should carry the coverage cycle forward when the pass times out", func() {
+			disruption.SingleNodeConsolidationTimeoutDuration = -5 * time.Second
+			candidates, err := createCandidates(1.0, 1)
+			Expect(err).To(BeNil())
+
+			consolidation.SeedEvaluatedCycle(candidates[0].ProviderID())
+			budgetMapping := map[string]int{
+				nodePool1.Name: 1,
+				nodePool2.Name: 1,
+				nodePool3.Name: 1,
+			}
+
+			_, _ = consolidation.ComputeCommands(ctx, budgetMapping, candidates...)
+
+			Expect(consolidation.EvaluatedCycleSize()).To(Equal(1))
+		})
+
+		It("should reset the coverage cycle when the pass completes without timing out", func() {
+			candidates, err := createCandidates(1.0, 1)
+			Expect(err).To(BeNil())
+
+			consolidation.SeedEvaluatedCycle(candidates[0].ProviderID())
+			budgetMapping := map[string]int{
+				nodePool1.Name: 1,
+				nodePool2.Name: 1,
+				nodePool3.Name: 1,
+			}
+
+			_, _ = consolidation.ComputeCommands(ctx, budgetMapping, candidates...)
+
+			Expect(consolidation.EvaluatedCycleSize()).To(Equal(0))
+		})
 	})
 })
 

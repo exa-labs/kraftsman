@@ -21,11 +21,33 @@ import (
 	"fmt"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 )
 
 func cursorConsolidation(evaluated ...string) *SingleNodeConsolidation {
 	return &SingleNodeConsolidation{evaluatedThisCycle: sets.New(evaluated...)}
+}
+
+func walkCandidate(i int, nodePool string) *Candidate {
+	return &Candidate{
+		StateNode: &state.StateNode{
+			Node: &corev1.Node{Spec: corev1.NodeSpec{ProviderID: fmt.Sprintf("provider-%d", i)}},
+		},
+		NodePool: &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: nodePool}},
+	}
+}
+
+func walkCandidates(n int) []*Candidate {
+	out := make([]*Candidate, n)
+	for i := range out {
+		out[i] = walkCandidate(i, "np")
+	}
+	return out
 }
 
 func providerIDs(candidates []*Candidate) []string {

@@ -20,3 +20,9 @@ package disruption
 func (s *SingleNodeConsolidation) EvaluatedCycleSize() int {
 	return s.evaluatedThisCycle.Len()
 }
+
+// SeedEvaluatedCycle marks provider IDs as already reached by the coverage cycle, letting the
+// external test package stage a partially-covered cycle.
+func (s *SingleNodeConsolidation) SeedEvaluatedCycle(providerIDs ...string) {
+	s.evaluatedThisCycle.Insert(providerIDs...)
+}

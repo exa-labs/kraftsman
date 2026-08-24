@@ -559,7 +559,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "consolidation_walk_cycle_coverage_ratio",
-			Help:      "Fraction of current candidates the running coverage cycle has reached across consecutive timed-out passes. A cycle ends - and the gauge reports 1 - when a pass stops for any reason other than a timeout, so a ratio pinned below 1 means back-to-back timeouts are letting candidates enter the set faster than the walk covers them.",
+			Help:      "Fraction of current candidates the running coverage cycle has reached across consecutive timed-out passes. Only timed-out passes report it; a pass that stops for any other reason ends the cycle and removes the series, so its presence means timeouts are active and a ratio pinned below 1 means candidates enter the set faster than the walk covers them.",
 		},
 		[]string{ConsolidationTypeLabel},
 	)
@@ -690,6 +690,12 @@ func ObserveWalkCycleCoverage(consolidationType string, evaluated, candidates in
 		return
 	}
 	WalkCycleCoverageRatio.Set(float64(evaluated)/float64(candidates), map[string]string{ConsolidationTypeLabel: consolidationType})
+}
+
+// ResetWalkCycleCoverage removes the coverage series when a pass ends without timing out. Absence
+// is the signal that no coverage cycle is running, rather than a stale or fabricated ratio.
+func ResetWalkCycleCoverage(consolidationType string) {
+	WalkCycleCoverageRatio.Delete(map[string]string{ConsolidationTypeLabel: consolidationType})
 }
 
 func ObserveConsolidationCandidateSkip(consolidationType, nodePool, instanceType, capacityType, reason string) {
