@@ -232,14 +232,18 @@ func (o *Options) validateConsolidation() error {
 	if o.SpotToSpotMinInstanceTypes < 1 {
 		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_INSTANCE_TYPES must be >= 1, got %d", o.SpotToSpotMinInstanceTypes)
 	}
-	if o.ConsolidationNegativeCacheTTL <= 0 && o.ConsolidationSkipUnchangedNegatives {
-		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_NEGATIVE_CACHE_TTL must be > 0 when CONSOLIDATION_SKIP_UNCHANGED_NEGATIVES is set, got %s", o.ConsolidationNegativeCacheTTL)
-	}
 	if o.ConsolidationSplitMinSavings < 0 || o.ConsolidationSplitMinSavings >= 1 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_SPLIT_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationSplitMinSavings)
 	}
 	if o.ConsolidationReplaceMinSavings < 0 || o.ConsolidationReplaceMinSavings >= 1 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationReplaceMinSavings)
+	}
+	return o.validateNegativeCache()
+}
+
+func (o *Options) validateNegativeCache() error {
+	if o.ConsolidationNegativeCacheTTL <= 0 && o.ConsolidationSkipUnchangedNegatives {
+		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_NEGATIVE_CACHE_TTL must be > 0 when CONSOLIDATION_SKIP_UNCHANGED_NEGATIVES is set, got %s", o.ConsolidationNegativeCacheTTL)
 	}
 	return nil
 }
