@@ -68,7 +68,13 @@ type consolidationProposal struct {
 type SingleNodeConsolidation struct {
 	consolidation
 	PreviouslyUnseenNodePools sets.Set[string]
-	validator                 Validator
+	// evaluatedThisCycle holds the provider IDs of candidates a walk has reached since the last
+	// full pass, so that consecutive timed-out passes resume coverage at the tail instead of
+	// re-walking the head every time. It is a walk-position hint only: nothing simulated or
+	// decided in an earlier pass is carried by it, and every candidate a pass reaches is still
+	// simulated and validated against current cluster state.
+	evaluatedThisCycle sets.Set[string]
+	validator          Validator
 }
 
 func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *SingleNodeConsolidation {
@@ -76,6 +82,7 @@ func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodO
 	return &SingleNodeConsolidation{
 		consolidation:             c,
 		PreviouslyUnseenNodePools: sets.New[string](),
+		evaluatedThisCycle:        sets.New[string](),
 		validator:                 o.validator,
 	}
 }
@@ -125,6 +132,18 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	balancedNodePoolsHeld := sets.New[string]()
 
 	timedOut := false
+	// The coverage cycle only accumulates across consecutive timed-out walks. Any pass that ends
+	// for another reason - it walked every candidate, returned its single command, or filled its
+	// proposal batch - resets it, so the next walk starts back at the head of the sorted list and
+	// the ranking is only overridden while timeouts are actually starving the tail.
+	defer func() {
+		if !timedOut {
+			s.evaluatedThisCycle = sets.New[string]()
+			// The gauge is only written by timed-out walks; drop the series so it does not
+			// hold the last timed-out pass's partial fraction after coverage recovered.
+			ResetWalkCycleCoverage(s.ConsolidationType())
+		}
+	}()
 	for i, candidate := range candidates {
 		if s.clock.Now().After(timeout) {
 			outcome = PassOutcomeTimedOut
@@ -135,6 +154,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 			s.PreviouslyUnseenNodePools = unseenNodePools
 			ObserveUnseenNodePools(s.ConsolidationType(), unseenNodePools.UnsortedList())
+			ObserveWalkCycleCoverage(s.ConsolidationType(), len(s.evaluatedThisCycle), len(candidates))
 
 			if len(proposals) == 0 {
 				return []Command{}, nil
@@ -179,6 +199,10 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 
+		// The coverage cycle only counts candidates that reach simulation: a candidate skipped
+		// above (claimed, pool held, budget exhausted, below threshold) was never evaluated, and
+		// marking it reached would demote it behind the tail on the next resumed walk.
+		s.evaluatedThisCycle.Insert(candidate.ProviderID())
 		// compute a possible consolidation option
 		cmd, err := s.computeConsolidationWithinCandidateBudget(ctx, candidate)
 		depth = i + 1
@@ -343,10 +367,42 @@ func (s *SingleNodeConsolidation) ConsolidationType() string {
 	return SingleNodeConsolidationType
 }
 
-// SortCandidates applies the consolidation sort, then interweaves by NodePool.
+// SortCandidates applies the consolidation sort, interweaves by NodePool, then resumes an
+// unfinished coverage cycle by moving candidates earlier timed-out walks already reached behind
+// the ones they never got to.
 func (s *SingleNodeConsolidation) SortCandidates(ctx context.Context, candidates []*Candidate) []*Candidate {
 	candidates = s.sortCandidates(ctx, candidates)
-	return s.shuffleCandidates(ctx, lo.GroupBy(candidates, func(c *Candidate) string { return c.NodePool.Name }))
+	candidates = s.shuffleCandidates(ctx, lo.GroupBy(candidates, func(c *Candidate) string { return c.NodePool.Name }))
+	return s.resumeCoverageCycle(ctx, candidates)
+}
+
+// resumeCoverageCycle reorders the sorted candidate list so a walk continues the coverage cycle
+// where the last timed-out walk stopped. The cycle only reorders — it persists no simulation
+// result or decision, the candidate list and cluster state are rebuilt every pass, and each
+// reached candidate is re-simulated and validated against current state. Without it, every
+// timed-out pass restarts at the head of the sorted list, so head candidates are re-evaluated
+// each pass while the tail past the timeout horizon is starved indefinitely; with it, every
+// candidate is reached within a bounded number of passes. A cycle ends when a walk ends for
+// any reason other than a timeout, or when every current candidate has been reached; either
+// way the next pass starts a fresh cycle in pure sorted order.
+func (s *SingleNodeConsolidation) resumeCoverageCycle(ctx context.Context, candidates []*Candidate) []*Candidate {
+	if s.evaluatedThisCycle.Len() == 0 {
+		return candidates
+	}
+	// Nodes that left the candidate set (deleted, disrupted, or no longer consolidatable) drop
+	// out of the cycle so the set tracks only live coverage and cannot grow without bound.
+	current := sets.New(lo.Map(candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
+	s.evaluatedThisCycle = s.evaluatedThisCycle.Intersection(current)
+	if s.evaluatedThisCycle.Len() == 0 || s.evaluatedThisCycle.Len() >= len(candidates) {
+		// Every live candidate was reached: the cycle is complete, start the next one at the head.
+		s.evaluatedThisCycle = sets.New[string]()
+		return candidates
+	}
+	unreached, reached := lo.FilterReject(candidates, func(c *Candidate, _ int) bool {
+		return !s.evaluatedThisCycle.Has(c.ProviderID())
+	})
+	log.FromContext(ctx).V(1).Info("resuming candidate walk coverage cycle", "already_evaluated", len(reached), "remaining", len(unreached))
+	return append(unreached, reached...)
 }
 
 func (s *SingleNodeConsolidation) shuffleCandidates(ctx context.Context, nodePoolCandidates map[string][]*Candidate) []*Candidate {
