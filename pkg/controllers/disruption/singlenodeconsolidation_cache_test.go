@@ -41,14 +41,15 @@ func TestSingleNodeConsolidationComputeCommandsStartsCachePass(t *testing.T) {
 	cloudProvider := fake.NewCloudProvider()
 	clusterClock := clock.RealClock{}
 	cluster := state.NewCluster(clusterClock, client, cloudProvider)
+	recorder := events.NewRecorder(&record.FakeRecorder{})
 	consolidation := MakeConsolidation(
 		clusterClock,
 		cluster,
 		client,
 		nil,
 		cloudProvider,
-		events.NewRecorder(&record.FakeRecorder{}),
-		nil,
+		recorder,
+		NewQueue(client, recorder, cluster, clusterClock, nil),
 	)
 
 	ctx := options.ToContext(context.Background(), &options.Options{})

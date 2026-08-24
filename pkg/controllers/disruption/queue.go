@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
@@ -101,6 +102,15 @@ type Queue struct {
 	cluster             *state.Cluster
 	clock               clock.Clock
 	provisioner         *provisioning.Provisioner
+	// completedCommands counts every command the queue has finished, from any disruption method.
+	// It is a fleet-change signal: consumers holding state computed against the fleet (the
+	// negative-result cache) compare it between passes to notice that capacity moved.
+	completedCommands atomic.Uint64
+}
+
+// CompletedCommandCount reports how many commands the queue has completed since startup.
+func (q *Queue) CompletedCommandCount() uint64 {
+	return q.completedCommands.Load()
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
@@ -424,6 +434,7 @@ func (q *Queue) GetCommands() []*Command {
 
 // CompleteCommand fully clears the queue of all references of a hash/command
 func (q *Queue) CompleteCommand(cmd *Command) {
+	q.completedCommands.Add(1)
 	if !cmd.Succeeded {
 		q.cluster.UnmarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
 	}

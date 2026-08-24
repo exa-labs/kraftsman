@@ -28,41 +28,43 @@ import (
 
 type OptionsFields struct {
 	// Vendor Neutral
-	ServiceName                        *string
-	MetricsPort                        *int
-	HealthProbePort                    *int
-	KubeClientQPS                      *int
-	KubeClientBurst                    *int
-	EnableProfiling                    *bool
-	DisableControllerWarmup            *bool
-	DisableLeaderElection              *bool
-	DisableClusterStateObservability   *bool
-	LeaderElectionName                 *string
-	LeaderElectionNamespace            *string
-	MemoryLimit                        *int64
-	CPURequests                        *int64
-	LogLevel                           *string
-	LogOutputPaths                     *string
-	LogErrorOutputPaths                *string
-	PreferencePolicy                   *options.PreferencePolicy
-	MinValuesPolicy                    *options.MinValuesPolicy
-	BatchMaxDuration                   *time.Duration
-	BatchIdleDuration                  *time.Duration
-	NodeMetricsInterval                *time.Duration
-	IgnoreDRARequests                  *bool
-	MaxConsolidationReplacements       *int
-	MaxConsolidationCommandsPerPass    *int
-	ConsolidationSplitFallback         *bool
-	ConsolidationSplitMaxAttempts      *int
-	ConsolidationSplitMinSavings       *float64
-	ConsolidationReplaceMinSavings     *float64
-	SpotToSpotMinInstanceTypes         *int
-	ConsolidationCandidateTimeout      *time.Duration
-	ConsolidationAttributeReplacements *bool
-	NodeClaimInitializationTimeout     *time.Duration
-	ODToSpotConsolidation              *bool
-	TopologyCountCacheMode             *options.TopologyCountCacheMode
-	FeatureGates                       FeatureGates
+	ServiceName                         *string
+	MetricsPort                         *int
+	HealthProbePort                     *int
+	KubeClientQPS                       *int
+	KubeClientBurst                     *int
+	EnableProfiling                     *bool
+	DisableControllerWarmup             *bool
+	DisableLeaderElection               *bool
+	DisableClusterStateObservability    *bool
+	LeaderElectionName                  *string
+	LeaderElectionNamespace             *string
+	MemoryLimit                         *int64
+	CPURequests                         *int64
+	LogLevel                            *string
+	LogOutputPaths                      *string
+	LogErrorOutputPaths                 *string
+	PreferencePolicy                    *options.PreferencePolicy
+	MinValuesPolicy                     *options.MinValuesPolicy
+	BatchMaxDuration                    *time.Duration
+	BatchIdleDuration                   *time.Duration
+	NodeMetricsInterval                 *time.Duration
+	IgnoreDRARequests                   *bool
+	MaxConsolidationReplacements        *int
+	MaxConsolidationCommandsPerPass     *int
+	ConsolidationSplitFallback          *bool
+	ConsolidationSplitMaxAttempts       *int
+	ConsolidationSplitMinSavings        *float64
+	ConsolidationReplaceMinSavings      *float64
+	SpotToSpotMinInstanceTypes          *int
+	ConsolidationCandidateTimeout       *time.Duration
+	ConsolidationAttributeReplacements  *bool
+	ConsolidationSkipUnchangedNegatives *bool
+	ConsolidationNegativeCacheTTL       *time.Duration
+	NodeClaimInitializationTimeout      *time.Duration
+	ODToSpotConsolidation               *bool
+	TopologyCountCacheMode              *options.TopologyCountCacheMode
+	FeatureGates                        FeatureGates
 }
 
 type FeatureGates struct {
@@ -112,11 +114,13 @@ func Options(overrides ...OptionsFields) *options.Options {
 		SpotToSpotMinInstanceTypes:       lo.FromPtrOr(opts.SpotToSpotMinInstanceTypes, 15),
 		// Tests drive a fake clock, and a per-candidate deadline is wall-clock, so it is off by
 		// default here: a suite opts in when it is what is under test.
-		ConsolidationCandidateTimeout:      lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
-		ConsolidationAttributeReplacements: lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
-		NodeClaimInitializationTimeout:     lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
-		ODToSpotConsolidation:              lo.FromPtrOr(opts.ODToSpotConsolidation, false),
-		TopologyCountCacheMode:             lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
+		ConsolidationCandidateTimeout:       lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
+		ConsolidationAttributeReplacements:  lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
+		ConsolidationSkipUnchangedNegatives: lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
+		ConsolidationNegativeCacheTTL:       lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
+		NodeClaimInitializationTimeout:      lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
+		ODToSpotConsolidation:               lo.FromPtrOr(opts.ODToSpotConsolidation, false),
+		TopologyCountCacheMode:              lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
 		FeatureGates: options.FeatureGates{
 			NodeRepair:              lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),
 			ReservedCapacity:        lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, true),

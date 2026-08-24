@@ -142,6 +142,24 @@ const (
 	// ConsolidationCandidateTimeout and was abandoned so the walk could continue. It is the
 	// per-candidate counterpart of a timed-out pass: the pass survives, this candidate does not.
 	CandidateSkipCandidateTimeout = "candidate_timed_out"
+	// CandidateSkipUnchangedNegative marks a candidate skipped because a previous pass simulated
+	// an identical candidate - same node, claim, pods, pool and instance type revision - and found
+	// nothing worth doing, and that verdict has not yet expired.
+	CandidateSkipUnchangedNegative = "unchanged_negative_result"
+)
+
+// Negative-result cache lookup outcomes. The counter is observed on every lookup whether or not
+// skipping is enabled to act on it, so the hit share measures how much of the fleet's simulation
+// work re-derives an unchanged answer.
+const (
+	// NegativeCacheLookupHit means the stored verdict is current and the candidate can be skipped.
+	NegativeCacheLookupHit = "hit"
+	// NegativeCacheLookupChanged means an entry existed but one of the fingerprinted inputs moved.
+	NegativeCacheLookupChanged = "changed"
+	// NegativeCacheLookupExpired means an entry existed but outlived its TTL.
+	NegativeCacheLookupExpired = "expired"
+	// NegativeCacheLookupAbsent means no verdict was stored for the candidate.
+	NegativeCacheLookupAbsent = "absent"
 )
 
 const (
@@ -444,6 +462,16 @@ var (
 			Help:      "Number of skipped single-node consolidation candidates by type, NodePool, candidate instance type, candidate capacity type, and reason, plus budget-exhausted candidates from both methods.",
 		},
 		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, instanceTypeLabel, metrics.CapacityTypeLabel, reasonLabel},
+	)
+	ConsolidationNegativeCacheLookupsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_negative_cache_lookups_total",
+			Help:      "Number of negative-result cache lookups for consolidation candidates, by consolidation type and outcome. Observed whether or not skipping is enabled, so the hit share measures how much simulation work re-derives an unchanged no-op verdict.",
+		},
+		[]string{ConsolidationTypeLabel, outcomeLabel},
 	)
 	ConsolidationReplacementAttemptsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
@@ -775,6 +803,13 @@ func ObserveConsolidationSpotZoneRetry(consolidationType string, candidates []*C
 			outcomeLabel:           outcome,
 		})
 	}
+}
+
+func ObserveNegativeResultCacheLookup(consolidationType, outcome string) {
+	ConsolidationNegativeCacheLookupsTotal.Inc(map[string]string{
+		ConsolidationTypeLabel: consolidationType,
+		outcomeLabel:           outcome,
+	})
 }
 
 // observeCandidateSkip records a skip for a candidate, resolving its types.

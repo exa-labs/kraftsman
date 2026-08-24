@@ -75,6 +75,14 @@ type SingleNodeConsolidation struct {
 	// simulated and validated against current cluster state.
 	evaluatedThisCycle sets.Set[string]
 	validator          Validator
+	// negativeResults persists across passes: a candidate whose simulation ended in a no-op is
+	// remembered by fingerprint, so an identical candidate in a later pass can be skipped.
+	negativeResults *NegativeResultCache
+	// completedCommandsSeen is the queue's completed-command count at the last pass. Any command
+	// completing between passes — from any disruption method, not just this one — can free
+	// capacity that a cached no-op verdict depended on, so the cache is cleared when it moves.
+	completedCommandsSeen uint64
+>>>>>>> cd61923c (perf(consolidation): skip candidates whose no-op verdict cannot have changed, behind a flag)
 }
 
 func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *SingleNodeConsolidation {
@@ -84,6 +92,7 @@ func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodO
 		PreviouslyUnseenNodePools: sets.New[string](),
 		evaluatedThisCycle:        sets.New[string](),
 		validator:                 o.validator,
+		negativeResults:           NewNegativeResultCache(c.clock),
 	}
 }
 
@@ -115,6 +124,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	// Set a timeout
 	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)
 	constrainedByBudgets := false
+	skippedOnNegativeCache := false
 
 	unseenNodePools := sets.New(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })...)
 
@@ -123,6 +133,21 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	// carry more than one command out of it. maxCommands of 1 keeps the classic behavior of
 	// validating and returning the first accepted command.
 	maxCommands := options.FromContext(ctx).MaxConsolidationCommandsPerPass
+	skipUnchangedNegatives := options.FromContext(ctx).ConsolidationSkipUnchangedNegatives
+	negativeCacheTTL := options.FromContext(ctx).ConsolidationNegativeCacheTTL
+	fingerprints := newNegativeCacheFingerprints(s.kubeClient, s.cloudProvider)
+	// A verdict of "nothing cheaper existed" holds only for the fleet it was computed against.
+	// Commands from every disruption method — multi-node consolidation, drift, emptiness,
+	// expiration — run through the queue and can free capacity that is invisible to a candidate's
+	// own fingerprint, so any completed command since the last pass empties the cache.
+	if completed := s.queue.CompletedCommandCount(); completed != s.completedCommandsSeen {
+		s.completedCommandsSeen = completed
+		s.negativeResults.Clear()
+	}
+	// Nodes that left the fleet are never looked up again, so their entries only leave the map
+	// here. The sweep runs after the candidate walk so a lookup still sees — and reports as
+	// expired, not absent — an entry that outlived its TTL between passes.
+	defer s.negativeResults.DropExpired()
 	proposals := []consolidationProposal{}
 	// claimedProviderIDs holds every candidate of every proposal, so two proposals can never
 	// name the same node. Multi-candidate commands contribute all of their candidates.
@@ -199,12 +224,26 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 
-		// The coverage cycle only counts candidates that reach simulation: a candidate skipped
+		// The coverage cycle only counts candidates that reach a verdict: a candidate skipped
 		// above (claimed, pool held, budget exhausted, below threshold) was never evaluated, and
-		// marking it reached would demote it behind the tail on the next resumed walk.
+		// marking it reached would demote it behind the tail on the next resumed walk. A cached
+		// negative below counts — it stands in for the simulation that produced it.
 		s.evaluatedThisCycle.Insert(candidate.ProviderID())
+
+		// A candidate that an earlier pass simulated to a no-op, none of whose fingerprinted
+		// inputs have moved since, would re-derive the same answer. The lookup is always recorded
+		// so the recurrence rate is measurable; the skip itself is opt-in.
+		fingerprint := fingerprints.fingerprint(ctx, candidate)
+		if fingerprint != "" && s.negativeResults.ShouldSkip(s.ConsolidationType(), candidate.ProviderID(), fingerprint) && skipUnchangedNegatives {
+			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipUnchangedNegative)
+			skippedOnNegativeCache = true
+			depth = i + 1
+			continue
+		}
+
 		// compute a possible consolidation option
-		cmd, err := s.computeConsolidationWithinCandidateBudget(ctx, candidate)
+		candidateCtx, durability := withNoOpDurability(ctx)
+		cmd, err := s.computeConsolidationWithinCandidateBudget(candidateCtx, candidate)
 		depth = i + 1
 		if err != nil {
 			// A candidate that ran out of its own budget is abandoned, not an error: the walk
@@ -219,6 +258,11 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 		if cmd.Decision() == NoOpDecision {
+			// A no-op decided by pass-scoped exhaustion (spent split budget, deleting candidate,
+			// transient error) is not a verdict about the candidate and must not outlive the pass.
+			if fingerprint != "" && durability.Conclusive() {
+				s.negativeResults.StoreNegative(candidate.ProviderID(), fingerprint, negativeCacheTTL)
+			}
 			continue
 		}
 		// Score the move: Balanced pools may reject; other policies pass through.
@@ -237,6 +281,9 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			}
 			outcome = PassOutcomeCompleted
 			ObserveAcceptedCandidate(cmd, s.ConsolidationType(), i)
+			// The command frees capacity every stored verdict was computed without; none of them
+			// can be trusted against the fleet this command leaves behind.
+			s.negativeResults.Clear()
 			return []Command{cmd}, nil
 		}
 
@@ -255,6 +302,10 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	if len(proposals) > 0 {
 		admitted, err := s.admitProposals(ctx, proposals)
+		if len(admitted) > 0 {
+			// Executed commands change the free capacity every stored verdict was computed against.
+			s.negativeResults.Clear()
+		}
 		// Only passes that actually held a batch are observed, so the histogram's rate is the rate
 		// of batched passes: a pass holding one proposal admits exactly as the unbatched controller
 		// would, and would otherwise pile samples of 1 onto the distribution being measured.
@@ -278,7 +329,11 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return []Command{}, nil
 	}
 
-	if !constrainedByBudgets {
+	// A pass that skipped candidates on cached verdicts did not actually evaluate them, so it
+	// cannot declare the fleet consolidated: IsConsolidated would then suppress passes until some
+	// unrelated state change, holding the skipped entries past their TTL — expiry only runs when
+	// a pass looks the entries up. Mirrors how budget-constrained passes are handled.
+	if !constrainedByBudgets && !skippedOnNegativeCache {
 		// if there are no candidates because of a budget, don't mark
 		// as consolidated, as it's possible it should be consolidatable
 		// the next time we try to disrupt.

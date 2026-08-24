@@ -269,6 +269,7 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	if err != nil {
 		// if a candidate node is now deleting, just retry
 		if errors.Is(err, errCandidateDeleting) {
+			markNoOpInconclusive(ctx)
 			return Command{}, nil
 		}
 		return Command{}, err
