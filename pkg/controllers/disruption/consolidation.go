@@ -172,9 +172,10 @@ func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidat
 	return candidates
 }
 
-// consolidationSimulationOptions parameterizes a consolidation simulation. The zero value is the
-// ordinary path; the split fallback re-runs the same code with a price limit on new capacity, an
-// extra savings margin, and its own telemetry instead of the candidate skip counters.
+// consolidationSimulationOptions parameterizes a consolidation simulation. The ordinary path carries
+// only the configured replacement savings floor; the split fallback re-runs the same code with a
+// price limit on new capacity, its own savings margin, and its own telemetry instead of the
+// candidate skip counters.
 type consolidationSimulationOptions struct {
 	// newCapacityPriceLimit caps the price of instance types the simulation may launch new nodes from.
 	newCapacityPriceLimit float64
@@ -184,9 +185,39 @@ type consolidationSimulationOptions struct {
 	silent bool
 }
 
+// priceBudget is what a set of replacements must beat: the disrupted candidates' hourly price less the
+// savings margin the simulation requires. The margin decides the launch list too, since only options
+// under the limit survive the price filter, so a replacement can never launch a type that saves less
+// than the margin.
+type priceBudget struct {
+	// candidatePrice is the summed hourly price of the candidates being replaced.
+	candidatePrice float64
+	// minSavings is the fraction of candidatePrice the replacements must save beyond being cheaper.
+	minSavings float64
+}
+
+// limit is the aggregate worst-case launch price the replacements must stay under.
+func (b priceBudget) limit() float64 {
+	return b.candidatePrice * (1 - b.minSavings)
+}
+
+// split divides the limit evenly across n replacement claims for the zone-narrowing retries, which
+// price each claim against its own share before the aggregate filter has the final say.
+func (b priceBudget) split(n int) float64 {
+	return b.limit() / float64(n)
+}
+
+// vetoedByMargin reports whether replacements whose cheapest aggregate launch price is cheapestTotal
+// fail only because of the savings margin: they beat the candidates' price but not the limit.
+func (b priceBudget) vetoedByMargin(cheapestTotal float64) bool {
+	return cheapestTotal >= b.limit() && cheapestTotal < b.candidatePrice
+}
+
 // computeConsolidation computes a consolidation action to take
 func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...*Candidate) (Command, error) {
-	return c.computeConsolidationWithOptions(ctx, consolidationSimulationOptions{}, candidates...)
+	return c.computeConsolidationWithOptions(ctx, consolidationSimulationOptions{
+		minSavings: options.FromContext(ctx).ConsolidationReplaceMinSavings,
+	}, candidates...)
 }
 
 // errCandidateTimedOut reports a candidate abandoned by its own budget rather than by a failure.
@@ -293,8 +324,8 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// get the current node price based on the offering
 	// fallback if we can't find the specific zonal pricing data
 	candidatePrice := sumCandidatePrices(candidates)
-	// the replacement price a split fallback must beat, tightened by its savings margin
-	replacementPriceBudget := candidatePrice * (1 - simOpts.minSavings)
+	// the replacement price to beat, tightened by the simulation's savings margin
+	budget := priceBudget{candidatePrice: candidatePrice, minSavings: simOpts.minSavings}
 
 	allExistingAreSpot := true
 	for _, cn := range candidates {
@@ -316,7 +347,7 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 		lo.SomeBy(results.NewNodeClaims, func(nc *pscheduling.NodeClaim) bool {
 			return nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeSpot)
 		}) {
-		cmd, skipReason, err := c.computeSpotToSpotConsolidation(ctx, candidates, results, replacementPriceBudget, simOpts)
+		cmd, skipReason, err := c.computeSpotToSpotConsolidation(ctx, candidates, results, budget, simOpts)
 		if err == nil && cmd.Decision() == NoOpDecision {
 			if splitCmd, ok := c.trySplitConsolidation(ctx, simOpts, candidatePrice, candidates); ok {
 				return splitCmd, nil
@@ -341,12 +372,12 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// causing churns and landing onto lower available spot instance ultimately resulting in higher interruptions.
 	// When the spot-only retry is armed, hold the "can't replace" event back until the retry also
 	// fails: it may still turn the candidate into a replace command.
-	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, replacementPriceBudget, !simOpts.silent && spotRetrySnapshots == nil); !ok {
+	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, budget, !simOpts.silent && spotRetrySnapshots == nil); !ok {
 		if spotRetrySnapshots != nil {
 			if !simOpts.silent {
 				ObserveConsolidationODToSpotRetry(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
 			}
-			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, replacementPriceBudget, options.FromContext(ctx).SpotToSpotMinInstanceTypes) {
+			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes) {
 				cmd := Command{
 					Candidates:            candidates,
 					Replacements:          replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -419,17 +450,17 @@ func satisfiesMinValues(r *scheduling.Requirement, n int) bool {
 // and insufficient spot capacity fails the launch rather than falling back to on-demand.
 // It reports whether every claim retained a viable option; claims are mutated only on success
 // being meaningful (callers discard them otherwise).
-func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, priceBudget float64, spotLaunchCap int) bool {
+func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, spotLaunchCap int) bool {
 	observeOutcome := func(outcome string) {
 		if !simOpts.silent {
 			ObserveConsolidationODToSpotRetry(consolidationType, candidates, outcome)
 		}
 	}
-	// priceBudget is the aggregate across every replacement claim; a zone or type that is only cheap
+	// The budget is the aggregate across every replacement claim; a zone or type that is only cheap
 	// relative to the whole budget would get pinned into one claim and inflate its worst-case price
 	// past its share, so the narrowing below uses each claim's equal share. The aggregate filter at
 	// the end remains the authoritative price guarantee.
-	claimBudget := priceBudget / float64(len(newNodeClaims))
+	claimBudget := budget.split(len(newNodeClaims))
 	for i, nc := range newNodeClaims {
 		nc.InstanceTypeOptions = snapshots[i]
 		if outcome, ok := narrowClaimToCheapSpotZones(nc, claimBudget); !ok {
@@ -437,7 +468,7 @@ func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simO
 			return false
 		}
 	}
-	if ok, _, _ := c.filterReplacementsAndPublish(newNodeClaims, candidates, priceBudget, false); !ok {
+	if ok, _, _ := c.filterReplacementsAndPublish(newNodeClaims, candidates, budget, false); !ok {
 		observeOutcome(ODToSpotRetryOutcomeAggregatePrice)
 		return false
 	}
@@ -499,12 +530,12 @@ func narrowClaimToCheapSpotZones(nc *pscheduling.NodeClaim, claimBudget float64)
 // vetoes replacements most zones offer large savings on — the retry mirrors the on-demand to spot
 // repricing retry. Events are held back until the retry also fails: it may still turn the
 // candidate into a replace command.
-func (c *consolidation) filterSpotReplacementsWithZoneRetry(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, candidatePrice float64, publishEvents bool) (bool, string) {
+func (c *consolidation) filterSpotReplacementsWithZoneRetry(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, budget priceBudget, publishEvents bool) (bool, string) {
 	snapshots := lo.Map(newNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []*cloudprovider.InstanceType {
 		return append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)
 	})
-	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(newNodeClaims, candidates, candidatePrice, false); !ok {
-		if !c.retrySpotZoneNarrowedReplacements(ctx, candidates, newNodeClaims, snapshots, candidatePrice, skipReason, priceDetail, publishEvents) {
+	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(newNodeClaims, candidates, budget, false); !ok {
+		if !c.retrySpotZoneNarrowedReplacements(ctx, candidates, newNodeClaims, snapshots, budget, skipReason, priceDetail, publishEvents) {
 			return false, skipReason
 		}
 	}
@@ -517,19 +548,19 @@ func (c *consolidation) filterSpotReplacementsWithZoneRetry(ctx context.Context,
 // compatibility rejection fails for reasons no zone subset changes. On any failure the original
 // skip's events are published with the original price detail; the claims are only meaningfully
 // mutated on success. See the equal-share rationale on retrySpotOnlyReplacements for why each
-// claim is priced against candidatePrice split evenly across the claims.
-func (c *consolidation) retrySpotZoneNarrowedReplacements(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, candidatePrice float64, skipReason, priceDetail string, publishEvents bool) bool {
+// claim is priced against the budget split evenly across the claims.
+func (c *consolidation) retrySpotZoneNarrowedReplacements(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, skipReason, priceDetail string, publishEvents bool) bool {
 	observeOutcome := func(outcome string) {
 		if publishEvents {
 			ObserveConsolidationSpotZoneRetry(consolidationTypeFromContext(ctx), candidates, outcome)
 		}
 	}
-	if skipReason != CandidateSkipNoCheaperSingleReplacement && skipReason != CandidateSkipNoCheaperReplacementSet {
+	if !priceEmptiedSkip(skipReason) {
 		c.publishReplacementSkip(newNodeClaims, candidates, skipReason, priceDetail, publishEvents)
 		return false
 	}
 	observeOutcome(ODToSpotRetryOutcomeArmed)
-	claimBudget := candidatePrice / float64(len(newNodeClaims))
+	claimBudget := budget.split(len(newNodeClaims))
 	for i, nc := range newNodeClaims {
 		nc.InstanceTypeOptions = snapshots[i]
 		if outcome, narrowed := narrowClaimToCheapSpotZones(nc, claimBudget); !narrowed {
@@ -538,7 +569,7 @@ func (c *consolidation) retrySpotZoneNarrowedReplacements(ctx context.Context, c
 			return false
 		}
 	}
-	if retried, _, _ := c.filterReplacementsAndPublish(newNodeClaims, candidates, candidatePrice, false); !retried {
+	if retried, _, _ := c.filterReplacementsAndPublish(newNodeClaims, candidates, budget, false); !retried {
 		observeOutcome(ODToSpotRetryOutcomeAggregatePrice)
 		c.publishReplacementSkip(newNodeClaims, candidates, skipReason, priceDetail, publishEvents)
 		return false
@@ -567,7 +598,7 @@ func consolidationSchedulerOptions(newCapacityPriceLimit float64) []pscheduling.
 // candidate was passed over rather than that it was.
 //
 // nolint:unparam
-func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results, candidatePrice float64, simOpts consolidationSimulationOptions) (Command, string, error) {
+func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results, budget priceBudget, simOpts consolidationSimulationOptions) (Command, string, error) {
 	publishEvents := !simOpts.silent
 
 	// Spot consolidation is turned off.
@@ -589,7 +620,7 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 
-	if ok, skipReason := c.filterSpotReplacementsWithZoneRetry(ctx, candidates, results.NewNodeClaims, candidatePrice, publishEvents); !ok {
+	if ok, skipReason := c.filterSpotReplacementsWithZoneRetry(ctx, candidates, results.NewNodeClaims, budget, publishEvents); !ok {
 		return Command{}, skipReason, nil
 	}
 
@@ -652,14 +683,14 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	return cmd, "", nil
 }
 
-// filterReplacementsAndPublish price-filters the replacement NodeClaims against the candidates' total price and
-// returns whether all replacements still have viable instance type options, publishing an Unconsolidatable event for
-// single-node candidates when they don't and events are enabled (a split fallback retry re-evaluates a candidate the
-// ordinary path already reported on, so it stays silent). The second return value is the skip reason for the
-// rejection, empty when the replacements survive; the third is the pricing detail captured for a single-node
-// candidate before filtering (see cheapestWorstLaunchDetail), so a caller that suppressed events for a retry can
-// still replay them with the detail attached.
-func (c *consolidation) filterReplacementsAndPublish(newNodeClaims []*pscheduling.NodeClaim, candidates []*Candidate, candidatePrice float64, publishEvents bool) (bool, string, string) {
+// filterReplacementsAndPublish price-filters the replacement NodeClaims against the budget and returns whether all
+// replacements still have viable instance type options, publishing an Unconsolidatable event for single-node
+// candidates when they don't and events are enabled (a split fallback retry re-evaluates a candidate the ordinary
+// path already reported on, so it stays silent). The second return value is the skip reason for the rejection, empty
+// when the replacements survive; the third is the pricing detail captured for a single-node candidate before
+// filtering (see cheapestWorstLaunchDetail), so a caller that suppressed events for a retry can still replay them
+// with the detail attached.
+func (c *consolidation) filterReplacementsAndPublish(newNodeClaims []*pscheduling.NodeClaim, candidates []*Candidate, budget priceBudget, publishEvents bool) (bool, string, string) {
 	noOptions := func() bool {
 		return lo.SomeBy(newNodeClaims, func(nc *pscheduling.NodeClaim) bool { return len(nc.InstanceTypeOptions) == 0 })
 	}
@@ -674,9 +705,10 @@ func (c *consolidation) filterReplacementsAndPublish(newNodeClaims []*pschedulin
 	// recoverable before it runs.
 	var priceDetail string
 	if len(candidates) == 1 {
-		priceDetail = cheapestWorstLaunchDetail(newNodeClaims[0], candidatePrice)
+		priceDetail = cheapestWorstLaunchDetail(newNodeClaims[0], budget)
 	}
-	if err := filterReplacementsByAggregatePrice(newNodeClaims, candidatePrice); err != nil {
+	cheapestTotal := cheapestAggregateLaunchPrice(newNodeClaims)
+	if err := filterReplacementsByAggregatePrice(newNodeClaims, budget.limit()); err != nil {
 		if len(candidates) == 1 && publishEvents {
 			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("Filtering by price: %v", err))...)
 		}
@@ -687,6 +719,11 @@ func (c *consolidation) filterReplacementsAndPublish(newNodeClaims []*pschedulin
 	}
 	if noOptions() {
 		c.publishCantReplace(newNodeClaims, candidates, publishEvents, priceDetail)
+		// Cheaper capacity exists but not enough cheaper: the fleet is waiting on the margin, not on
+		// offerings, and only a wider price gap would change the verdict.
+		if budget.vetoedByMargin(cheapestTotal) {
+			return false, CandidateSkipBelowMinSavings, priceDetail
+		}
 		// Nothing survived the price ceiling, so the fleet is waiting on cheaper offerings. One
 		// replacement means one node of the candidate's shape fits its pods and no such node is
 		// cheaper, which is what the split fallback exists to serve.
@@ -725,7 +762,7 @@ func worstLaunchOffering(it *cloudprovider.InstanceType, reqs scheduling.Require
 // zone of that offering, and the budget it had to beat. This makes the market comparison behind a
 // "Can't replace with a cheaper node" event auditable — in particular, which capacity type was priced and which
 // zone set the worst case.
-func cheapestWorstLaunchDetail(nc *pscheduling.NodeClaim, budget float64) string {
+func cheapestWorstLaunchDetail(nc *pscheduling.NodeClaim, budget priceBudget) string {
 	var best *cloudprovider.Offering
 	var bestName string
 	for _, it := range nc.InstanceTypeOptions {
@@ -736,7 +773,16 @@ func cheapestWorstLaunchDetail(nc *pscheduling.NodeClaim, budget float64) string
 	if best == nil {
 		return ""
 	}
-	return fmt.Sprintf(" (cheapest option %s prices worst-case at $%g for %s in %s, budget $%g)", bestName, best.Price, best.CapacityType(), best.Zone(), budget)
+	if budget.minSavings > 0 {
+		return fmt.Sprintf(" (cheapest option %s prices worst-case at $%g for %s in %s, budget $%g after the %g%% minimum savings on $%g)", bestName, best.Price, best.CapacityType(), best.Zone(), budget.limit(), budget.minSavings*100, budget.candidatePrice)
+	}
+	return fmt.Sprintf(" (cheapest option %s prices worst-case at $%g for %s in %s, budget $%g)", bestName, best.Price, best.CapacityType(), best.Zone(), budget.limit())
+}
+
+// priceEmptiedSkip reports whether a skip reason means the price filter emptied every replacement
+// option: the only rejections a cheaper repricing (spot-only, zone-narrowed) can still overturn.
+func priceEmptiedSkip(skipReason string) bool {
+	return skipReason == CandidateSkipNoCheaperSingleReplacement || skipReason == CandidateSkipNoCheaperReplacementSet || skipReason == CandidateSkipBelowMinSavings
 }
 
 // publishReplacementSkip replays the event the ordinary filter would have published, matched to the
@@ -766,6 +812,23 @@ func truncateSpotInstanceTypeOptions(nc *pscheduling.NodeClaim, maxOptions int) 
 	}
 }
 
+// cheapestLaunchPrice is the lowest worst-case launch price among a replacement claim's instance type options, or
+// MaxFloat64 when it has none, so a claim with no options can never appear affordable in an aggregate.
+func cheapestLaunchPrice(nc *pscheduling.NodeClaim) float64 {
+	cheapest := math.MaxFloat64
+	for _, it := range nc.InstanceTypeOptions {
+		if p := it.Offerings.Available().WorstLaunchPrice(nc.Requirements); p < cheapest {
+			cheapest = p
+		}
+	}
+	return cheapest
+}
+
+// cheapestAggregateLaunchPrice is the lowest worst-case price at which every replacement claim could launch together.
+func cheapestAggregateLaunchPrice(newNodeClaims []*pscheduling.NodeClaim) float64 {
+	return lo.SumBy(newNodeClaims, cheapestLaunchPrice)
+}
+
 // filterReplacementsByAggregatePrice filters each replacement NodeClaim's instance type options so that the
 // worst-case total launch price across all replacements stays below candidatePrice. Each claim's price budget is
 // its cheapest launch price plus an equal share of the surplus budget, so any combination of retained options is
@@ -775,17 +838,8 @@ func truncateSpotInstanceTypeOptions(nc *pscheduling.NodeClaim, maxOptions int) 
 // Claims left with no options are how it reports that nothing is cheaper; the only error it returns is a minValues
 // failure from a claim whose cheaper options were kept.
 func filterReplacementsByAggregatePrice(newNodeClaims []*pscheduling.NodeClaim, candidatePrice float64) error {
-	cheapest := make([]float64, len(newNodeClaims))
-	cheapestTotal := 0.0
-	for i, nc := range newNodeClaims {
-		cheapest[i] = math.MaxFloat64
-		for _, it := range nc.InstanceTypeOptions {
-			if p := it.Offerings.Available().WorstLaunchPrice(nc.Requirements); p < cheapest[i] {
-				cheapest[i] = p
-			}
-		}
-		cheapestTotal += cheapest[i]
-	}
+	cheapest := lo.Map(newNodeClaims, func(nc *pscheduling.NodeClaim, _ int) float64 { return cheapestLaunchPrice(nc) })
+	cheapestTotal := lo.Sum(cheapest)
 	if cheapestTotal >= candidatePrice {
 		// No combination of replacements can beat the candidate's price; empty all options so the caller
 		// reports "can't replace with cheaper node(s)".

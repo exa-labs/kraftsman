@@ -67,6 +67,7 @@ var _ = Describe("Options", func() {
 		"FEATURE_GATES",
 		"OD_TO_SPOT_CONSOLIDATION",
 		"SPOT_TO_SPOT_MIN_INSTANCE_TYPES",
+		"CONSOLIDATION_REPLACE_MIN_SAVINGS",
 	}
 
 	BeforeEach(func() {
@@ -355,6 +356,31 @@ var _ = Describe("Options", func() {
 
 		It("should fail validation when spot-to-spot-min-instance-types is below 1", func() {
 			Expect(opts.Parse(fs, "--spot-to-spot-min-instance-types=0")).ToNot(Succeed())
+		})
+
+		It("should default consolidation-replace-min-savings to 0", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationReplaceMinSavings).To(BeZero())
+		})
+
+		It("should set consolidation-replace-min-savings via the environment variable", func() {
+			os.Setenv("CONSOLIDATION_REPLACE_MIN_SAVINGS", "0.1")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationReplaceMinSavings).To(Equal(0.1))
+		})
+
+		It("should set consolidation-replace-min-savings via the CLI flag", func() {
+			Expect(opts.Parse(fs, "--consolidation-replace-min-savings=0.25")).To(Succeed())
+			Expect(opts.ConsolidationReplaceMinSavings).To(Equal(0.25))
+		})
+
+		It("should fail validation when consolidation-replace-min-savings is outside [0, 1)", func() {
+			Expect(opts.Parse(fs, "--consolidation-replace-min-savings=1")).ToNot(Succeed())
+			Expect(opts.Parse(fs, "--consolidation-replace-min-savings=-0.1")).ToNot(Succeed())
 		})
 
 		DescribeTable(

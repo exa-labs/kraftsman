@@ -107,6 +107,7 @@ type Options struct {
 	ConsolidationSplitFallback         bool
 	ConsolidationSplitMaxAttempts      int
 	ConsolidationSplitMinSavings       float64
+	ConsolidationReplaceMinSavings     float64
 	SpotToSpotMinInstanceTypes         int
 	ConsolidationCandidateTimeout      time.Duration
 	ConsolidationAttributeReplacements bool
@@ -164,6 +165,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.DurationVar(&o.ConsolidationCandidateTimeout, "consolidation-candidate-timeout", env.WithDefaultDuration("CONSOLIDATION_CANDIDATE_TIMEOUT", 10*time.Second), "The maximum time a single consolidation candidate's scheduling simulation may run before it is abandoned and the walk moves on. The pass timeout bounds discovery in aggregate; this bounds one candidate, so a pass degrades into finding fewer commands rather than none. 0 disables the per-candidate bound.")
 	fs.BoolVar(&o.ConsolidationAttributeReplacements, "consolidation-attribute-replacements", env.WithDefaultBool("CONSOLIDATION_ATTRIBUTE_REPLACEMENTS", true), "Count only the new NodeClaims that host a disrupted pod as a command's replacements. A consolidation simulation also schedules the cluster's pending pods, and the capacity it opens for them would otherwise be priced against the candidate and counted against the replacement bound. Disable to restore the unattributed behavior.")
 	fs.BoolVarWithEnv(&o.ODToSpotConsolidation, "od-to-spot-consolidation", "OD_TO_SPOT_CONSOLIDATION", true, "When set, a consolidation candidate running on-demand whose replacement found nothing cheaper is re-evaluated against spot offerings only, restricted to the zones whose spot price beats the candidate. The replacement launch is pinned to spot and those zones, so insufficient spot capacity fails the launch instead of falling back to on-demand. Enabled by default; set to false to opt out.")
+	fs.Float64Var(&o.ConsolidationReplaceMinSavings, "consolidation-replace-min-savings", env.WithDefaultFloat64("CONSOLIDATION_REPLACE_MIN_SAVINGS", 0), "The fraction of the disrupted nodes' price that any consolidation replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. Applies to every replace decision, including spot-to-spot and the split fallback (which uses the larger of this and consolidation-split-min-savings); delete decisions are unaffected. Replacement launches are also restricted to instance types that meet the margin. 0 accepts any cheaper replacement.")
 	fs.Float64Var(&o.ConsolidationSplitMinSavings, "consolidation-split-min-savings", env.WithDefaultFloat64("CONSOLIDATION_SPLIT_MIN_SAVINGS", 0.05), "The fraction of a candidate's price that a split replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. Guards against churning a node into several nodes for a negligible price difference.")
 	fs.DurationVar(&o.NodeClaimInitializationTimeout, "nodeclaim-initialization-timeout", env.WithDefaultDuration("NODECLAIM_INITIALIZATION_TIMEOUT", 0), "The maximum time a registered NodeClaim may stay uninitialized before it is deleted. Registration only means the kubelet joined; a node whose startup taints are never removed, or whose requested extended resources never appear, stays registered and uninitialized indefinitely, holding an instance that runs no workload and that disruption still models with its full capacity. A bootstrap that fails every time replaces one stranded instance with a delete and reprovision once per timeout, as the registration timeout already does, so set it well above the slowest healthy bootstrap. 0 disables the timeout.")
 	fs.StringVar(&o.topologyCountCacheModeRaw, "topology-count-cache-mode", env.WithDefaultString("TOPOLOGY_COUNT_CACHE_MODE", string(TopologyCountCacheModeOff)), "Whether a scheduling pass reuses each topology group's pod domain counts across its candidate simulations. The counts are a pure function of inputs the pass already pins, so the replay is exact; 'shadow' computes both paths, uses the fresh one, and counts divergences in the topology_count_cache_events_total metric, which is the evidence to collect before switching to 'on'. Can be one of 'off', 'shadow', and 'on'.")
@@ -228,6 +230,9 @@ func (o *Options) validateConsolidation() error {
 	}
 	if o.ConsolidationSplitMinSavings < 0 || o.ConsolidationSplitMinSavings >= 1 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_SPLIT_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationSplitMinSavings)
+	}
+	if o.ConsolidationReplaceMinSavings < 0 || o.ConsolidationReplaceMinSavings >= 1 {
+		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationReplaceMinSavings)
 	}
 	return nil
 }

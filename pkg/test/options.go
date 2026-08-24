@@ -55,6 +55,7 @@ type OptionsFields struct {
 	ConsolidationSplitFallback         *bool
 	ConsolidationSplitMaxAttempts      *int
 	ConsolidationSplitMinSavings       *float64
+	ConsolidationReplaceMinSavings     *float64
 	SpotToSpotMinInstanceTypes         *int
 	ConsolidationCandidateTimeout      *time.Duration
 	ConsolidationAttributeReplacements *bool
@@ -107,6 +108,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		ConsolidationSplitFallback:       lo.FromPtrOr(opts.ConsolidationSplitFallback, false),
 		ConsolidationSplitMaxAttempts:    lo.FromPtrOr(opts.ConsolidationSplitMaxAttempts, 50),
 		ConsolidationSplitMinSavings:     lo.FromPtrOr(opts.ConsolidationSplitMinSavings, 0.05),
+		ConsolidationReplaceMinSavings:   lo.FromPtrOr(opts.ConsolidationReplaceMinSavings, 0),
 		SpotToSpotMinInstanceTypes:       lo.FromPtrOr(opts.SpotToSpotMinInstanceTypes, 15),
 		// Tests drive a fake clock, and a per-candidate deadline is wall-clock, so it is off by
 		// default here: a suite opts in when it is what is under test.

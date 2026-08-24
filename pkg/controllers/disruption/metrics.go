@@ -105,6 +105,10 @@ const (
 	// CandidateSkipNoCheaperReplacementSet is the same verdict for a multi-node replacement plan:
 	// no combination of the required replacements beats the candidates' price.
 	CandidateSkipNoCheaperReplacementSet = "no_cheaper_replacement_set"
+	// CandidateSkipBelowMinSavings means cheaper capacity exists but the cheapest replacement set saves
+	// less than the configured minimum fraction of the candidates' price. This fleet is waiting on a
+	// wider price gap, not on offerings, and the skip is the cost of the floor.
+	CandidateSkipBelowMinSavings = "below_min_savings"
 	// CandidateSkipReplacementFlexibility means cheaper capacity does exist but the options that
 	// survived the price ceiling could not satisfy the NodePool's minValues requirements. This
 	// fleet is waiting on requirements, not on prices.
