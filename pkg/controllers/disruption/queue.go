@@ -49,12 +49,14 @@ import (
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -66,6 +68,9 @@ const (
 	maxRetryDuration        = 1 * time.Hour
 	maxConcurrentReconciles = 100
 	retryDurationScale      = 80 * time.Millisecond
+	// terminationBudgetPollInterval is how often a command whose replacements are initialized re-checks the
+	// NodePool's termination budget when pipelined disruption budgets are enabled.
+	terminationBudgetPollInterval = 10 * time.Second
 )
 
 type UnrecoverableError struct {
@@ -74,6 +79,26 @@ type UnrecoverableError struct {
 
 func NewUnrecoverableError(err error) *UnrecoverableError {
 	return &UnrecoverableError{error: err}
+}
+
+// TerminationBudgetError is returned by waitOrTerminate when a command's replacements are initialized but the
+// NodePool's termination budget has no room to start draining its candidates. It is recoverable and, unlike other
+// recoverable errors, does not count against the command's retry duration: the replacement is up and nothing is
+// broken, the command is just queued behind drains that are already in progress.
+type TerminationBudgetError struct {
+	error
+}
+
+func NewTerminationBudgetError(err error) *TerminationBudgetError {
+	return &TerminationBudgetError{error: err}
+}
+
+func IsTerminationBudgetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var terminationBudgetError *TerminationBudgetError
+	return stderrors.As(err, &terminationBudgetError)
 }
 
 func IsUnrecoverableError(err error) bool {
@@ -101,11 +126,12 @@ type Queue struct {
 	cluster             *state.Cluster
 	clock               clock.Clock
 	provisioner         *provisioning.Provisioner
+	cloudProvider       cloudprovider.CloudProvider
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
 func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner,
+	provisioner *provisioning.Provisioner, cloudProvider cloudprovider.CloudProvider,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -117,6 +143,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		cluster:             cluster,
 		clock:               clock,
 		provisioner:         provisioner,
+		cloudProvider:       cloudProvider,
 	}
 	return queue
 }
@@ -151,6 +178,11 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues(cmd.LogValues()...))
 
 	if err := q.waitOrTerminate(ctx, cmd); err != nil {
+		// Waiting on termination budget is a function of other nodes' drains finishing, which takes minutes, so poll
+		// it less aggressively than the replacement readiness wait.
+		if IsTerminationBudgetError(err) {
+			return reconcile.Result{RequeueAfter: terminationBudgetPollInterval}, nil
+		}
 		// If recoverable, re-queue and try again.
 		if !IsUnrecoverableError(err) {
 			return reconcile.Result{RequeueAfter: queueBaseDelay}, nil
@@ -195,6 +227,11 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	retryDuration := q.GetMaxRetryDuration()
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
+		// A command held only by the termination budget has working replacements; failing it would orphan them and
+		// un-taint candidates that are about to drain, so the budget wait is not bounded by the retry duration.
+		if IsTerminationBudgetError(err) {
+			return
+		}
 		if q.clock.Since(cmd.CreationTimestamp) > retryDuration {
 			err = NewUnrecoverableError(serrors.Wrap(fmt.Errorf("command reached timeout, %w", err), "duration", q.clock.Since(cmd.CreationTimestamp)))
 		}
@@ -233,7 +270,13 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 		return fmt.Errorf("waiting for replacement initialization, %w", err)
 	}
 
-	// All replacements have been provisioned.
+	// All replacements have been provisioned. With pipelined budgets, deleting the candidates is what actually
+	// disrupts their pods, so this is where the NodePool's termination budget is spent.
+	if options.FromContext(ctx).PipelinedDisruptionBudgets {
+		if err := q.waitForTerminationBudget(ctx, cmd); err != nil {
+			return err
+		}
+	}
 	// All we need to do now is get a successful delete call for each node claim,
 	// then the termination controller will handle the eventual deletion of the nodes.
 	errs := make([]error, len(cmd.Candidates))
@@ -254,6 +297,36 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// If there were any deletion failures, we should requeue.
 	// In the case where we requeue, but the timeout for the command is reached, we'll mark this as a failure.
 	return multierr.Combine(errs...)
+}
+
+// waitForTerminationBudget returns a TerminationBudgetError when any NodePool among the command's candidates cannot
+// start draining all of the candidates it owns right now. Candidates that are already deleting (a previous attempt
+// got part way through) are not counted again; they already hold a terminating slot.
+func (q *Queue) waitForTerminationBudget(ctx context.Context, cmd *Command) error {
+	needed := map[string]int{}
+	for _, c := range cmd.Candidates {
+		if c.Deleted() {
+			continue
+		}
+		needed[c.NodePool.Name]++
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+	terminationBudget, err := BuildTerminationBudgetMapping(ctx, q.cluster, q.clock, q.kubeClient, q.cloudProvider, cmd.Reason())
+	if err != nil {
+		return fmt.Errorf("building termination budgets, %w", err)
+	}
+	for nodePool, n := range needed {
+		if available := terminationBudget[nodePool]; available < n {
+			DisruptionQueueTerminationWaitsTotal.Inc(map[string]string{
+				metrics.NodePoolLabel: nodePool,
+				metrics.ReasonLabel:   pretty.ToSnakeCase(string(cmd.Reason())),
+			})
+			return NewTerminationBudgetError(serrors.Wrap(fmt.Errorf("waiting for termination budget"), "NodePool", klog.KRef("", nodePool), "needed", n, "available", available))
+		}
+	}
+	return nil
 }
 
 // markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted

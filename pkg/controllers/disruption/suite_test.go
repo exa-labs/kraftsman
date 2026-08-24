@@ -103,7 +103,7 @@ var _ = BeforeSuite(func() {
 	recorder = test.NewEventRecorder()
 	draController = deviceallocation.NewController(env.Client)
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController)
-	queue = disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov)
+	queue = disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, cloudProvider)
 })
 
 var _ = AfterSuite(func() {
@@ -128,7 +128,7 @@ var _ = BeforeEach(func() {
 	disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
-	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
+	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, cloudProvider))
 	cluster.MarkUnconsolidated()
 
 	// Reset Feature Flags to test defaults
@@ -472,7 +472,7 @@ var _ = Describe("Simulate Scheduling", func() {
 		defer hangCreateClient.Stop()
 
 		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, env.Clock, deviceallocation.NewController(hangCreateClient))
-		q := disruption.NewQueue(hangCreateClient, recorder, cluster, env.Clock, p)
+		q := disruption.NewQueue(hangCreateClient, recorder, cluster, env.Clock, p, cloudProvider)
 		dc := disruption.NewController(env.Clock, hangCreateClient, p, cloudProvider, recorder, cluster, q, clusterCost)
 
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{

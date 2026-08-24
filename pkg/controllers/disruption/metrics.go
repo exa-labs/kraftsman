@@ -304,6 +304,43 @@ var (
 		},
 		[]string{metrics.NodePoolLabel, metrics.ReasonLabel},
 	)
+	// NodePoolNodesPendingReplacement and NodePoolNodesTerminating split NodePoolNodesConsumingBudgets into the two
+	// stages of a replace command: candidates whose replacement is still booting (pending) and candidates that are
+	// actually draining or NotReady (terminating). With pipelined budgets only the former counts against the budget
+	// for starting commands and only the latter against the budget for terminating; without it their sum is the spend.
+	NodePoolNodesPendingReplacement = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodePoolSubsystem,
+			Name:      "nodes_pending_replacement",
+			Help:      "The number of nodes a disruption command has claimed whose replacements are still initializing. Labeled by NodePool and reason.",
+		},
+		[]string{metrics.NodePoolLabel, metrics.ReasonLabel},
+	)
+	NodePoolNodesTerminating = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodePoolSubsystem,
+			Name:      "nodes_terminating",
+			Help:      "The number of initialized nodes that are draining or NotReady. Labeled by NodePool and reason.",
+		},
+		[]string{metrics.NodePoolLabel, metrics.ReasonLabel},
+	)
+	// DisruptionQueueTerminationWaitsTotal counts the times the disruption queue had a command whose replacements were
+	// initialized but held off deleting its candidates because the NodePool's termination budget was full. A
+	// sustained rate means replacements are booting faster than drains complete and the budget is the limiter.
+	DisruptionQueueTerminationWaitsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "queue_termination_waits_total",
+			Help:      "The number of times a disruption command with initialized replacements waited for termination budget before deleting its candidates. Labeled by NodePool and reason.",
+		},
+		[]string{metrics.NodePoolLabel, metrics.ReasonLabel},
+	)
 	DisruptionQueueFailuresTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
