@@ -82,7 +82,6 @@ type SingleNodeConsolidation struct {
 	// completing between passes — from any disruption method, not just this one — can free
 	// capacity that a cached no-op verdict depended on, so the cache is cleared when it moves.
 	completedCommandsSeen uint64
->>>>>>> cd61923c (perf(consolidation): skip candidates whose no-op verdict cannot have changed, behind a flag)
 }
 
 func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *SingleNodeConsolidation {
