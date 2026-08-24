@@ -191,29 +191,30 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 
 	// The simulation searches every ready NodePool for a replacement, so a change to any other
 	// pool — not just the candidate's — must change the fingerprint.
-	otherPool := managedNodePool("pool-other", 1, true)
+	otherPool := managedNodePool(1, true)
 	withOther := newNegativeCacheFingerprints(fakecr.NewFakeClient(otherPool), provider).fingerprint(ctx, base)
 	if withOther == baseFingerprint {
 		t.Fatal("adding another ready NodePool did not change the fingerprint")
 	}
-	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(managedNodePool("pool-other", 2, true)), provider).fingerprint(ctx, base); got == withOther {
+	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(managedNodePool(2, true)), provider).fingerprint(ctx, base); got == withOther {
 		t.Fatal("editing another ready NodePool did not change the fingerprint")
 	}
 	// A fleet pool recreated under the same name with the same generation and revision must still
 	// change the fingerprint: its UID is the only thing that distinguishes the new object.
-	recreated := managedNodePool("pool-other", 1, true)
+	recreated := managedNodePool(1, true)
 	recreated.UID = "pool-other-recreated-uid"
 	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(recreated), provider).fingerprint(ctx, base); got == withOther {
 		t.Fatal("recreating a fleet NodePool with a new UID did not change the fingerprint")
 	}
 	// Readiness gates membership in the fleet component, so a pool flipping unready must change
 	// the fingerprint: the simulation the verdict came from could have used that pool.
-	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(managedNodePool("pool-other", 1, false)), provider).fingerprint(ctx, base); got != baseFingerprint {
+	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(managedNodePool(1, false)), provider).fingerprint(ctx, base); got != baseFingerprint {
 		t.Fatal("an unready NodePool entered the fleet component")
 	}
 }
 
-func managedNodePool(name string, generation int64, ready bool) *v1.NodePool {
+func managedNodePool(generation int64, ready bool) *v1.NodePool {
+	const name = "pool-other"
 	nodePool := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid"), Generation: generation},
 		Spec: v1.NodePoolSpec{
