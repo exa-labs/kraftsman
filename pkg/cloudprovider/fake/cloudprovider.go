@@ -52,6 +52,10 @@ type CloudProvider struct {
 	InstanceTypes            []*cloudprovider.InstanceType
 	InstanceTypesForNodePool map[string][]*cloudprovider.InstanceType
 	ErrorsForNodePool        map[string]error
+	// InstanceTypesRevision is the revision reported by GetInstanceTypesWithRevision. It is 0 by
+	// default, which per InstanceTypesRevisionProvider means "no stable revision available", so
+	// callers behave as if the provider did not implement the interface until a test sets it.
+	InstanceTypesRevision uint64
 
 	mu sync.RWMutex
 	// CreateCalls contains the arguments for every create call that was made since it was cleared
@@ -85,6 +89,7 @@ func (c *CloudProvider) Reset() {
 	c.CreateCalls = nil
 	c.CreatedNodeClaims = map[string]*v1.NodeClaim{}
 	c.InstanceTypes = nil
+	c.InstanceTypesRevision = 0
 	c.InstanceTypesForNodePool = map[string][]*cloudprovider.InstanceType{}
 	c.ErrorsForNodePool = map[string]error{}
 	c.AllowedCreateCalls = math.MaxInt
@@ -262,6 +267,23 @@ func (c *CloudProvider) GetInstanceTypes(_ context.Context, np *v1.NodePool) ([]
 			}),
 		),
 	}, nil
+}
+
+// GetInstanceTypesWithRevision implements cloudprovider.InstanceTypesRevisionProvider so tests can
+// exercise the paths that need a content revision. It reports InstanceTypesRevision, which is 0
+// unless a test sets it, and a 0 revision means callers must not treat the result as versioned.
+func (c *CloudProvider) GetInstanceTypesWithRevision(ctx context.Context, np *v1.NodePool) ([]*cloudprovider.InstanceType, uint64, error) {
+	its, err := c.GetInstanceTypes(ctx, np)
+	if err != nil {
+		return nil, 0, err
+	}
+	return its, c.InstanceTypesRevision, nil
+}
+
+// InstanceTypeRevision implements cloudprovider.InstanceTypeRevisionProvider, reporting the same
+// InstanceTypesRevision without materializing the instance type list.
+func (c *CloudProvider) InstanceTypeRevision(_ context.Context, _ *v1.NodePool) (uint64, error) {
+	return c.InstanceTypesRevision, nil
 }
 
 func (c *CloudProvider) Delete(_ context.Context, nc *v1.NodeClaim) error {

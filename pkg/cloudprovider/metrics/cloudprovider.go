@@ -164,6 +164,17 @@ func (d *decorator) GetInstanceTypesWithRevision(ctx context.Context, nodePool *
 	return instanceTypes, revision, err
 }
 
+// InstanceTypeRevision forwards the optional InstanceTypeRevisionProvider interface. A lookup on
+// the underlying provider's revision counter is too cheap to be worth a duration sample, so it is
+// not measured. A provider that does not implement it reports 0 (no stable revision).
+func (d *decorator) InstanceTypeRevision(ctx context.Context, nodePool *v1.NodePool) (uint64, error) {
+	revisionProvider, ok := d.CloudProvider.(cloudprovider.InstanceTypeRevisionProvider)
+	if !ok {
+		return 0, nil
+	}
+	return revisionProvider.InstanceTypeRevision(ctx, nodePool)
+}
+
 func (d *decorator) IsDrifted(ctx context.Context, nodeClaim *v1.NodeClaim) (cloudprovider.DriftReason, error) {
 	method := "IsDrifted"
 	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()

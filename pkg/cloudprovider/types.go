@@ -110,6 +110,17 @@ type InstanceTypesRevisionProvider interface {
 	GetInstanceTypesWithRevision(context.Context, *v1.NodePool) ([]*InstanceType, uint64, error)
 }
 
+// InstanceTypeRevisionProvider is an optional interface a CloudProvider can implement to return
+// only the revision of a NodePool's instance type list, without materializing the list itself.
+// The revision follows the same contract as InstanceTypesRevisionProvider: it must change
+// whenever the content returned for the same NodePool (UID and generation) can differ, and 0
+// means no stable revision is available. Callers that need the revision but not the types (e.g.
+// fingerprinting) should use this instead of GetInstanceTypesWithRevision, which may clone the
+// full list per call.
+type InstanceTypeRevisionProvider interface {
+	InstanceTypeRevision(context.Context, *v1.NodePool) (uint64, error)
+}
+
 type NodeLifecycleHookResult struct {
 	// Requeue indicates the lifecycle controller should requeue with exponential backoff.
 	Requeue bool

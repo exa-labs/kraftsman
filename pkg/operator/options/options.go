@@ -78,44 +78,46 @@ type FeatureGates struct {
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
 type Options struct {
-	ServiceName                        string
-	MetricsPort                        int
-	HealthProbePort                    int
-	KubeClientQPS                      int
-	KubeClientBurst                    int
-	EnableProfiling                    bool
-	DisableControllerWarmup            bool
-	DisableLeaderElection              bool
-	DisableClusterStateObservability   bool
-	LeaderElectionName                 string
-	LeaderElectionNamespace            string
-	MemoryLimit                        int64
-	CPURequests                        int64
-	LogLevel                           string
-	LogOutputPaths                     string
-	LogErrorOutputPaths                string
-	BatchMaxDuration                   time.Duration
-	BatchIdleDuration                  time.Duration
-	NodeMetricsInterval                time.Duration
-	preferencePolicyRaw                string
-	PreferencePolicy                   PreferencePolicy
-	minValuesPolicyRaw                 string
-	MinValuesPolicy                    MinValuesPolicy
-	IgnoreDRARequests                  bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
-	MaxConsolidationReplacements       int
-	MaxConsolidationCommandsPerPass    int
-	ConsolidationSplitFallback         bool
-	ConsolidationSplitMaxAttempts      int
-	ConsolidationSplitMinSavings       float64
-	ConsolidationReplaceMinSavings     float64
-	SpotToSpotMinInstanceTypes         int
-	ConsolidationCandidateTimeout      time.Duration
-	ConsolidationAttributeReplacements bool
-	NodeClaimInitializationTimeout     time.Duration
-	ODToSpotConsolidation              bool
-	topologyCountCacheModeRaw          string
-	TopologyCountCacheMode             TopologyCountCacheMode
-	FeatureGates                       FeatureGates
+	ServiceName                         string
+	MetricsPort                         int
+	HealthProbePort                     int
+	KubeClientQPS                       int
+	KubeClientBurst                     int
+	EnableProfiling                     bool
+	DisableControllerWarmup             bool
+	DisableLeaderElection               bool
+	DisableClusterStateObservability    bool
+	LeaderElectionName                  string
+	LeaderElectionNamespace             string
+	MemoryLimit                         int64
+	CPURequests                         int64
+	LogLevel                            string
+	LogOutputPaths                      string
+	LogErrorOutputPaths                 string
+	BatchMaxDuration                    time.Duration
+	BatchIdleDuration                   time.Duration
+	NodeMetricsInterval                 time.Duration
+	preferencePolicyRaw                 string
+	PreferencePolicy                    PreferencePolicy
+	minValuesPolicyRaw                  string
+	MinValuesPolicy                     MinValuesPolicy
+	IgnoreDRARequests                   bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
+	MaxConsolidationReplacements        int
+	MaxConsolidationCommandsPerPass     int
+	ConsolidationSplitFallback          bool
+	ConsolidationSplitMaxAttempts       int
+	ConsolidationSplitMinSavings        float64
+	ConsolidationReplaceMinSavings      float64
+	SpotToSpotMinInstanceTypes          int
+	ConsolidationCandidateTimeout       time.Duration
+	ConsolidationAttributeReplacements  bool
+	ConsolidationSkipUnchangedNegatives bool
+	ConsolidationNegativeCacheTTL       time.Duration
+	NodeClaimInitializationTimeout      time.Duration
+	ODToSpotConsolidation               bool
+	topologyCountCacheModeRaw           string
+	TopologyCountCacheMode              TopologyCountCacheMode
+	FeatureGates                        FeatureGates
 }
 
 type FlagSet struct {
@@ -164,6 +166,8 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.IntVar(&o.SpotToSpotMinInstanceTypes, "spot-to-spot-min-instance-types", env.WithDefaultInt("SPOT_TO_SPOT_MIN_INSTANCE_TYPES", 15), "The minimum number of cheaper instance type options a replacement NodeClaim must have for spot-to-spot single-node consolidation to proceed. The upstream default of 15 assumes broad instance-type flexibility; a fleet whose pods pin a single small instance family can never present that many cheaper types and needs a lower minimum. Replacement launches are capped to this many cheapest options too (or the NodePool's minValues if greater), so the launched type is always within the priced set and cannot be immediately consolidated again.")
 	fs.DurationVar(&o.ConsolidationCandidateTimeout, "consolidation-candidate-timeout", env.WithDefaultDuration("CONSOLIDATION_CANDIDATE_TIMEOUT", 10*time.Second), "The maximum time a single consolidation candidate's scheduling simulation may run before it is abandoned and the walk moves on. The pass timeout bounds discovery in aggregate; this bounds one candidate, so a pass degrades into finding fewer commands rather than none. 0 disables the per-candidate bound.")
 	fs.BoolVar(&o.ConsolidationAttributeReplacements, "consolidation-attribute-replacements", env.WithDefaultBool("CONSOLIDATION_ATTRIBUTE_REPLACEMENTS", true), "Count only the new NodeClaims that host a disrupted pod as a command's replacements. A consolidation simulation also schedules the cluster's pending pods, and the capacity it opens for them would otherwise be priced against the candidate and counted against the replacement bound. Disable to restore the unattributed behavior.")
+	fs.BoolVarWithEnv(&o.ConsolidationSkipUnchangedNegatives, "consolidation-skip-unchanged-negatives", "CONSOLIDATION_SKIP_UNCHANGED_NEGATIVES", false, "When set, a single-node consolidation candidate whose previous simulation ended in a no-op is skipped while its fingerprint - Node and NodeClaim resourceVersions, NodePool generation, reschedulable pod set, and the NodePool's instance type revision - is unchanged and the verdict is younger than consolidation-negative-cache-ttl. Only no-op verdicts are cached, so a stale entry can only delay a node's consolidation, never disrupt one wrongly; the cache is dropped whenever a pass admits a command. Lookup outcomes are counted regardless of this flag, so the hit rate is measurable before skipping is enabled.")
+	fs.DurationVar(&o.ConsolidationNegativeCacheTTL, "consolidation-negative-cache-ttl", env.WithDefaultDuration("CONSOLIDATION_NEGATIVE_CACHE_TTL", 5*time.Minute), "How long a cached no-op consolidation verdict remains valid. The fingerprint covers the candidate's own inputs; the TTL bounds what it cannot see, chiefly capacity elsewhere in the fleet freeing up: a verdict older than the TTL is never served. A fully no-op pass marks the fleet consolidated for up to five minutes whether or not caching is enabled, so a TTL below that does not make rechecks more frequent - it only tightens which verdicts the recheck may reuse.")
 	fs.BoolVarWithEnv(&o.ODToSpotConsolidation, "od-to-spot-consolidation", "OD_TO_SPOT_CONSOLIDATION", true, "When set, a consolidation candidate running on-demand whose replacement found nothing cheaper is re-evaluated against spot offerings only, restricted to the zones whose spot price beats the candidate. The replacement launch is pinned to spot and those zones, so insufficient spot capacity fails the launch instead of falling back to on-demand. Enabled by default; set to false to opt out.")
 	fs.Float64Var(&o.ConsolidationReplaceMinSavings, "consolidation-replace-min-savings", env.WithDefaultFloat64("CONSOLIDATION_REPLACE_MIN_SAVINGS", 0), "The fraction of the disrupted nodes' price that any consolidation replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. Applies to every replace decision, including spot-to-spot and the split fallback (which uses the larger of this and consolidation-split-min-savings); delete decisions are unaffected. Replacement launches are also restricted to instance types that meet the margin. 0 accepts any cheaper replacement.")
 	fs.Float64Var(&o.ConsolidationSplitMinSavings, "consolidation-split-min-savings", env.WithDefaultFloat64("CONSOLIDATION_SPLIT_MIN_SAVINGS", 0.05), "The fraction of a candidate's price that a split replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. Guards against churning a node into several nodes for a negligible price difference.")
@@ -233,6 +237,13 @@ func (o *Options) validateConsolidation() error {
 	}
 	if o.ConsolidationReplaceMinSavings < 0 || o.ConsolidationReplaceMinSavings >= 1 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationReplaceMinSavings)
+	}
+	return o.validateNegativeCache()
+}
+
+func (o *Options) validateNegativeCache() error {
+	if o.ConsolidationNegativeCacheTTL <= 0 && o.ConsolidationSkipUnchangedNegatives {
+		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_NEGATIVE_CACHE_TTL must be > 0 when CONSOLIDATION_SKIP_UNCHANGED_NEGATIVES is set, got %s", o.ConsolidationNegativeCacheTTL)
 	}
 	return nil
 }

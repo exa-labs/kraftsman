@@ -96,6 +96,9 @@ func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts conso
 	}
 	if !budget.TryAcquire() {
 		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeAttemptCapExhausted)
+		// The pass's attempt budget, not the candidate, decided this no-op: a fresh pass would
+		// have run the split, so the verdict must not outlive the pass.
+		markNoOpInconclusive(ctx)
 		return Command{}, false
 	}
 
@@ -112,6 +115,7 @@ func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts conso
 	switch {
 	case err != nil:
 		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeError)
+		markNoOpInconclusive(ctx)
 		return Command{}, false
 	case cmd.Decision() != ReplaceDecision:
 		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeNoOp)
