@@ -466,13 +466,27 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 		if t.preferencePolicy == PreferencePolicyIgnore && tsc.WhenUnsatisfiable != corev1.DoNotSchedule {
 			continue
 		}
-		for _, key := range tsc.MatchLabelKeys {
-			if value, ok := p.Labels[key]; ok {
-				tsc.LabelSelector.MatchExpressions = append(tsc.LabelSelector.MatchExpressions, metav1.LabelSelectorRequirement{
-					Key:      key,
-					Operator: metav1.LabelSelectorOpIn,
-					Values:   []string{value},
-				})
+		// tsc is a copy, but its LabelSelector still points into the pod. The pod is shared with
+		// every scheduler that reads it, so matchLabelKeys are folded into a copy of the selector
+		// rather than appended to the pod's own; otherwise each scheduler construction would grow
+		// the pod's selector by another requirement.
+		// Kubernetes applies matchLabelKeys only when a labelSelector is set; a nil selector
+		// matches nothing and stays nil regardless of the pod's labels.
+		selector := tsc.LabelSelector
+		if selector != nil {
+			var matchLabelKeyRequirements []metav1.LabelSelectorRequirement
+			for _, key := range tsc.MatchLabelKeys {
+				if value, ok := p.Labels[key]; ok {
+					matchLabelKeyRequirements = append(matchLabelKeyRequirements, metav1.LabelSelectorRequirement{
+						Key:      key,
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{value},
+					})
+				}
+			}
+			if len(matchLabelKeyRequirements) > 0 {
+				selector = selector.DeepCopy()
+				selector.MatchExpressions = append(selector.MatchExpressions, matchLabelKeyRequirements...)
 			}
 		}
 		topologyGroups = append(topologyGroups, NewTopologyGroup(
@@ -480,7 +494,7 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 			tsc.TopologyKey,
 			p,
 			sets.New(p.Namespace),
-			tsc.LabelSelector,
+			selector,
 			tsc.MaxSkew,
 			tsc.MinDomains,
 			tsc.NodeTaintsPolicy,
