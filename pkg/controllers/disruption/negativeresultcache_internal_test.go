@@ -136,7 +136,7 @@ func fingerprintCandidate(nodeRV, claimRV string, poolGeneration int64, podUIDs 
 			Node:      &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", ResourceVersion: nodeRV}},
 			NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-a", ResourceVersion: claimRV}},
 		},
-		NodePool:          &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Generation: poolGeneration, ResourceVersion: "pool-rv"}},
+		NodePool:          &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", UID: "pool-a-uid", Generation: poolGeneration, ResourceVersion: "pool-rv"}},
 		reschedulablePods: pods,
 	}
 }
@@ -167,6 +167,14 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 		"nodeclaim resourceVersion": fingerprintCandidate("n1", "c2", 1, "uid-a", "uid-b"),
 		"nodepool generation":       fingerprintCandidate("n1", "c1", 2, "uid-a", "uid-b"),
 		"pod set":                   fingerprintCandidate("n1", "c1", 1, "uid-a"),
+		// A NodePool deleted and recreated under the same name resets its generation and may reuse
+		// an instance type revision, so only the UID distinguishes it from the pool the verdict
+		// was computed against.
+		"nodepool UID": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.NodePool.UID = "pool-a-recreated-uid"
+			return c
+		}(),
 		"pod resourceVersion": func() *Candidate {
 			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
 			c.reschedulablePods[0].ResourceVersion = "rv-updated"
@@ -191,6 +199,13 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(managedNodePool("pool-other", 2, true)), provider).fingerprint(ctx, base); got == withOther {
 		t.Fatal("editing another ready NodePool did not change the fingerprint")
 	}
+	// A fleet pool recreated under the same name with the same generation and revision must still
+	// change the fingerprint: its UID is the only thing that distinguishes the new object.
+	recreated := managedNodePool("pool-other", 1, true)
+	recreated.UID = "pool-other-recreated-uid"
+	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(recreated), provider).fingerprint(ctx, base); got == withOther {
+		t.Fatal("recreating a fleet NodePool with a new UID did not change the fingerprint")
+	}
 	// Readiness gates membership in the fleet component, so a pool flipping unready must change
 	// the fingerprint: the simulation the verdict came from could have used that pool.
 	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(managedNodePool("pool-other", 1, false)), provider).fingerprint(ctx, base); got != baseFingerprint {
@@ -200,7 +215,7 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 
 func managedNodePool(name string, generation int64, ready bool) *v1.NodePool {
 	nodePool := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Generation: generation},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name + "-uid"), Generation: generation},
 		Spec: v1.NodePoolSpec{
 			Template: v1.NodeClaimTemplate{
 				Spec: v1.NodeClaimTemplateSpec{

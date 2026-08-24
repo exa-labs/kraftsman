@@ -210,12 +210,15 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 		podUIDs = append(podUIDs, string(pod.UID)+":"+pod.ResourceVersion)
 	}
 	sort.Strings(podUIDs)
-	// The NodePool is fingerprinted by generation, not resourceVersion: its status counters are
-	// patched on every node join/leave, so resourceVersion churns continuously on a busy fleet
-	// while only spec changes can alter what the simulation would do with this candidate.
-	return fmt.Sprintf("%s|%s|%d|%d|%s|%s",
+	// The NodePool is fingerprinted by UID and generation, not resourceVersion: its status counters
+	// are patched on every node join/leave, so resourceVersion churns continuously on a busy fleet
+	// while only spec changes can alter what the simulation would do with this candidate. The UID
+	// covers a delete/recreate under the same name, which resets generation and, per the
+	// InstanceTypesRevisionProvider contract, may reuse a revision for different content.
+	return fmt.Sprintf("%s|%s|%s:%d|%d|%s|%s",
 		candidate.Node.ResourceVersion,
 		candidate.NodeClaim.ResourceVersion,
+		candidate.NodePool.UID,
 		candidate.NodePool.Generation,
 		revision,
 		strings.Join(podUIDs, ","),
@@ -224,7 +227,7 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 }
 
 // fleetComponent is the fingerprint's view of every NodePool a replacement could be templated
-// from: each ready managed pool's name, generation, and instance type revision, resolved once
+// from: each ready managed pool's name, UID, generation, and instance type revision, resolved once
 // per pass. Only ready pools are included, so a pool's Ready condition flipping changes the
 // component by changing the set. It fails closed — no fleet component, no fingerprint — when the
 // pools cannot be listed or any pool's offerings cannot be versioned.
@@ -248,7 +251,7 @@ func (f *negativeCacheFingerprints) fleetComponent(ctx context.Context) (string,
 			f.fleet = &failed
 			return "", false
 		}
-		parts = append(parts, fmt.Sprintf("%s:%d:%d", nodePool.Name, nodePool.Generation, revision))
+		parts = append(parts, fmt.Sprintf("%s:%s:%d:%d", nodePool.Name, nodePool.UID, nodePool.Generation, revision))
 	}
 	sort.Strings(parts)
 	fleet := "{" + strings.Join(parts, ";") + "}"
