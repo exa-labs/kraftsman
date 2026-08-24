@@ -1179,6 +1179,85 @@ var _ = Describe("Consolidation", func() {
 			Entry("if the candidate is on-demand node", false),
 			Entry("if the candidate is spot node", true),
 		)
+		DescribeTable("applies the replacement savings floor",
+			func(minSavings float64, expectReplace bool) {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ConsolidationReplaceMinSavings: lo.ToPtr(minSavings)}))
+				// two on-demand types where the cheaper one saves 8%: admitted without a floor, vetoed by a 10% floor
+				onDemandOffering := func(price float64) cloudprovider.Offering {
+					return cloudprovider.Offering{
+						Available:    true,
+						Price:        price,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1"}),
+					}
+				}
+				resources := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourcePods: resource.MustParse("100")}
+				current := fake.NewInstanceType("current", fake.WithResources(resources), fake.WithOfferings(onDemandOffering(1.0)))
+				cheaper := fake.NewInstanceType("cheaper", fake.WithResources(resources), fake.WithOfferings(onDemandOffering(0.92)))
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{current, cheaper}
+				// the pool must not admit spot, or the replacement would be pinned to a capacity type these types never offer
+				nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, v1.NodeSelectorRequirementWithMinValues{
+					Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{v1.CapacityTypeOnDemand},
+				})
+				nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
+					corev1.LabelInstanceTypeStable: current.Name,
+					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+					corev1.LabelTopologyZone:       "test-zone-1",
+				})
+				node.Labels = nodeClaim.Labels
+				ExpectSingletonReconciled(ctx, pricingController)
+
+				rs := test.ReplicaSet()
+				ExpectApplied(ctx, env.Client, rs)
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+				pod := test.Pod(test.PodOptions{
+					ObjectMeta: metav1.ObjectMeta{Labels: labels,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion:         "apps/v1",
+								Kind:               "ReplicaSet",
+								Name:               rs.Name,
+								UID:                rs.UID,
+								Controller:         new(true),
+								BlockOwnerDeletion: new(true),
+							},
+						}}})
+				ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, nodePool)
+				ExpectManualBinding(ctx, env.Client, pod, node)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+				ExpectSingletonReconciled(ctx, disruptionController)
+
+				cmds := queue.GetCommands()
+				_, skipped := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_candidate_skips_total", map[string]string{
+					"consolidation_type":  "single",
+					metrics.NodePoolLabel: nodePool.Name,
+					"instance_type":       current.Name,
+					"reason":              disruption.CandidateSkipBelowMinSavings,
+				})
+				if !expectReplace {
+					Expect(cmds).To(BeEmpty())
+					Expect(skipped).To(BeTrue())
+					ExpectExists(ctx, env.Client, nodeClaim)
+					_, ok := lo.Find(recorder.Events(), func(e events.Event) bool {
+						return strings.Contains(e.Message, "minimum savings")
+					})
+					Expect(ok).To(BeTrue())
+					return
+				}
+				Expect(skipped).To(BeFalse())
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Replacements).To(HaveLen(1))
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+				nodeClaims := ExpectNodeClaims(ctx, env.Client)
+				Expect(nodeClaims).To(HaveLen(1))
+				Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).Has(cheaper.Name)).To(BeTrue())
+				ExpectNotFound(ctx, env.Client, nodeClaim, node)
+			},
+			Entry("admits an 8% saving with no floor", 0.0, true),
+			Entry("admits an 8% saving under a 5% floor", 0.05, true),
+			Entry("vetoes an 8% saving under a 10% floor", 0.1, false),
+		)
 		It("cannot replace spot with spot if less than minimum InstanceTypes flexibility", func() {
 			// Forcefully shrink the possible instanceTypes to be lower than 15 to replace a nodeclaim
 			cloudProvider.InstanceTypes = lo.Slice(fake.InstanceTypesAssorted(), 0, 5)

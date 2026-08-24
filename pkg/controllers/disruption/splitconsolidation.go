@@ -102,8 +102,10 @@ func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts conso
 	start := time.Now()
 	cmd, err := c.computeConsolidationWithOptions(ctx, consolidationSimulationOptions{
 		newCapacityPriceLimit: candidatePrice,
-		minSavings:            opts.ConsolidationSplitMinSavings,
-		silent:                true,
+		// The split margin guards against trading one node for several; the replace floor is the
+		// fleet-wide minimum any replacement must clear, so the stricter of the two applies.
+		minSavings: max(opts.ConsolidationSplitMinSavings, opts.ConsolidationReplaceMinSavings),
+		silent:     true,
 	}, candidate)
 	ObserveConsolidationSplitDuration(ctx, candidate.NodePool.Name, time.Since(start))
 

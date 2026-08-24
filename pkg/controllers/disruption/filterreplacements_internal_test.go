@@ -19,6 +19,7 @@ package disruption
 import (
 	"testing"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
@@ -68,6 +69,7 @@ func TestFilterReplacementsAndPublishSkipReasons(t *testing.T) {
 		name           string
 		newNodeClaims  []*pscheduling.NodeClaim
 		candidatePrice float64
+		minSavings     float64
 		reason         string
 	}{
 		{
@@ -98,10 +100,34 @@ func TestFilterReplacementsAndPublishSkipReasons(t *testing.T) {
 			candidatePrice: 0.3,
 			reason:         CandidateSkipNoCheaperReplacementSet,
 		},
+		{
+			// $0.2 beats $0.22 but not by the 10% the floor asks for: cheaper capacity exists and only
+			// the margin stands in the way, so the skip names the floor rather than the offerings.
+			name:           "single replacement cheaper but under the savings floor",
+			newNodeClaims:  []*pscheduling.NodeClaim{priceFilterNodeClaim(1, cheap)},
+			candidatePrice: 0.22,
+			minSavings:     0.1,
+			reason:         CandidateSkipBelowMinSavings,
+		},
+		{
+			name:           "replacement set cheaper but under the savings floor",
+			newNodeClaims:  []*pscheduling.NodeClaim{priceFilterNodeClaim(1, cheap), priceFilterNodeClaim(1, cheap)},
+			candidatePrice: 0.42,
+			minSavings:     0.1,
+			reason:         CandidateSkipBelowMinSavings,
+		},
+		{
+			// Nothing is cheaper even before the margin, so the floor is not what blocked this one.
+			name:           "nothing cheaper with a savings floor set",
+			newNodeClaims:  []*pscheduling.NodeClaim{priceFilterNodeClaim(1, expensive)},
+			candidatePrice: 1.0,
+			minSavings:     0.1,
+			reason:         CandidateSkipNoCheaperSingleReplacement,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &consolidation{}
-			ok, reason, _ := c.filterReplacementsAndPublish(tc.newNodeClaims, nil, tc.candidatePrice, false)
+			ok, reason, _ := c.filterReplacementsAndPublish(tc.newNodeClaims, nil, priceBudget{candidatePrice: tc.candidatePrice, minSavings: tc.minSavings}, false)
 			if ok {
 				t.Fatalf("expected the replacements to be rejected")
 			}
@@ -115,11 +141,43 @@ func TestFilterReplacementsAndPublishSkipReasons(t *testing.T) {
 func TestFilterReplacementsAndPublishKeepsCheaperOptions(t *testing.T) {
 	c := &consolidation{}
 	nc := priceFilterNodeClaim(1, priceFilterInstanceType("cheap", 0.2))
-	ok, reason, _ := c.filterReplacementsAndPublish([]*pscheduling.NodeClaim{nc}, nil, 1.0, false)
+	ok, reason, _ := c.filterReplacementsAndPublish([]*pscheduling.NodeClaim{nc}, nil, priceBudget{candidatePrice: 1.0}, false)
 	if !ok || reason != "" {
 		t.Fatalf("filterReplacementsAndPublish() = (%t, %q), want (true, \"\")", ok, reason)
 	}
 	if len(nc.InstanceTypeOptions) != 1 {
 		t.Errorf("kept %d instance type options, want 1", len(nc.InstanceTypeOptions))
+	}
+}
+
+// The floor decides what may launch, not only whether to replace: an option that is cheaper than the
+// candidate but inside the margin is trimmed so the worst-case launch always clears the floor.
+func TestFilterReplacementsAndPublishTrimsOptionsInsideTheFloor(t *testing.T) {
+	c := &consolidation{}
+	nc := priceFilterNodeClaim(1, priceFilterInstanceType("cheap", 0.2), priceFilterInstanceType("barely-cheaper", 0.95))
+	ok, reason, _ := c.filterReplacementsAndPublish([]*pscheduling.NodeClaim{nc}, nil, priceBudget{candidatePrice: 1.0, minSavings: 0.1}, false)
+	if !ok || reason != "" {
+		t.Fatalf("filterReplacementsAndPublish() = (%t, %q), want (true, \"\")", ok, reason)
+	}
+	if len(nc.InstanceTypeOptions) != 1 || nc.InstanceTypeOptions[0].Name != "cheap" {
+		t.Errorf("kept %v, want only the option that clears the floor", lo.Map(nc.InstanceTypeOptions, func(it *cloudprovider.InstanceType, _ int) string { return it.Name }))
+	}
+}
+
+func TestPriceBudget(t *testing.T) {
+	b := priceBudget{candidatePrice: 2.0, minSavings: 0.25}
+	if got := b.limit(); got != 1.5 {
+		t.Errorf("limit() = %g, want 1.5", got)
+	}
+	if got := b.split(3); got != 0.5 {
+		t.Errorf("split(3) = %g, want 0.5", got)
+	}
+	for cheapestTotal, want := range map[float64]bool{1.4: false, 1.5: true, 1.99: true, 2.0: false} {
+		if got := b.vetoedByMargin(cheapestTotal); got != want {
+			t.Errorf("vetoedByMargin(%g) = %t, want %t", cheapestTotal, got, want)
+		}
+	}
+	if (priceBudget{candidatePrice: 2.0}).vetoedByMargin(1.0) {
+		t.Errorf("a zero margin can never veto")
 	}
 }
