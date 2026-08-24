@@ -31,8 +31,7 @@ import (
 
 type ExistingNode struct {
 	*state.StateNode
-	cachedAvailable v1.ResourceList // Cache so we don't have to re-subtract resources on the StateNode every time
-	cachedTaints    []v1.Taint      // Cache so we don't hae to re-construct the taints each time we attempt to schedule a pod
+	cachedTaints []v1.Taint // Cache so we don't hae to re-construct the taints each time we attempt to schedule a pod
 
 	Pods                    []*v1.Pod
 	topology                *Topology
@@ -50,14 +49,12 @@ type ExistingNode struct {
 // scheduling never mutates an ExistingNode's requirements map in place: Add replaces the map
 // with a freshly built one.
 func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, requirements scheduling.Requirements, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
-	available, remaining := existingNodeResources(n, daemonResources)
-	return newExistingNodeWithResources(n, topology, taints, requirements, available, remaining, instanceType, isUnderConsolidateAfter)
+	return newExistingNodeWithResources(n, topology, taints, requirements, existingNodeResources(n, daemonResources), instanceType, isUnderConsolidateAfter)
 }
 
-// existingNodeResources derives a node's available resources and its remaining resources after
-// the unscheduled share of its daemon overhead. It mutates daemonResources, so callers must hand
-// it an owned copy.
-func existingNodeResources(n *state.StateNode, daemonResources v1.ResourceList) (available, remaining v1.ResourceList) {
+// existingNodeResources derives a node's remaining resources after the unscheduled share of its
+// daemon overhead. It mutates daemonResources, so callers must hand it an owned copy.
+func existingNodeResources(n *state.StateNode, daemonResources v1.ResourceList) (remaining v1.ResourceList) {
 	// The state node passed in here must be a deep copy from cluster state as we modify it
 	// the remaining daemonResources to schedule are the total daemonResources minus what has already scheduled
 	resources.SubtractFrom(daemonResources, n.DaemonSetRequests())
@@ -70,17 +67,16 @@ func existingNodeResources(n *state.StateNode, daemonResources v1.ResourceList) 
 			daemonResources[k] = v
 		}
 	}
-	available = n.Available()
-	return available, resources.Subtract(available, daemonResources)
+	available := n.Available()
+	return resources.Subtract(available, daemonResources)
 }
 
-// newExistingNodeWithResources constructs an ExistingNode from already-derived resource lists.
-// available may be shared (it is never mutated after construction); remaining must be owned by
-// the new node because scheduling subtracts from it in place.
-func newExistingNodeWithResources(n *state.StateNode, topology *Topology, taints []v1.Taint, requirements scheduling.Requirements, available, remaining v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
+// newExistingNodeWithResources constructs an ExistingNode from an already-derived remaining
+// resource list, which must be owned by the new node because scheduling subtracts from it in
+// place.
+func newExistingNodeWithResources(n *state.StateNode, topology *Topology, taints []v1.Taint, requirements scheduling.Requirements, remaining v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
 	node := &ExistingNode{
 		StateNode:               n,
-		cachedAvailable:         available,
 		cachedTaints:            taints,
 		topology:                topology,
 		remainingResources:      remaining,

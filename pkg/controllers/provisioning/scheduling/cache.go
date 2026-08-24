@@ -49,12 +49,11 @@ type DaemonOverheadCache struct {
 // existingNodeIngredients holds the candidate-invariant inputs of one ExistingNode. Everything
 // here is a pure function of the node's own state and the daemonset pod set, both covered by the
 // cache key and the daemonset-generation flush; the values pin the view observed at first read for
-// the rest of the pass, like every other pass-scoped cache. taints and available are shared and
-// read-only; remainingBase is deep copied out because scheduling subtracts from an ExistingNode's
-// remaining resources in place.
+// the rest of the pass, like every other pass-scoped cache. taints are shared and read-only;
+// remainingBase is deep copied out because scheduling subtracts from an ExistingNode's remaining
+// resources in place.
 type existingNodeIngredients struct {
 	taints        []corev1.Taint
-	available     corev1.ResourceList
 	remainingBase corev1.ResourceList
 }
 

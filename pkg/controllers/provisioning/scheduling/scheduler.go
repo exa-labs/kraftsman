@@ -839,30 +839,31 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 	// create our existing nodes
 	for _, node := range stateNodes {
 		nodeRequirements := labelRequirementsForStateNode(s.nodeRequirementsCache, node)
-		taints, available, remaining := s.existingNodeIngredients(ctx, node, nodeRequirements, daemonSetPods)
+		taints, remaining := s.existingNodeIngredients(ctx, node, nodeRequirements, daemonSetPods)
 		// isUnderConsolidateAfter depends on the clock, so it is recomputed for every candidate
 		// rather than cached: caching it could pin a consolidateAfter verdict past its expiry.
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
 		existingNodeRequirements := existingNodeRequirementsForStateNode(s.nodeRequirementsCache, node, nodeRequirements)
-		s.existingNodes = append(s.existingNodes, newExistingNodeWithResources(node, s.topology, taints, existingNodeRequirements, available, remaining, s.instanceTypeForNode(node), isUnderConsolidateAfter))
+		s.existingNodes = append(s.existingNodes, newExistingNodeWithResources(node, s.topology, taints, existingNodeRequirements, remaining, s.instanceTypeForNode(node), isUnderConsolidateAfter))
 		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()
 }
 
 // existingNodeIngredients returns the candidate-invariant inputs of one ExistingNode: the node's
-// taints, its available resources, and its remaining resources after unscheduled daemon overhead.
-// All three are pure functions of the node's own state and the daemonset pod set, so they are
-// memoized per pass under the daemon overhead cache's node-identity key and daemonset-generation
-// flush. taints are shared and read-only across candidates; available and remaining are deep
-// copied out because an ExistingNode's resource lists were always freshly allocated per
-// construction and scheduling subtracts from remaining in place.
-func (s *Scheduler) existingNodeIngredients(ctx context.Context, node *state.StateNode, nodeRequirements scheduling.Requirements, daemonSetPods []*corev1.Pod) ([]corev1.Taint, corev1.ResourceList, corev1.ResourceList) {
-	build := func() ([]corev1.Taint, corev1.ResourceList, corev1.ResourceList) {
+// taints and its remaining resources after unscheduled daemon overhead. Both are functions of
+// the node's own state and the daemonset pod set, so they are memoized per pass under the daemon
+// overhead cache's node-identity key and daemonset-generation flush. remaining derives from
+// StateNode.Available(), which is cluster-state-derived and can go stale within a pass as pods
+// land or leave; the staleness is bounded by the pass, validation re-simulates before admission,
+// and a stale value can only miss or reject a command, never produce a wrong one. taints are
+// shared read-only across candidates; remaining is deep copied out because scheduling subtracts
+// from it in place.
+func (s *Scheduler) existingNodeIngredients(ctx context.Context, node *state.StateNode, nodeRequirements scheduling.Requirements, daemonSetPods []*corev1.Pod) ([]corev1.Taint, corev1.ResourceList) {
+	build := func() ([]corev1.Taint, corev1.ResourceList) {
 		taints := node.Taints()
 		daemonRequests := s.getDaemonRequests(ctx, node, taints, nodeRequirements, daemonSetPods)
-		available, remaining := existingNodeResources(node, daemonRequests)
-		return taints, available, remaining
+		return taints, existingNodeResources(node, daemonRequests)
 	}
 	if s.daemonOverheadCache == nil {
 		return build()
@@ -872,15 +873,14 @@ func (s *Scheduler) existingNodeIngredients(ctx context.Context, node *state.Sta
 		return build()
 	}
 	if ing, ok := s.daemonOverheadCache.ingredients(key); ok {
-		return ing.taints, ing.available.DeepCopy(), ing.remainingBase.DeepCopy()
+		return ing.taints, ing.remainingBase.DeepCopy()
 	}
-	taints, available, remaining := build()
+	taints, remaining := build()
 	s.daemonOverheadCache.setIngredients(key, existingNodeIngredients{
 		taints:        taints,
-		available:     available.DeepCopy(),
 		remainingBase: remaining.DeepCopy(),
 	})
-	return taints, available, remaining
+	return taints, remaining
 }
 
 // getDaemonRequests returns the summed resource requests of the daemon pods compatible with the

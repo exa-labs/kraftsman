@@ -50,16 +50,11 @@ func TestExistingNodeIngredientsIsolation(t *testing.T) {
 	ctx := karpopts.ToContext(context.Background(), test.Options())
 	s := &Scheduler{daemonOverheadCache: NewDaemonOverheadCache()}
 
-	taints1, available1, remaining1 := s.existingNodeIngredients(ctx, sn, labelRequirementsForStateNode(s.nodeRequirementsCache, sn), nil)
-	_, available2, remaining2 := s.existingNodeIngredients(ctx, sn, labelRequirementsForStateNode(s.nodeRequirementsCache, sn), nil)
+	taints1, remaining1 := s.existingNodeIngredients(ctx, sn, labelRequirementsForStateNode(s.nodeRequirementsCache, sn), nil)
+	_, remaining2 := s.existingNodeIngredients(ctx, sn, labelRequirementsForStateNode(s.nodeRequirementsCache, sn), nil)
 
 	if len(taints1) != 0 {
 		t.Fatalf("unexpected taints: %v", taints1)
-	}
-	for name, want := range available1 {
-		if got := available2[name]; got.Cmp(want) != 0 {
-			t.Fatalf("available diverged for %s: %s vs %s", name, want.String(), got.String())
-		}
 	}
 	for name, want := range remaining1 {
 		if got := remaining2[name]; got.Cmp(want) != 0 {
@@ -72,7 +67,7 @@ func TestExistingNodeIngredientsIsolation(t *testing.T) {
 	cpu := remaining2[corev1.ResourceCPU]
 	cpu.Sub(resource.MustParse("3"))
 	remaining2[corev1.ResourceCPU] = cpu
-	_, _, remaining3 := s.existingNodeIngredients(ctx, sn, labelRequirementsForStateNode(s.nodeRequirementsCache, sn), nil)
+	_, remaining3 := s.existingNodeIngredients(ctx, sn, labelRequirementsForStateNode(s.nodeRequirementsCache, sn), nil)
 	if got := remaining3[corev1.ResourceCPU]; got.Cmp(resource.MustParse("4")) != 0 {
 		t.Fatalf("mutation leaked between candidates: %s", got.String())
 	}
@@ -87,7 +82,7 @@ func TestExistingNodeIngredientsIsolation(t *testing.T) {
 	// A node without a stable identity must bypass the cache entirely.
 	anon := state.NewNode()
 	anon.Node = &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "anon"}, Status: node.Status}
-	_, _, remainingAnon := s.existingNodeIngredients(ctx, anon, labelRequirementsForStateNode(s.nodeRequirementsCache, anon), nil)
+	_, remainingAnon := s.existingNodeIngredients(ctx, anon, labelRequirementsForStateNode(s.nodeRequirementsCache, anon), nil)
 	if got := remainingAnon[corev1.ResourceCPU]; got.Cmp(resource.MustParse("4")) != 0 {
 		t.Fatalf("unexpected remaining for uncacheable node: %s", got.String())
 	}
