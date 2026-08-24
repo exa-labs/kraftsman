@@ -838,15 +838,49 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
 	for _, node := range stateNodes {
-		taints := node.Taints()
 		nodeRequirements := labelRequirementsForStateNode(s.nodeRequirementsCache, node)
-		daemonRequests := s.getDaemonRequests(ctx, node, taints, nodeRequirements, daemonSetPods)
+		taints, remaining := s.existingNodeIngredients(ctx, node, nodeRequirements, daemonSetPods)
+		// isUnderConsolidateAfter depends on the clock, so it is recomputed for every candidate
+		// rather than cached: caching it could pin a consolidateAfter verdict past its expiry.
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
 		existingNodeRequirements := existingNodeRequirementsForStateNode(s.nodeRequirementsCache, node, nodeRequirements)
-		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, existingNodeRequirements, daemonRequests, s.instanceTypeForNode(node), isUnderConsolidateAfter))
+		s.existingNodes = append(s.existingNodes, newExistingNodeWithResources(node, s.topology, taints, existingNodeRequirements, remaining, s.instanceTypeForNode(node), isUnderConsolidateAfter))
 		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()
+}
+
+// existingNodeIngredients returns the candidate-invariant inputs of one ExistingNode: the node's
+// taints and its remaining resources after unscheduled daemon overhead. Both are functions of
+// the node's own state and the daemonset pod set, so they are memoized per pass under the daemon
+// overhead cache's node-identity key and daemonset-generation flush. remaining derives from
+// StateNode.Available(), which is cluster-state-derived and can go stale within a pass as pods
+// land or leave; the staleness is bounded by the pass, validation re-simulates before admission,
+// and a stale value can only miss or reject a command, never produce a wrong one. taints are
+// shared read-only across candidates; remaining is deep copied out because scheduling subtracts
+// from it in place.
+func (s *Scheduler) existingNodeIngredients(ctx context.Context, node *state.StateNode, nodeRequirements scheduling.Requirements, daemonSetPods []*corev1.Pod) ([]corev1.Taint, corev1.ResourceList) {
+	build := func() ([]corev1.Taint, corev1.ResourceList) {
+		taints := node.Taints()
+		daemonRequests := s.getDaemonRequests(ctx, node, taints, nodeRequirements, daemonSetPods)
+		return taints, existingNodeResources(node, daemonRequests)
+	}
+	if s.daemonOverheadCache == nil {
+		return build()
+	}
+	key, ok := nodeCacheKey(node, karpopts.FromContext(ctx).IgnoreDRARequests)
+	if !ok {
+		return build()
+	}
+	if ing, ok := s.daemonOverheadCache.ingredients(key); ok {
+		return ing.taints, ing.remainingBase.DeepCopy()
+	}
+	taints, remaining := build()
+	s.daemonOverheadCache.setIngredients(key, existingNodeIngredients{
+		taints:        taints,
+		remainingBase: remaining.DeepCopy(),
+	})
+	return taints, remaining
 }
 
 // getDaemonRequests returns the summed resource requests of the daemon pods compatible with the

@@ -299,6 +299,9 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 			ctx = scheduling.WithTopologyPassCache(ctx, scheduling.NewTopologyPassCache())
 			ctx = scheduling.WithInverseAffinityCache(ctx, scheduling.NewInverseAffinityCache())
 			ctx = WithPassReads(ctx, NewPassReads())
+			if cache := scheduling.DaemonOverheadCacheFromContext(ctx); cache != nil {
+				cache.DropStateDerived()
+			}
 		}
 		_, err := s.validator.Validate(ctx, proposal.cmd, validationDelay)
 		validationDelay = 0

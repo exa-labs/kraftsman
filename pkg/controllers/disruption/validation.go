@@ -219,6 +219,9 @@ func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, valid
 		if PassReadsFromContext(ctx) != nil {
 			ctx = WithPassReads(ctx, NewPassReads())
 		}
+		if cache := scheduling.DaemonOverheadCacheFromContext(ctx); cache != nil {
+			cache.DropStateDerived()
+		}
 	}
 	candidateValidationStart := time.Now()
 	validatedCandidates, err := c.validateCandidates(ctx, cmd.Candidates...)

@@ -356,26 +356,15 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 
 // countDomains initializes the topology group by registereding any well known domains and performing pod counts
 // against the cluster for any existing pods.
-//
-//nolint:gocyclo
 func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	nodeRequirementsCache := NodeRequirementsCacheFromContext(ctx)
-
-	// collect the pods from all the specified namespaces (don't see a way to query multiple namespaces
-	// simultaneously)
-	var pods []corev1.Pod
-	for _, ns := range tg.namespaces.UnsortedList() {
-		nsPods, err := listTopologyPods(ctx, t.kubeClient, ns, tg.rawSelector)
-		if err != nil {
-			return fmt.Errorf("listing pods, %w", err)
-		}
-		pods = append(pods, nsPods...)
-	}
 
 	// capture new domain values from existing nodes that may not have any pods selected by the topology group
 	// scheduled to them already
 	// Note: long term we should handle this when constructing the domain groups, but that would require domain groups
 	// to handle affinity in addition to taints / tolerations.
+	// This loop stays outside the count cache: t.stateNodes excludes the candidate a consolidation
+	// simulation is removing, so which empty domains exist is candidate-dependent.
 	for _, n := range t.stateNodes {
 		// ignore state nodes which are tracking in-flight NodeClaims
 		if n.Node == nil {
@@ -395,19 +384,60 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 		}
 	}
 
-	// sort our pods by the node they are scheduled to
+	records, err := topologyPodRecords(ctx, t.kubeClient, tg)
+	if err != nil {
+		return err
+	}
+	// The scan deliberately ignores exclusions so its output is the same for every candidate; the
+	// exclusion of the pods being rescheduled happens here, at replay.
+	for _, r := range records {
+		if t.excludedPods.Has(string(r.uid)) {
+			continue
+		}
+		tg.Record(r.domain)
+	}
+	return nil
+}
+
+// scanTopologyPodDomains walks every pod the topology group selects and returns, in a stable
+// order, the (pod UID, domain) pairs that count toward the group's domains. The result depends
+// only on the group's hashed identity and on reads the pass has already pinned (the pod lists and
+// node objects in TopologyPassCache), never on the pods being scheduled, which is what makes it
+// shareable across the candidates of one pass.
+//
+//nolint:gocyclo
+func scanTopologyPodDomains(ctx context.Context, kubeClient client.Client, tg *TopologyGroup) ([]podDomainRecord, error) {
+	nodeRequirementsCache := NodeRequirementsCacheFromContext(ctx)
+
+	// collect the pods from all the specified namespaces (don't see a way to query multiple namespaces
+	// simultaneously)
+	var pods []corev1.Pod
+	for _, ns := range sets.List(tg.namespaces) {
+		nsPods, err := listTopologyPods(ctx, kubeClient, ns, tg.rawSelector)
+		if err != nil {
+			return nil, fmt.Errorf("listing pods, %w", err)
+		}
+		pods = append(pods, nsPods...)
+	}
+
+	// sort our pods by the node they are scheduled to, with a total-order tiebreak so two scans of
+	// identical cluster state emit identical record sequences (the shadow-mode comparison depends
+	// on that determinism)
 	sort.Slice(pods, func(i, j int) bool {
-		return pods[i].Spec.NodeName < pods[j].Spec.NodeName
+		if pods[i].Spec.NodeName != pods[j].Spec.NodeName {
+			return pods[i].Spec.NodeName < pods[j].Spec.NodeName
+		}
+		if pods[i].Namespace != pods[j].Namespace {
+			return pods[i].Namespace < pods[j].Namespace
+		}
+		return pods[i].Name < pods[j].Name
 	})
 	var previousNode *corev1.Node
 	var previousNodeRequirements scheduling.Requirements
 
+	var records []podDomainRecord
 	for i, p := range pods {
 		if IgnoredForTopology(&pods[i]) {
-			continue
-		}
-		// pod is excluded for counting purposes
-		if t.excludedPods.Has(string(p.UID)) {
 			continue
 		}
 		var node *corev1.Node
@@ -418,9 +448,9 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 			nodeRequirements = previousNodeRequirements
 		} else {
 			var err error
-			node, err = getTopologyNode(ctx, t.kubeClient, p.Spec.NodeName)
+			node, err = getTopologyNode(ctx, kubeClient, p.Spec.NodeName)
 			if err != nil {
-				return serrors.Wrap(fmt.Errorf("getting node, %w", err), "Node", klog.KRef("", p.Spec.NodeName))
+				return nil, serrors.Wrap(fmt.Errorf("getting node, %w", err), "Node", klog.KRef("", p.Spec.NodeName))
 			}
 			// Pods that cannot be evicted can be leaked in the API Server after
 			// a Node is removed. Since pod bindings are immutable, these pods
@@ -455,9 +485,9 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 		if !tg.nodeFilter.Matches(node.Spec.Taints, nodeRequirements) {
 			continue
 		}
-		tg.Record(domain)
+		records = append(records, podDomainRecord{uid: p.UID, domain: domain})
 	}
-	return nil
+	return records, nil
 }
 
 func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {

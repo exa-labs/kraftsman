@@ -18,6 +18,7 @@ package scheduling
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -41,13 +42,31 @@ type TopologyPassCache struct {
 	mu          sync.Mutex
 	podsByKey   map[string][]corev1.Pod
 	nodesByName map[string]*corev1.Node
+	// recordsByGroup holds each topology group's scanned pod domain records under the group's
+	// hash, which covers everything the scan reads that is not already pinned by the pod and node
+	// caches above. The records are shared across candidates and MUST be treated as read-only.
+	recordsByGroup map[uint64][]podDomainRecord
 }
 
 func NewTopologyPassCache() *TopologyPassCache {
 	return &TopologyPassCache{
-		podsByKey:   map[string][]corev1.Pod{},
-		nodesByName: map[string]*corev1.Node{},
+		podsByKey:      map[string][]corev1.Pod{},
+		nodesByName:    map[string]*corev1.Node{},
+		recordsByGroup: map[uint64][]podDomainRecord{},
 	}
+}
+
+func (c *TopologyPassCache) podDomainRecords(hash uint64) ([]podDomainRecord, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	records, ok := c.recordsByGroup[hash]
+	return records, ok
+}
+
+func (c *TopologyPassCache) setPodDomainRecords(hash uint64, records []podDomainRecord) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recordsByGroup[hash] = records
 }
 
 func WithTopologyPassCache(ctx context.Context, cache *TopologyPassCache) context.Context {
@@ -75,7 +94,7 @@ func listTopologyPods(ctx context.Context, kubeClient client.Client, namespace s
 	// labels.Nothing() (unparseable selector) both stringify to "" and must not share an entry.
 	rawKey := "<nil>"
 	if rawSelector != nil {
-		rawKey = rawSelector.String()
+		rawKey = fmt.Sprintf("%v", rawSelector)
 	}
 	key := strings.Join([]string{namespace, rawKey}, "\x00")
 	cache.mu.Lock()
