@@ -26,8 +26,10 @@ import (
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -530,6 +532,49 @@ var (
 		},
 		[]string{metrics.NodePoolLabel, decisionLabel, capacityTypeTransitionLabel},
 	)
+	// ConsolidationSpotReplacementOptions is the tuning signal for SPOT_TO_SPOT_MIN_INSTANCE_TYPES:
+	// how many cheaper spot-compatible instance types a single-node spot candidate's replacement
+	// presented before the minimum was applied. The fraction of observations at or above a value
+	// is the fraction of spot-to-spot candidates that value would admit.
+	ConsolidationSpotReplacementOptions = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_spot_replacement_options",
+			Help:      "Number of cheaper spot-compatible instance type options a single-node spot-to-spot consolidation replacement offered, observed before the configured minimum is enforced, by NodePool.",
+			Buckets:   []float64{0, 1, 2, 3, 4, 5, 8, 10, 15, 20, 30, 50},
+		},
+		[]string{metrics.NodePoolLabel},
+	)
+	// ConsolidationExecutedSavingsFraction records how much of the disrupted capacity's hourly price
+	// each executed consolidation command is estimated to save. Mass near zero is churn for little
+	// return and is the population a minimum-savings floor would remove.
+	ConsolidationExecutedSavingsFraction = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_executed_savings_fraction",
+			Help:      "Estimated hourly savings of a successfully executed consolidation command as a fraction of the disrupted nodes' hourly price, by NodePool, decision, and capacity type transition. Observed once per NodePool the command disrupted.",
+			Buckets:   []float64{0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1},
+		},
+		[]string{metrics.NodePoolLabel, decisionLabel, capacityTypeTransitionLabel},
+	)
+	// ConsolidationDisruptedNodeAgeSeconds records how old each node was when a consolidation command
+	// disrupted it. Short ages mean consolidation is re-deciding nodes it or provisioning only just
+	// launched.
+	ConsolidationDisruptedNodeAgeSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_disrupted_node_age_seconds",
+			Help:      "Age of each node at the time a consolidation command that disrupted it executed successfully, by NodePool, decision, and capacity type transition.",
+			Buckets:   metrics.NodeLifetimeBuckets(),
+		},
+		[]string{metrics.NodePoolLabel, decisionLabel, capacityTypeTransitionLabel},
+	)
 	// This gauge measures the same population as upstream's eligible_nodes, one rung below
 	// actionable: constructible and unblocked, with no price consulted. Being ours to name, it says
 	// candidate rather than inheriting a word that reads as a verdict.
@@ -941,6 +986,44 @@ func ObserveRealizedSavings(ctx context.Context, kubeClient client.Reader, cmd C
 	transition := capacityTypeTransition(ctx, kubeClient, cmd)
 	for _, candidate := range cmd.Candidates {
 		ConsolidationRealizedSavingsDollarsPerHourTotal.Add(cmd.EstimatedSavings()/float64(len(cmd.Candidates)), map[string]string{
+			metrics.NodePoolLabel:       candidate.NodePool.Name,
+			decisionLabel:               string(cmd.Decision()),
+			capacityTypeTransitionLabel: transition,
+		})
+	}
+}
+
+// ObserveSpotReplacementOptions records how many cheaper spot-compatible instance types a
+// single-node spot-to-spot replacement offered before the configured minimum vetoed or capped it.
+func ObserveSpotReplacementOptions(nodePoolName string, options int) {
+	ConsolidationSpotReplacementOptions.Observe(float64(options), map[string]string{
+		metrics.NodePoolLabel: nodePoolName,
+	})
+}
+
+// ObserveExecutedCommandValue records, for a successfully executed consolidation command, the
+// savings it is estimated to realize relative to what it disrupted and how old each disrupted node
+// was at execution. Both are attributed to the capacity type transition the command performed so
+// spot-to-spot moves can be judged separately from on-demand-to-spot ones.
+func ObserveExecutedCommandValue(ctx context.Context, kubeClient client.Reader, clk clock.Clock, cmd Command) {
+	if len(cmd.Candidates) == 0 {
+		return
+	}
+	transition := capacityTypeTransition(ctx, kubeClient, cmd)
+	if sourceCost := cmd.SourceCost(); sourceCost > 0 {
+		for _, nodePoolName := range uniqueSorted(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })) {
+			ConsolidationExecutedSavingsFraction.Observe(cmd.EstimatedSavings()/sourceCost, map[string]string{
+				metrics.NodePoolLabel:       nodePoolName,
+				decisionLabel:               string(cmd.Decision()),
+				capacityTypeTransitionLabel: transition,
+			})
+		}
+	}
+	for _, candidate := range cmd.Candidates {
+		if candidate.NodeClaim == nil || candidate.NodeClaim.CreationTimestamp.IsZero() {
+			continue
+		}
+		ConsolidationDisruptedNodeAgeSeconds.Observe(clk.Since(candidate.NodeClaim.CreationTimestamp.Time).Seconds(), map[string]string{
 			metrics.NodePoolLabel:       candidate.NodePool.Name,
 			decisionLabel:               string(cmd.Decision()),
 			capacityTypeTransitionLabel: transition,

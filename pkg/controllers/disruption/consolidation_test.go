@@ -1346,6 +1346,26 @@ var _ = Describe("Consolidation", func() {
 			Expect(launchTypes).To(HaveLen(1))
 			Expect(launchTypes[0]).To(Equal(spotInstances[0].Name))
 
+			// The replacement records the decision that launched it, and the gate records how many
+			// cheaper spot options it had to choose from before the minimum was applied.
+			Expect(nodeClaims[0].Annotations).To(HaveKeyWithValue(v1.NodeClaimReplacementOriginAnnotationKey, "underutilized:spot"))
+			spotOptions, ok := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_spot_replacement_options", map[string]string{metrics.NodePoolLabel: nodePool.Name})
+			Expect(ok).To(BeTrue())
+			Expect(spotOptions.Histogram.GetSampleCount()).To(BeNumerically(">=", 1))
+			Expect(spotOptions.Histogram.GetSampleSum()).To(BeNumerically(">=", 1))
+			for _, name := range []string{
+				"karpenter_voluntary_disruption_consolidation_executed_savings_fraction",
+				"karpenter_voluntary_disruption_consolidation_disrupted_node_age_seconds",
+			} {
+				sample, found := FindMetricWithLabelValues(name, map[string]string{
+					metrics.NodePoolLabel:      nodePool.Name,
+					"decision":                 "replace",
+					"capacity_type_transition": "spot->spot",
+				})
+				Expect(found).To(BeTrue(), name)
+				Expect(sample.Histogram.GetSampleCount()).To(BeNumerically(">=", 1), name)
+			}
+
 			// and delete the old one
 			ExpectNotFound(ctx, env.Client, spotNodeClaim, spotNode)
 		})
