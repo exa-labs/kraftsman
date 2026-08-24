@@ -57,6 +57,10 @@ const (
 	// scheduled to this NodeClaim. The initialization controller can gate on these drivers having published their
 	// ResourceSlices before marking the node initialized.
 	DRADriversAnnotationKey = apis.Group + "/requested-dra-drivers"
+	// NodeClaimReplacementOriginAnnotationKey marks a NodeClaim the disruption queue launched to replace
+	// nodes it was about to disrupt. The value is "<reason>:<source capacity types>", for example
+	// "underutilized:spot", so the node's later fate can be attributed to the decision that launched it.
+	NodeClaimReplacementOriginAnnotationKey = apis.Group + "/replacement-origin"
 )
 
 // Karpenter specific finalizers

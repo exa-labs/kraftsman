@@ -614,6 +614,9 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	//   2) There were at least 15 options cheaper than the current candidate.
 	minInstanceTypes := options.FromContext(ctx).SpotToSpotMinInstanceTypes
 	for _, nc := range results.NewNodeClaims {
+		// Observed before the gate so the distribution shows what any minimum would admit, not only what
+		// the configured one did.
+		ObserveSpotReplacementOptions(candidates[0].NodePool.Name, len(nc.InstanceTypeOptions))
 		if len(nc.InstanceTypeOptions) < minInstanceTypes {
 			if publishEvents {
 				c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, fmt.Sprintf("SpotToSpotConsolidation requires %d cheaper instance type options than the current candidate to consolidate, got %d",

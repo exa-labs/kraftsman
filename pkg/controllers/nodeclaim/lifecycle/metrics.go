@@ -36,6 +36,37 @@ var InstanceTerminationDurationSeconds = opmetrics.NewPrometheusHistogram(
 	[]string{metrics.NodePoolLabel},
 )
 
+// NodeClaimLifetimeSeconds records how long each NodeClaim existed, from creation to the removal of its
+// termination finalizer, by the decision that launched it and the cause that ended it. Replacement
+// NodeClaims carry NodeClaimReplacementOriginAnnotationKey; everything else is attributed to
+// provisioning. Together with the age of nodes consolidation disrupts, this shows whether replacement
+// nodes live long enough to pay for the disruption that launched them.
+var NodeClaimLifetimeSeconds = opmetrics.NewPrometheusHistogram(
+	crmetrics.Registry,
+	prometheus.HistogramOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: metrics.NodeClaimSubsystem,
+		Name:      "lifetime_seconds",
+		Help:      "Seconds from NodeClaim creation to deletion, by NodePool, capacity type, the origin that launched it (provisioning, or the replacement-origin annotation set by the disruption queue), and the cause of its termination (a voluntary disruption reason, never_initialized, or other).",
+		Buckets:   metrics.NodeLifetimeBuckets(),
+	},
+	[]string{metrics.NodePoolLabel, metrics.CapacityTypeLabel, originLabel, causeLabel},
+)
+
+const (
+	originLabel = "origin"
+	causeLabel  = "cause"
+
+	// provisioningOrigin is the origin of every NodeClaim not launched as a disruption replacement.
+	provisioningOrigin = "provisioning"
+	// terminationCauseNeverInitialized marks a NodeClaim deleted before it ever became a usable node:
+	// a failed launch, a registration or initialization timeout, or an instance that disappeared.
+	terminationCauseNeverInitialized = "never_initialized"
+	// terminationCauseOther covers deletions the NodeClaim itself does not explain: cloud provider
+	// interruption, expiration, garbage collection of a vanished instance, and operator deletes.
+	terminationCauseOther = "other"
+)
+
 var NodeClaimTerminationDurationSeconds = opmetrics.NewPrometheusHistogram(
 	crmetrics.Registry,
 	prometheus.HistogramOpts{

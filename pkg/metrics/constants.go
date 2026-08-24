@@ -41,6 +41,13 @@ const (
 
 // DurationBuckets returns a []float64 of default threshold values for duration histograms.
 // Each returned slice is new and may be modified without impacting other bucket definitions.
+// NodeLifetimeBuckets spans the ages at which a node is worth telling apart: minutes (a replacement
+// that never settled), hours (a spot node that was interrupted or re-consolidated), and days (a
+// node that earned its launch). In seconds.
+func NodeLifetimeBuckets() []float64 {
+	return []float64{300, 900, 1800, 3600, 7200, 14400, 28800, 43200, 86400, 172800, 259200, 604800}
+}
+
 func DurationBuckets() []float64 {
 	// Use same bucket thresholds as controller-runtime.
 	// https://github.com/kubernetes-sigs/controller-runtime/blob/v0.10.0/pkg/internal/controller/metrics/metrics.go#L47-L48

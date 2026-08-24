@@ -180,6 +180,7 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 			ObserveRealizedSavings(ctx, q.kubeClient, *cmd)
 			ObserveExecutedConsolidationCommand(*cmd)
 			ObserveExecutedReplacementLaunches(ctx, q.kubeClient, *cmd)
+			ObserveExecutedCommandValue(ctx, q.kubeClient, q.clock, *cmd)
 		}
 	}
 	q.CompleteCommand(cmd)
@@ -294,9 +295,14 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 	return markedCandidates, multierr.Combine(errs...)
 }
 
-// createReplacementNodeClaims creates replacement NodeClaims
+// createReplacementNodeClaims creates replacement NodeClaims, each annotated with the command that
+// launched it so its eventual termination can be attributed back to that decision.
 func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) error {
-	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
+	origin := replacementOrigin(*cmd)
+	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim {
+		r.Annotations = lo.Assign(r.Annotations, map[string]string{v1.NodeClaimReplacementOriginAnnotationKey: origin})
+		return r.NodeClaim
+	}), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
 	if err != nil {
 		return err
 	}

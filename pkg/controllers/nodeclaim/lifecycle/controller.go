@@ -53,6 +53,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/result"
 )
 
@@ -281,9 +282,37 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 			metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
 			metrics.ZoneLabel:         nodeClaim.Labels[corev1.LabelTopologyZone],
 		})
+		observeLifetime(nodeClaim)
 	}
 	return reconcile.Result{}, nil
 
+}
+
+// observeLifetime records a finalized NodeClaim's lifetime under the origin that launched it and the
+// cause of its deletion, so replacement nodes can be compared with provisioned ones.
+func observeLifetime(nodeClaim *v1.NodeClaim) {
+	if nodeClaim.CreationTimestamp.IsZero() || nodeClaim.DeletionTimestamp.IsZero() {
+		return
+	}
+	NodeClaimLifetimeSeconds.Observe(nodeClaim.DeletionTimestamp.Sub(nodeClaim.CreationTimestamp.Time).Seconds(), map[string]string{
+		metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
+		metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
+		originLabel:               lo.ValueOr(nodeClaim.Annotations, v1.NodeClaimReplacementOriginAnnotationKey, provisioningOrigin),
+		causeLabel:                terminationCause(nodeClaim),
+	})
+}
+
+// terminationCause names why a NodeClaim was deleted from what the NodeClaim itself records: the
+// DisruptionReason condition the disruption queue sets before deleting, whether the node ever
+// initialized, and otherwise nothing.
+func terminationCause(nodeClaim *v1.NodeClaim) string {
+	if cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason); cond.IsTrue() && cond.Reason != "" {
+		return pretty.ToSnakeCase(cond.Reason)
+	}
+	if !nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() {
+		return terminationCauseNeverInitialized
+	}
+	return terminationCauseOther
 }
 
 func (c *Controller) ensureTerminationGracePeriodTerminationTimeAnnotation(ctx context.Context, nodeClaim *v1.NodeClaim) error {

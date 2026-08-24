@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -218,6 +219,15 @@ type Replacement struct {
 	// This intentionally does not capture nodes that go initialized then go NotReady after as other pods can
 	// schedule to this node as well.
 	Initialized bool
+}
+
+// replacementOrigin is the value stored under NodeClaimReplacementOriginAnnotationKey on a command's
+// replacement NodeClaims: the snake-cased disruption reason and the sorted, comma-joined capacity types
+// of the nodes being replaced, for example "underutilized:spot".
+func replacementOrigin(cmd Command) string {
+	sources := lo.Uniq(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.capacityType }))
+	sort.Strings(sources)
+	return pretty.ToSnakeCase(string(cmd.Reason())) + ":" + strings.Join(sources, ",")
 }
 
 func replacementsFromNodeClaims(newNodeClaims ...*pscheduling.NodeClaim) []*Replacement {
