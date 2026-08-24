@@ -470,26 +470,24 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 		// every scheduler that reads it, so matchLabelKeys are folded into a copy of the selector
 		// rather than appended to the pod's own; otherwise each scheduler construction would grow
 		// the pod's selector by another requirement.
+		// Kubernetes applies matchLabelKeys only when a labelSelector is set; a nil selector
+		// matches nothing and stays nil regardless of the pod's labels.
 		selector := tsc.LabelSelector
-		var matchLabelKeyRequirements []metav1.LabelSelectorRequirement
-		for _, key := range tsc.MatchLabelKeys {
-			if value, ok := p.Labels[key]; ok {
-				matchLabelKeyRequirements = append(matchLabelKeyRequirements, metav1.LabelSelectorRequirement{
-					Key:      key,
-					Operator: metav1.LabelSelectorOpIn,
-					Values:   []string{value},
-				})
+		if selector != nil {
+			var matchLabelKeyRequirements []metav1.LabelSelectorRequirement
+			for _, key := range tsc.MatchLabelKeys {
+				if value, ok := p.Labels[key]; ok {
+					matchLabelKeyRequirements = append(matchLabelKeyRequirements, metav1.LabelSelectorRequirement{
+						Key:      key,
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{value},
+					})
+				}
 			}
-		}
-		// Only materialize a selector when there is something to add: a nil selector matches
-		// nothing, while an empty one matches everything.
-		if len(matchLabelKeyRequirements) > 0 {
-			if selector == nil {
-				selector = &metav1.LabelSelector{}
-			} else {
+			if len(matchLabelKeyRequirements) > 0 {
 				selector = selector.DeepCopy()
+				selector.MatchExpressions = append(selector.MatchExpressions, matchLabelKeyRequirements...)
 			}
-			selector.MatchExpressions = append(selector.MatchExpressions, matchLabelKeyRequirements...)
 		}
 		topologyGroups = append(topologyGroups, NewTopologyGroup(
 			TopologyTypeSpread,

@@ -75,16 +75,13 @@ func TestNewForTopologiesNilSelectorWithMatchLabelKeys(t *testing.T) {
 	topology := &Topology{
 		domainGroups: map[string]TopologyDomainGroup{corev1.LabelHostname: NewTopologyDomainGroup()},
 	}
+	// A nil selector matches nothing and matchLabelKeys do not apply to it, even when the pod
+	// carries the key: materializing a selector here would start matching pods.
 	groups := topology.newForTopologies(pod)
-	if len(groups) != 1 || groups[0].rawSelector == nil || len(groups[0].rawSelector.MatchExpressions) != 1 {
-		t.Fatalf("expected a selector built from matchLabelKeys, got %+v", groups)
-	}
-
-	// With none of the keys present on the pod the selector must stay nil: an empty selector
-	// would match every pod in the namespace rather than none.
-	pod.Labels = map[string]string{}
-	groups = topology.newForTopologies(pod)
 	if len(groups) != 1 || groups[0].rawSelector != nil {
-		t.Fatalf("expected a nil selector when no matchLabelKeys are present, got %+v", groups[0].rawSelector)
+		t.Fatalf("expected a nil selector to stay nil despite matchLabelKeys, got %+v", groups)
+	}
+	if len(pod.Spec.TopologySpreadConstraints[0].MatchLabelKeys) != 1 || pod.Spec.TopologySpreadConstraints[0].LabelSelector != nil {
+		t.Fatalf("expected the pod's constraint to be left untouched, got %+v", pod.Spec.TopologySpreadConstraints[0])
 	}
 }
