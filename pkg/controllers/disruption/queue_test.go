@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -37,6 +38,8 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -254,6 +257,92 @@ var _ = Describe("Queue", func() {
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim1, node1)
 		})
+		It("should wait for termination budget before deleting candidates when budgets are pipelined", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{PipelinedDisruptionBudgets: lo.ToPtr(true)}))
+			DeferCleanup(func() { ctx = options.ToContext(ctx, test.Options()) })
+			disruption.DisruptionQueueTerminationWaitsTotal.Reset()
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodeClaim2, node2, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
+
+			replacementNodeClaim := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacementNodeClaim)).To(Succeed())
+			replacementNodeClaim, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+				[]*corev1.Node{replacementNode}, []*v1.NodeClaim{replacementNodeClaim})
+
+			// The other node in the pool goes NotReady, so the pool's single termination slot is taken.
+			ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, node2)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
+
+			// The replacement is initialized, but the candidate must not be deleted while the budget is full.
+			result := ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			Expect(cmd.Replacements[0].Initialized).To(BeTrue())
+			Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+			ExpectExists(ctx, env.Client, nodeClaim1)
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue())
+			ExpectMetricCounterValue(disruption.DisruptionQueueTerminationWaitsTotal, 1, map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+				metrics.ReasonLabel:   "drifted",
+			})
+
+			// Waiting on budget must not be counted against the command's retry duration.
+			env.Clock.Step(2 * time.Hour)
+			result = ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+			ExpectExists(ctx, env.Client, nodeClaim1)
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue())
+
+			// Once the slot frees up the candidate is deleted.
+			ExpectMakeNodesReady(ctx, env.Client, env.Clock, node2)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim1)
+			ExpectNotFound(ctx, env.Client, nodeClaim1, node1)
+		})
+		It("should not wait for termination budget when budgets are not pipelined", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodeClaim2, node2, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
+
+			replacementNodeClaim := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacementNodeClaim)).To(Succeed())
+			replacementNodeClaim, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+				[]*corev1.Node{replacementNode}, []*v1.NodeClaim{replacementNodeClaim})
+			ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, node2)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
+
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim1)
+			ExpectNotFound(ctx, env.Client, nodeClaim1, node1)
+		})
 		It("should only finish a command when all replacements are initialized", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
@@ -419,7 +508,7 @@ var _ = Describe("Queue", func() {
 		Context("CalculateRetryDuration", func() {
 			DescribeTable("should calculate correct timeout based on queue length",
 				func(numCommands int, expectedDuration time.Duration) {
-					q := disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov)
+					q := disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, cloudProvider)
 					q.Lock()
 					for i := range numCommands {
 						q.ProviderIDToCommand[strconv.Itoa(i)] = &disruption.Command{}

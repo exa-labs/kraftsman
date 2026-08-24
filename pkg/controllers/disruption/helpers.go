@@ -337,14 +337,89 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 	return nodePoolMap, nodePoolToInstanceTypesMap, nil
 }
 
-// BuildDisruptionBudgets prepares our disruption budget mapping. The disruption budget maps each disruption reason to the number of allowed disruptions.
+// BuildDisruptionBudgetMapping prepares our disruption budget mapping. The disruption budget maps each disruption reason to the number of allowed disruptions.
 // We calculate allowed disruptions by taking the max disruptions allowed by disruption reason and subtracting the number of nodes that are NotReady and already being deleted by that disruption reason.
+//
+// With pipelined disruption budgets, a candidate whose command is still waiting on its replacements to initialize
+// only holds a slot in this mapping, which gates the start of new commands. The budget for actually terminating
+// nodes is checked separately by the disruption queue (see BuildTerminationBudgetMapping) right before it deletes a
+// command's candidates, so the NodePool's budget bounds how many nodes are draining at once rather than how many
+// commands are in flight.
 //
 //nolint:gocyclo
 func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, reason v1.DisruptionReason) (map[string]int, error) {
+	counts := countBudgetConsumers(cluster)
 	disruptionBudgetMapping := map[string]int{}
-	numNodes := map[string]int{}   // map[nodepool] -> node count in nodepool
-	disrupting := map[string]int{} // map[nodepool] -> nodes undergoing disruption
+	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
+	if err != nil {
+		return disruptionBudgetMapping, fmt.Errorf("listing node pools, %w", err)
+	}
+	pipelined := options.FromContext(ctx).PipelinedDisruptionBudgets
+	for _, nodePool := range nodePools {
+		c := counts[nodePool.Name]
+		allowedDisruptions := nodePool.MustGetAllowedDisruptions(clk, c.total, reason)
+		// Without pipelining, every node that is marked, draining, or unhealthy consumes the single budget. With it,
+		// only the nodes still waiting on a replacement hold a slot here; draining nodes are accounted for at the
+		// termination gate instead.
+		consuming := c.pending + c.terminating
+		if pipelined {
+			consuming = c.pending
+		}
+		disruptionBudgetMapping[nodePool.Name] = lo.Max([]int{allowedDisruptions - consuming, 0})
+		NodePoolAllowedDisruptions.Set(float64(allowedDisruptions), map[string]string{
+			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: string(reason),
+		})
+		NodePoolNodesConsumingBudgets.Set(float64(consuming), map[string]string{
+			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: string(reason),
+		})
+		NodePoolNodesPendingReplacement.Set(float64(c.pending), map[string]string{
+			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: string(reason),
+		})
+		NodePoolNodesTerminating.Set(float64(c.terminating), map[string]string{
+			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: string(reason),
+		})
+		if c.total != 0 && allowedDisruptions == 0 {
+			recorder.Publish(disruptionevents.NodePoolBlockedForDisruptionReason(nodePool, reason))
+		}
+	}
+	return disruptionBudgetMapping, nil
+}
+
+// BuildTerminationBudgetMapping returns, per NodePool, how many more nodes may start draining right now for the
+// given reason: the NodePool's allowed disruptions less the nodes that are already terminating or NotReady. It is
+// the second stage of pipelined disruption budgets and is consulted by the disruption queue before it deletes a
+// command's candidates.
+func BuildTerminationBudgetMapping(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, reason v1.DisruptionReason) (map[string]int, error) {
+	counts := countBudgetConsumers(cluster)
+	terminationBudgetMapping := map[string]int{}
+	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
+	if err != nil {
+		return terminationBudgetMapping, fmt.Errorf("listing node pools, %w", err)
+	}
+	for _, nodePool := range nodePools {
+		c := counts[nodePool.Name]
+		allowedDisruptions := nodePool.MustGetAllowedDisruptions(clk, c.total, reason)
+		terminationBudgetMapping[nodePool.Name] = lo.Max([]int{allowedDisruptions - c.terminating, 0})
+	}
+	return terminationBudgetMapping, nil
+}
+
+// budgetConsumers splits a NodePool's initialized nodes by how they relate to its disruption budget.
+type budgetConsumers struct {
+	// total is the number of initialized, non-terminated nodes the budget percentage is computed from.
+	total int
+	// pending is the number of nodes a disruption command has claimed but not yet deleted: their replacements are
+	// still booting, the node is tainted against new pods, and every pod on it is still running.
+	pending int
+	// terminating is the number of nodes that are actually being drained or are NotReady, i.e. whose pods are (or
+	// may be) unavailable.
+	terminating int
+}
+
+// countBudgetConsumers tallies budgetConsumers per NodePool name. NodePools with no initialized nodes are absent from
+// the map; the zero value is the correct count for them.
+func countBudgetConsumers(cluster *state.Cluster) map[string]budgetConsumers {
+	counts := map[string]budgetConsumers{}
 	for _, node := range cluster.DeepCopyNodes() {
 		// We only consider nodes that we own and are initialized towards the total.
 		// If a node is launched/registered, but not initialized, pods aren't scheduled
@@ -356,42 +431,26 @@ func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, c
 		if !node.Managed() || !node.Initialized() {
 			continue
 		}
-
 		// Additionally, don't consider nodeclaims that have the terminating condition. A nodeclaim should have
 		// the Terminating condition only when the node is drained and cloudprovider.Delete() was successful
 		// on the underlying cloud provider machine.
 		if node.NodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
 			continue
 		}
-
 		nodePool := node.Labels()[v1.NodePoolLabelKey]
-		numNodes[nodePool]++
-
-		// If the node satisfies one of the following, we subtract it from the allowed disruptions.
-		// 1. Has a NotReady conditiion
-		// 2. Is marked as disrupting
-		if cond := nodeutils.GetCondition(node.Node, corev1.NodeReady); cond.Status != corev1.ConditionTrue || node.MarkedForDeletion() {
-			disrupting[nodePool]++
+		c := counts[nodePool]
+		c.total++
+		// A node is terminating when it is NotReady or its NodeClaim is being deleted (drain in progress). A node the
+		// disruption queue has only marked for deletion is pending: nothing on it has been disrupted yet.
+		switch {
+		case nodeutils.GetCondition(node.Node, corev1.NodeReady).Status != corev1.ConditionTrue || node.Deleted():
+			c.terminating++
+		case node.MarkedForDeletion():
+			c.pending++
 		}
+		counts[nodePool] = c
 	}
-	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
-	if err != nil {
-		return disruptionBudgetMapping, fmt.Errorf("listing node pools, %w", err)
-	}
-	for _, nodePool := range nodePools {
-		allowedDisruptions := nodePool.MustGetAllowedDisruptions(clk, numNodes[nodePool.Name], reason)
-		disruptionBudgetMapping[nodePool.Name] = lo.Max([]int{allowedDisruptions - disrupting[nodePool.Name], 0})
-		NodePoolAllowedDisruptions.Set(float64(allowedDisruptions), map[string]string{
-			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: string(reason),
-		})
-		NodePoolNodesConsumingBudgets.Set(float64(disrupting[nodePool.Name]), map[string]string{
-			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: string(reason),
-		})
-		if numNodes[nodePool.Name] != 0 && allowedDisruptions == 0 {
-			recorder.Publish(disruptionevents.NodePoolBlockedForDisruptionReason(nodePool, reason))
-		}
-	}
-	return disruptionBudgetMapping, nil
+	return counts
 }
 
 // mapCandidates maps the list of proposed candidates with the current state

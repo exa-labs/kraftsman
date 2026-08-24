@@ -66,6 +66,7 @@ var _ = Describe("Options", func() {
 		"MIN_VALUES_POLICY",
 		"FEATURE_GATES",
 		"OD_TO_SPOT_CONSOLIDATION",
+		"PIPELINED_DISRUPTION_BUDGETS",
 		"SPOT_TO_SPOT_MIN_INSTANCE_TYPES",
 	}
 
@@ -331,6 +332,26 @@ var _ = Describe("Options", func() {
 		It("should opt out of od-to-spot-consolidation via the CLI flag", func() {
 			Expect(opts.Parse(fs, "--od-to-spot-consolidation=false")).To(Succeed())
 			Expect(opts.ODToSpotConsolidation).To(BeFalse())
+		})
+
+		It("should default pipelined-disruption-budgets to false", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.PipelinedDisruptionBudgets).To(BeFalse())
+		})
+
+		It("should enable pipelined-disruption-budgets via the environment variable", func() {
+			os.Setenv("PIPELINED_DISRUPTION_BUDGETS", "true")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.PipelinedDisruptionBudgets).To(BeTrue())
+		})
+
+		It("should enable pipelined-disruption-budgets via the CLI flag", func() {
+			Expect(opts.Parse(fs, "--pipelined-disruption-budgets=true")).To(Succeed())
+			Expect(opts.PipelinedDisruptionBudgets).To(BeTrue())
 		})
 
 		It("should default spot-to-spot-min-instance-types to 15", func() {
