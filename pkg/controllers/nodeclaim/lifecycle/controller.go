@@ -258,6 +258,7 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 		}
 		InstanceTerminationDurationSeconds.Observe(time.Since(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).LastTransitionTime.Time).Seconds(), map[string]string{
 			metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
+			causeLabel:            terminationCause(nodeClaim),
 		})
 	}
 	stored := nodeClaim.DeepCopy() // The NodeClaim may have been modified in the EnsureTerminated function
@@ -276,6 +277,7 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 		log.FromContext(ctx).Info("deleted nodeclaim")
 		NodeClaimTerminationDurationSeconds.Observe(time.Since(stored.DeletionTimestamp.Time).Seconds(), map[string]string{
 			metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
+			causeLabel:            terminationCause(nodeClaim),
 		})
 		metrics.NodeClaimsTerminatedTotal.Inc(map[string]string{
 			metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
@@ -303,9 +305,13 @@ func observeLifetime(nodeClaim *v1.NodeClaim) {
 }
 
 // terminationCause names why a NodeClaim was deleted from what the NodeClaim itself records: the
-// DisruptionReason condition the disruption queue sets before deleting, whether the node ever
-// initialized, and otherwise nothing.
+// termination-cause annotation a deleter outside the disruption queue stamps (only known values,
+// so arbitrary annotations cannot explode metric cardinality), the DisruptionReason condition the
+// disruption queue sets before deleting, whether the node ever initialized, and otherwise nothing.
 func terminationCause(nodeClaim *v1.NodeClaim) string {
+	if cause := nodeClaim.Annotations[v1.NodeClaimTerminationCauseAnnotationKey]; cause == v1.NodeClaimTerminationCauseCloudInterrupted {
+		return cause
+	}
 	if cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason); cond.IsTrue() && cond.Reason != "" {
 		return pretty.ToSnakeCase(cond.Reason)
 	}

@@ -30,10 +30,10 @@ var InstanceTerminationDurationSeconds = opmetrics.NewPrometheusHistogram(
 		Namespace: metrics.Namespace,
 		Subsystem: metrics.NodeClaimSubsystem,
 		Name:      "instance_termination_duration_seconds",
-		Help:      "Duration of CloudProvider Instance termination in seconds.",
+		Help:      "Duration of CloudProvider Instance termination in seconds, by NodePool and the cause of the deletion (a voluntary disruption reason, the termination-cause annotation such as cloud_interrupted, never_initialized, or other).",
 		Buckets:   prometheus.ExponentialBuckets(1, 2, 11), //The threshold values generated here are 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
 	},
-	[]string{metrics.NodePoolLabel},
+	[]string{metrics.NodePoolLabel, causeLabel},
 )
 
 // NodeClaimLifetimeSeconds records how long each NodeClaim existed, from creation to the removal of its
@@ -47,7 +47,7 @@ var NodeClaimLifetimeSeconds = opmetrics.NewPrometheusHistogram(
 		Namespace: metrics.Namespace,
 		Subsystem: metrics.NodeClaimSubsystem,
 		Name:      "lifetime_seconds",
-		Help:      "Seconds from NodeClaim creation to deletion, by NodePool, capacity type, the origin that launched it (provisioning, or the replacement-origin annotation set by the disruption queue), and the cause of its termination (a voluntary disruption reason, never_initialized, or other).",
+		Help:      "Seconds from NodeClaim creation to deletion, by NodePool, capacity type, the origin that launched it (provisioning, or the replacement-origin annotation set by the disruption queue), and the cause of its termination (a voluntary disruption reason, the termination-cause annotation such as cloud_interrupted, never_initialized, or other).",
 		Buckets:   metrics.NodeLifetimeBuckets(),
 	},
 	[]string{metrics.NodePoolLabel, metrics.CapacityTypeLabel, originLabel, causeLabel},
@@ -62,8 +62,9 @@ const (
 	// terminationCauseNeverInitialized marks a NodeClaim deleted before it ever became a usable node:
 	// a failed launch, a registration or initialization timeout, or an instance that disappeared.
 	terminationCauseNeverInitialized = "never_initialized"
-	// terminationCauseOther covers deletions the NodeClaim itself does not explain: cloud provider
-	// interruption, expiration, garbage collection of a vanished instance, and operator deletes.
+	// terminationCauseOther covers deletions the NodeClaim itself does not explain: expiration,
+	// garbage collection of a vanished instance, and operator deletes. Cloud-initiated interruption
+	// is reported under its own cause when the deleter stamps NodeClaimTerminationCauseAnnotationKey.
 	terminationCauseOther = "other"
 )
 
@@ -73,7 +74,7 @@ var NodeClaimTerminationDurationSeconds = opmetrics.NewPrometheusHistogram(
 		Namespace: metrics.Namespace,
 		Subsystem: metrics.NodeClaimSubsystem,
 		Name:      "termination_duration_seconds",
-		Help:      "Duration of NodeClaim termination in seconds.",
+		Help:      "Duration of NodeClaim termination in seconds, by NodePool and the cause of the deletion (a voluntary disruption reason, the termination-cause annotation such as cloud_interrupted, never_initialized, or other).",
 		Buckets:   prometheus.ExponentialBuckets(1, 2, 12)}, //The threshold values generated here are 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024. 2048
-	[]string{metrics.NodePoolLabel},
+	[]string{metrics.NodePoolLabel, causeLabel},
 )

@@ -172,6 +172,48 @@ var _ = Describe("Termination", func() {
 		Entry("attributes a consolidation replacement disrupted by consolidation to its origin and reason", "underutilized:spot", string(v1.DisruptionReasonUnderutilized), true, "underutilized:spot", "underutilized"),
 		Entry("attributes a node that never initialized to never_initialized", "", "", false, "provisioning", "never_initialized"),
 	)
+	It("attributes deletions stamped with the termination-cause annotation to that cause", func() {
+		lifecycle.NodeClaimLifetimeSeconds.Reset()
+		lifecycle.NodeClaimTerminationDurationSeconds.Reset()
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+
+		node := test.NodeClaimLinkedNode(nodeClaim)
+		ExpectApplied(ctx, env.Client, node)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue()).To(BeTrue())
+
+		// Stand in for the initialization controller and an interruption controller, which stamps the
+		// termination-cause annotation before deleting the NodeClaim.
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
+		nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.NodeClaimTerminationCauseAnnotationKey: v1.NodeClaimTerminationCauseCloudInterrupted})
+		ExpectApplied(ctx, env.Client, nodeClaim)
+
+		Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		ExpectFinalizersRemoved(ctx, env.Client, node)
+		ExpectNotFound(ctx, env.Client, node)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		ExpectNotFound(ctx, env.Client, nodeClaim)
+
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_instance_termination_duration_seconds", 1, map[string]string{
+			metrics.NodePoolLabel: nodePool.Name,
+			"cause":               v1.NodeClaimTerminationCauseCloudInterrupted,
+		})
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_termination_duration_seconds", 1, map[string]string{
+			metrics.NodePoolLabel: nodePool.Name,
+			"cause":               v1.NodeClaimTerminationCauseCloudInterrupted,
+		})
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_lifetime_seconds", 1, map[string]string{
+			metrics.NodePoolLabel:     nodePool.Name,
+			metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
+			"origin":                  "provisioning",
+			"cause":                   v1.NodeClaimTerminationCauseCloudInterrupted,
+		})
+	})
 	It("shouldn't mark the root condition of the NodeClaim as unknown when setting the Termination condition", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)

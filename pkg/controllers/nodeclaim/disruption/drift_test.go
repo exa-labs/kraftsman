@@ -479,6 +479,24 @@ var _ = Describe("Drift", func() {
 			Entry("ExpireAfter", v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{ExpireAfter: v1.MustParseNillableDuration("100m")}}}}),
 			Entry("TerminationGracePeriod", v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{TerminationGracePeriod: &metav1.Duration{Duration: 100 * time.Minute}}}}}),
 		)
+		It("should not detect drift when the reserved termination-cause annotation is added to the NodePool template", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodePoolController, nodePool)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimDisruptionController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeDrifted)).To(BeNil())
+
+			nodePool = ExpectExists(ctx, env.Client, nodePool)
+			nodePool.Spec.Template.Annotations = lo.Assign(nodePool.Spec.Template.Annotations, map[string]string{
+				v1.NodeClaimTerminationCauseAnnotationKey: v1.NodeClaimTerminationCauseCloudInterrupted,
+			})
+			ExpectApplied(ctx, env.Client, nodePool)
+
+			ExpectObjectReconciled(ctx, env.Client, nodePoolController, nodePool)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimDisruptionController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeDrifted)).To(BeNil())
+		})
 		It("should not return drifted if karpenter.sh/nodepool-hash annotation is not present on the NodePool", func() {
 			nodePool.Annotations = map[string]string{}
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)

@@ -61,7 +61,16 @@ const (
 	// nodes it was about to disrupt. The value is "<reason>:<source capacity types>", for example
 	// "underutilized:spot", so the node's later fate can be attributed to the decision that launched it.
 	NodeClaimReplacementOriginAnnotationKey = apis.Group + "/replacement-origin"
+	// NodeClaimTerminationCauseAnnotationKey records why a NodeClaim was deleted when the deleter is not
+	// the disruption queue, for example "cloud_interrupted" for cloud-initiated interruption or preemption.
+	// Termination metrics report it as the cause of the deletion.
+	NodeClaimTerminationCauseAnnotationKey = apis.Group + "/termination-cause"
 )
+
+// NodeClaimTerminationCauseCloudInterrupted is the NodeClaimTerminationCauseAnnotationKey value for
+// deletions initiated by the cloud provider rather than Karpenter: a spot interruption or preemption,
+// a scheduled change, or an instance health failure.
+const NodeClaimTerminationCauseCloudInterrupted = "cloud_interrupted"
 
 // Karpenter specific finalizers
 const (
