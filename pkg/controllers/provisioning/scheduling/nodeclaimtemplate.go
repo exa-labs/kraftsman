@@ -159,8 +159,11 @@ func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 	nc := &v1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: fmt.Sprintf("%s-", i.NodePoolName),
-			Annotations:  i.Annotations,
-			Labels:       i.Labels,
+			// The termination-cause annotation is reserved for the deleter that terminates the
+			// NodeClaim; a value inherited from NodePool template metadata would misattribute
+			// every termination from that pool in the termination metrics.
+			Annotations: lo.OmitByKeys(i.Annotations, []string{v1.NodeClaimTerminationCauseAnnotationKey}),
+			Labels:      i.Labels,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion:         object.GVK(&v1.NodePool{}).GroupVersion().String(),
