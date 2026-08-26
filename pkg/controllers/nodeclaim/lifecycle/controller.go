@@ -305,13 +305,12 @@ func observeLifetime(nodeClaim *v1.NodeClaim) {
 }
 
 // terminationCause names why a NodeClaim was deleted from what the NodeClaim itself records: the
-// termination-cause annotation a deleter outside the disruption queue stamps (for example
-// cloud_interrupted for a cloud-initiated interruption or preemption), the DisruptionReason
-// condition the disruption queue sets before deleting, whether the node ever initialized, and
-// otherwise nothing.
+// termination-cause annotation a deleter outside the disruption queue stamps (only known values,
+// so arbitrary annotations cannot explode metric cardinality), the DisruptionReason condition the
+// disruption queue sets before deleting, whether the node ever initialized, and otherwise nothing.
 func terminationCause(nodeClaim *v1.NodeClaim) string {
-	if cause := nodeClaim.Annotations[v1.NodeClaimTerminationCauseAnnotationKey]; cause != "" {
-		return pretty.ToSnakeCase(cause)
+	if cause := nodeClaim.Annotations[v1.NodeClaimTerminationCauseAnnotationKey]; cause == v1.NodeClaimTerminationCauseCloudInterrupted {
+		return cause
 	}
 	if cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason); cond.IsTrue() && cond.Reason != "" {
 		return pretty.ToSnakeCase(cond.Reason)
