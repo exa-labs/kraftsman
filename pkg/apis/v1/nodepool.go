@@ -334,7 +334,13 @@ type NodePool struct {
 const NodePoolHashVersion = "v3"
 
 func (in *NodePool) Hash() string {
-	return fmt.Sprint(lo.Must(hashstructure.Hash(in.Spec.Template, hashstructure.FormatV2, &hashstructure.HashOptions{
+	// The termination-cause annotation is reserved for the deleter of a NodeClaim and never
+	// propagates from template metadata to created NodeClaims, so it must not drift them either.
+	template := in.Spec.Template
+	if _, ok := template.Annotations[NodeClaimTerminationCauseAnnotationKey]; ok {
+		template.Annotations = lo.OmitByKeys(template.Annotations, []string{NodeClaimTerminationCauseAnnotationKey})
+	}
+	return fmt.Sprint(lo.Must(hashstructure.Hash(template, hashstructure.FormatV2, &hashstructure.HashOptions{
 		SlicesAsSets:    true,
 		IgnoreZeroValue: true,
 		ZeroNil:         true,
