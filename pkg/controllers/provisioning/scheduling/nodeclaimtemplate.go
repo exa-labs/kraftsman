@@ -106,6 +106,12 @@ func (i *NodeClaimTemplate) resolveCustomLabelsFromRequirements() map[string]str
 		if v1.WellKnownLabels.Has(key) || v1.RestrictedLabels.Has(key) || schedulingSimulationKeys.Has(key) {
 			continue
 		}
+		// An Exists requirement left unnarrowed by any pod requirement has no concrete value;
+		// Any() would invent a random one (e.g. `efa=1490613278757040451`), mislabeling the node
+		// and matching nothing that selects on a real value. Leave the label unset instead.
+		if requirement.Operator() == corev1.NodeSelectorOpExists {
+			continue
+		}
 		if value := requirement.Any(); value != "" {
 			labels[key] = value
 		}

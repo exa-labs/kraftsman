@@ -245,6 +245,74 @@ var _ = Describe("IsDisruptable", func() {
 	})
 })
 
+var _ = Describe("IsPreempting", func() {
+	It("should return false when no node is nominated", func() {
+		p := &corev1.Pod{}
+		Expect(pod.IsPreempting(p)).To(BeFalse())
+	})
+
+	It("should return true for a kube-scheduler pod nominated to a node", func() {
+		p := &corev1.Pod{
+			Spec:   corev1.PodSpec{SchedulerName: "default-scheduler"},
+			Status: corev1.PodStatus{NominatedNodeName: "node-a"},
+		}
+		Expect(pod.IsPreempting(p)).To(BeTrue())
+	})
+
+	It("should return false for a volcano-scheduled pod nominated to a node", func() {
+		p := &corev1.Pod{
+			Spec:   corev1.PodSpec{SchedulerName: pod.VolcanoSchedulerName},
+			Status: corev1.PodStatus{NominatedNodeName: "node-a"},
+		}
+		Expect(pod.IsPreempting(p)).To(BeFalse())
+	})
+})
+
+var _ = Describe("IsProvisionable", func() {
+	unschedulable := corev1.PodCondition{
+		Type:   corev1.PodScheduled,
+		Status: corev1.ConditionFalse,
+		Reason: corev1.PodReasonUnschedulable,
+	}
+
+	It("should exclude a kube-scheduler pod nominated to a node", func() {
+		p := &corev1.Pod{
+			Spec: corev1.PodSpec{SchedulerName: "default-scheduler"},
+			Status: corev1.PodStatus{
+				Conditions:        []corev1.PodCondition{unschedulable},
+				NominatedNodeName: "node-a",
+			},
+		}
+		Expect(pod.IsProvisionable(p)).To(BeFalse())
+	})
+
+	It("should include a volcano-scheduled pod nominated to a node", func() {
+		p := &corev1.Pod{
+			Spec: corev1.PodSpec{SchedulerName: pod.VolcanoSchedulerName},
+			Status: corev1.PodStatus{
+				Conditions:        []corev1.PodCondition{unschedulable},
+				NominatedNodeName: "node-a",
+			},
+		}
+		Expect(pod.IsProvisionable(p)).To(BeTrue())
+	})
+
+	It("should exclude a volcano-scheduled pod whose PodScheduled reason is not Unschedulable", func() {
+		p := &corev1.Pod{
+			Spec: corev1.PodSpec{SchedulerName: pod.VolcanoSchedulerName},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{{
+					Type:   corev1.PodScheduled,
+					Status: corev1.ConditionFalse,
+					Reason: "Schedulable",
+				}},
+				NominatedNodeName: "node-a",
+			},
+		}
+		Expect(pod.IsProvisionable(p)).To(BeFalse())
+	})
+})
+
 var _ = Describe("HasDRARequirements", func() {
 	It("should return false when the pod references no ResourceClaims", func() {
 		p := &corev1.Pod{
