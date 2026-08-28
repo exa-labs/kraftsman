@@ -17,6 +17,7 @@ limitations under the License.
 package scheduling
 
 import (
+	"slices"
 	"sort"
 	"testing"
 
@@ -108,7 +109,7 @@ func TestTopologyGroupSpreadSkipsUnselectableNodePoolDomains(t *testing.T) {
 	pod := zoneSpreadPod(map[string]string{v1.NodePoolLabelKey: "monitoring"})
 
 	domains := spreadDomains(t, pod, nodePools, nil)
-	if want := []string{"us-west-2a", "us-west-2b", "us-west-2c"}; !equalStrings(domains, want) {
+	if want := []string{"us-west-2a", "us-west-2b", "us-west-2c"}; !slices.Equal(domains, want) {
 		t.Fatalf("expected only the domains of the selected nodepool %v, got %v", want, domains)
 	}
 }
@@ -121,7 +122,7 @@ func TestTopologyGroupSpreadCountsAllDomainsWithoutNodeSelector(t *testing.T) {
 	pod := zoneSpreadPod(nil)
 
 	domains := spreadDomains(t, pod, nodePools, nil)
-	if want := []string{"ap-northeast-1a", "us-west-2a", "us-west-2b"}; !equalStrings(domains, want) {
+	if want := []string{"ap-northeast-1a", "us-west-2a", "us-west-2b"}; !slices.Equal(domains, want) {
 		t.Fatalf("expected every domain %v, got %v", want, domains)
 	}
 }
@@ -145,7 +146,7 @@ func TestTopologyGroupSpreadHonorsRequiredNodeAffinity(t *testing.T) {
 	}}
 
 	domains := spreadDomains(t, pod, nodePools, nil)
-	if want := []string{"us-west-2a", "us-west-2b"}; !equalStrings(domains, want) {
+	if want := []string{"us-west-2a", "us-west-2b"}; !slices.Equal(domains, want) {
 		t.Fatalf("expected only the domains of the affine nodepool %v, got %v", want, domains)
 	}
 }
@@ -170,7 +171,7 @@ func TestTopologyGroupSpreadIgnoredAffinityPolicyCountsAllDomains(t *testing.T) 
 		pod.Spec.TopologySpreadConstraints[0].LabelSelector, 1, nil, nil, &ignore, domainGroups[corev1.LabelTopologyZone])
 
 	domains := sets.List(sets.KeySet(group.domains))
-	if want := []string{"ap-northeast-1a", "us-west-2a"}; !equalStrings(domains, want) {
+	if want := []string{"ap-northeast-1a", "us-west-2a"}; !slices.Equal(domains, want) {
 		t.Fatalf("expected every domain %v, got %v", want, domains)
 	}
 }
@@ -185,25 +186,13 @@ func TestTopologyGroupSpreadHonorsTaints(t *testing.T) {
 	honor := corev1.NodeInclusionPolicyHonor
 
 	domains := spreadDomains(t, zoneSpreadPod(nil), nodePools, &honor)
-	if want := []string{"us-west-2a"}; !equalStrings(domains, want) {
+	if want := []string{"us-west-2a"}; !slices.Equal(domains, want) {
 		t.Fatalf("expected the tainted nodepool's domain to be skipped, got %v", domains)
 	}
 
 	tolerating := zoneSpreadPod(nil, corev1.Toleration{Key: "accelerator", Operator: corev1.TolerationOpExists})
 	domains = spreadDomains(t, tolerating, nodePools, &honor)
-	if want := []string{"us-west-2a", "us-west-2b"}; !equalStrings(domains, want) {
+	if want := []string{"us-west-2a", "us-west-2b"}; !slices.Equal(domains, want) {
 		t.Fatalf("expected a tolerating pod to keep every domain %v, got %v", want, domains)
 	}
-}
-
-func equalStrings(got []string, want []string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			return false
-		}
-	}
-	return true
 }
