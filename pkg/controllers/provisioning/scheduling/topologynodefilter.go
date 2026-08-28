@@ -79,6 +79,23 @@ func (t TopologyNodeFilter) Matches(taints []corev1.Taint, requirements scheduli
 	return matchesAffinity && matchesTaints
 }
 
+// ConflictsWithRequirements returns true if no term of the pod's required node affinity can be met by a node with
+// the given requirements. Unlike matchesRequirements it only reports outright conflicts: a key the requirements
+// leave undefined isn't a mismatch, since a node's labels are also decided by the instance type picked at launch.
+// This is the check to use against a NodePool rather than an actual node or a NodeClaim.
+func (t TopologyNodeFilter) ConflictsWithRequirements(requirements scheduling.Requirements) bool {
+	if len(t.Requirements) == 0 || t.AffinityPolicy == corev1.NodeInclusionPolicyIgnore {
+		return false
+	}
+	// these are an OR, so the filter only conflicts if every term does
+	for _, req := range t.Requirements {
+		if requirements.Intersects(req) == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // MatchesRequirements returns true if the TopologyNodeFilter doesn't prohibit a node with the requirements from
 // participating in the topology. This method allows checking the requirements from a scheduling.NodeClaim to see if the
 // node we will soon create participates in this topology.

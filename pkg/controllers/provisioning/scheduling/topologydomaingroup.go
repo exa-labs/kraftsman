@@ -52,7 +52,9 @@ func (t TopologyDomainGroup) Insert(domain string, nodePool string, taints []v1.
 // ForEachDomain calls f on each domain tracked by the topology group that the pod could actually
 // land in, given at least one NodePool supplying that domain. If the taint policy is honor, the pod
 // must tolerate that NodePool's taints; if the affinity policy is honor, the pod's node selector and
-// required node affinity must be compatible with the NodePool.
+// required node affinity must not conflict with the NodePool's requirements. A domain is only
+// dropped on an outright conflict, so a pod selecting a label that the NodePool leaves to its
+// instance types keeps the domain.
 //
 // Honoring affinity here is what keeps a spread's global minimum meaningful in a cluster whose
 // NodePools do not all offer the same domains. A pod pinned to one NodePool would otherwise count
@@ -69,8 +71,7 @@ func (t TopologyDomainGroup) ForEachDomain(pod *v1.Pod, nodeFilter TopologyNodeF
 					continue
 				}
 			}
-			if nodeFilter.AffinityPolicy == v1.NodeInclusionPolicyHonor &&
-				!nodeFilter.matchesRequirements(source.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
+			if nodeFilter.AffinityPolicy == v1.NodeInclusionPolicyHonor && nodeFilter.ConflictsWithRequirements(source.Requirements) {
 				continue
 			}
 			f(domain)

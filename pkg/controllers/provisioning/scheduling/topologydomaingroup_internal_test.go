@@ -151,6 +151,29 @@ func TestTopologyGroupSpreadHonorsRequiredNodeAffinity(t *testing.T) {
 	}
 }
 
+// A NodePool leaves some labels to whichever instance type gets launched, so a pod selecting one of
+// those keys must not lose the pool's domains: only an outright conflict drops a domain.
+func TestTopologyGroupSpreadKeepsDomainsForInstanceTypeOnlyLabels(t *testing.T) {
+	nodePools := []*v1.NodePool{zonalNodePool("monitoring", []string{"us-west-2a", "us-west-2b"})}
+	pod := zoneSpreadPod(map[string]string{"example.com/flavor": "gpu"})
+
+	instanceTypes := map[string][]*cloudprovider.InstanceType{"monitoring": {{
+		Name: "gpu-instance-type",
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-west-2a", "us-west-2b"),
+			scheduling.NewRequirement("example.com/flavor", corev1.NodeSelectorOpIn, "gpu"),
+		),
+	}}}
+	domainGroups := buildDomainGroups(nodePools, instanceTypes)
+	group := NewTopologyGroup(TopologyTypeSpread, corev1.LabelTopologyZone, pod, sets.New(pod.Namespace),
+		pod.Spec.TopologySpreadConstraints[0].LabelSelector, 1, nil, nil, nil, domainGroups[corev1.LabelTopologyZone])
+
+	domains := sets.List(sets.KeySet(group.domains))
+	if want := []string{"us-west-2a", "us-west-2b"}; !slices.Equal(domains, want) {
+		t.Fatalf("expected the instance types' domains %v, got %v", want, domains)
+	}
+}
+
 // An ignored NodeAffinityPolicy opts out of the filtering entirely, as it does upstream.
 func TestTopologyGroupSpreadIgnoredAffinityPolicyCountsAllDomains(t *testing.T) {
 	nodePools := []*v1.NodePool{
