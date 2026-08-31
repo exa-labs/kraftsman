@@ -135,8 +135,18 @@ func IsScheduled(pod *corev1.Pod) bool {
 	return pod.Spec.NodeName != ""
 }
 
+// VolcanoSchedulerName is the schedulerName Volcano-managed pods carry.
+const VolcanoSchedulerName = "volcano"
+
+// IsPreempting checks if a pod is about to schedule onto existing capacity freed by preemption.
+// kube-scheduler sets NominatedNodeName only after selecting preemption victims whose deletion
+// will free enough capacity for the pod, and clears it when the nomination becomes invalid.
+// Volcano also sets it on gang members pipelined behind an eviction while the gang as a whole
+// cannot bind (minAvailable unmet), and never clears it, so for volcano-scheduled pods the field
+// carries no will-soon-schedule guarantee — treating it as one deadlocks partially-satisfiable
+// gangs (the nominated pods never appear provisionable, so the missing nodes are never launched).
 func IsPreempting(pod *corev1.Pod) bool {
-	return pod.Status.NominatedNodeName != ""
+	return pod.Status.NominatedNodeName != "" && pod.Spec.SchedulerName != VolcanoSchedulerName
 }
 
 func IsPending(pod *corev1.Pod) bool {
