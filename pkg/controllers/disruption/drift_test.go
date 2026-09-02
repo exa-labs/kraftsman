@@ -1049,6 +1049,75 @@ var _ = Describe("Drift", func() {
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(3))
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(3))
 		})
+		It("should not launch replacements for the pending pod backlog", func() {
+			labels := map[string]string{
+				"app": "test",
+			}
+			// create our RS so we can link a pod to it
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}},
+				NodeSelector: map[string]string{v1.NodePoolLabelKey: nodePool.Name},
+			})
+			// The backlog can only land on a NodePool the candidate does not belong to, so the simulation
+			// has to open separate claims for it that the candidate's replacement can never share.
+			backlogNodePool := test.NodePool()
+			backlogPods := test.UnschedulablePods(test.PodOptions{
+				NodeSelector: map[string]string{v1.NodePoolLabelKey: backlogNodePool.Name},
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("1")},
+				},
+			}, 3)
+
+			ExpectApplied(ctx, env.Client, rs, pod, nodeClaim, node, nodePool, backlogNodePool)
+			for _, p := range backlogPods {
+				ExpectApplied(ctx, env.Client, p)
+			}
+
+			// bind the pod to the node
+			ExpectManualBinding(ctx, env.Client, pod, node)
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			// The command replaces the candidate with the one claim that hosts its pod. The claims the
+			// simulation opened for the backlog belong to the provisioner, not to drift.
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+			nodeclaims := ExpectNodeClaims(ctx, env.Client)
+			Expect(nodeclaims).To(HaveLen(2))
+			for _, nc := range nodeclaims {
+				Expect(nc.Labels[v1.NodePoolLabelKey]).To(Equal(nodePool.Name))
+			}
+
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+
+			// Cascade any deletion of the nodeClaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim, node)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
+			// The backlog is still pending for the provisioner.
+			for _, p := range backlogPods {
+				ExpectNotScheduled(ctx, env.Client, p)
+			}
+		})
 		It("should drift one non-empty node at a time, starting with the earliest drift", func() {
 			labels := map[string]string{
 				"app": "test",

@@ -156,10 +156,10 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		})
 	}
 	results = results.TruncateInstanceTypes(ctx, scheduling.MaxInstanceTypes)
-	// Consolidation prices its command from this slice and counts it against the replacement bound,
-	// so a claim it did not cause distorts the decision. Drift and the other methods replace their
-	// candidate whatever the simulation costs, so they keep the unattributed contract.
-	if consolidationTypeFromContext(ctx) != "" && options.FromContext(ctx).ConsolidationAttributeReplacements {
+	// Every method launches this slice as its command's replacements and waits for each of them to
+	// become ready before it drains the candidate, so a claim the candidate did not cause is
+	// launched and waited on by a command that has no use for it.
+	if options.FromContext(ctx).ConsolidationAttributeReplacements {
 		results.NewNodeClaims = replacementsAttributableToDisruption(results.NewNodeClaims, deletingPodUIDs, candidatePodsWithheld(candidates, candidatePods))
 	}
 	for _, n := range results.ExistingNodes {
@@ -188,12 +188,16 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 // replacementsAttributableToDisruption keeps the new NodeClaims a disruption is responsible for and
 // drops the ones the simulation created for the pending pod backlog.
 //
-// A consolidation simulation schedules the candidate's pods alongside every pending pod in the
+// A disruption simulation schedules the candidate's pods alongside every pending pod in the
 // cluster, because that backlog competes for the same capacity. The solve does not distinguish
 // between them in its output: a claim opened for pods the provisioner is already launching capacity
-// for arrives in the same NewNodeClaims slice as the candidate's replacement. Consolidation then
-// reads that claim as part of its command, which turns a delete into a replacement, counts against
-// MaxConsolidationReplacements, and is priced against the candidate.
+// for arrives in the same NewNodeClaims slice as the candidate's replacement. The method then
+// reads that claim as part of its command. For consolidation that turns a delete into a
+// replacement, counts against MaxConsolidationReplacements, and is priced against the candidate.
+// For drift it makes the command launch a claim per backlog node and wait for all of them to
+// become ready before draining the candidate; a backlog the cloud cannot fill (ICE) then holds the
+// drift of one node hostage to hundreds of launches that never register, and the candidate is
+// never drained.
 //
 // The distortion is invisible while the backlog is empty, and on gaia production the
 // multiple_replacements_required skip rate per evaluated candidate tracks it directly: ~0.000 below
