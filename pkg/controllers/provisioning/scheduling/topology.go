@@ -113,6 +113,10 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 	domainGroups := map[string]TopologyDomainGroup{}
 	for npName, its := range instanceTypes {
 		np := nodePoolIndex[npName]
+		// Requirements carried by every node this NodePool launches, regardless of instance type.
+		// Domains are attributed to them so that a pod which can't select the NodePool doesn't have
+		// its topology spread computed against domains only this NodePool can supply.
+		nodePoolRequirements := nodePoolDomainRequirements(np)
 		for _, it := range its {
 			// We need to intersect the instance type requirements with the current nodePool requirements.  This
 			// ensures that something like zones from an instance type don't expand the universe of valid domains.
@@ -125,7 +129,7 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 					domainGroups[topologyKey] = NewTopologyDomainGroup()
 				}
 				for _, domain := range requirement.Values() {
-					domainGroups[topologyKey].Insert(domain, np.Spec.Template.Spec.Taints...)
+					domainGroups[topologyKey].Insert(domain, npName, np.Spec.Template.Spec.Taints, nodePoolRequirements)
 				}
 			}
 		}
@@ -138,12 +142,27 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 					domainGroups[key] = NewTopologyDomainGroup()
 				}
 				for _, value := range requirement.Values() {
-					domainGroups[key].Insert(value, np.Spec.Template.Spec.Taints...)
+					domainGroups[key].Insert(value, npName, np.Spec.Template.Spec.Taints, nodePoolRequirements)
 				}
 			}
 		}
 	}
 	return domainGroups
+}
+
+// nodePoolDomainRequirements returns the requirements shared by every node the NodePool can launch:
+// its template requirements and labels, plus the labels Karpenter stamps onto each of its NodeClaims.
+// Instance type requirements are deliberately left out, since a domain can be offered by only some of
+// the pool's instance types while this set has to hold for any node supplying the domain.
+func nodePoolDomainRequirements(np *v1.NodePool) scheduling.Requirements {
+	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
+	requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
+	nodeClaimLabels := map[string]string{v1.NodePoolLabelKey: np.Name}
+	if ref := np.Spec.Template.Spec.NodeClassRef; ref != nil {
+		nodeClaimLabels[v1.NodeClassLabelKey(ref.GroupKind())] = ref.Name
+	}
+	requirements.Add(scheduling.NewLabelRequirements(nodeClaimLabels).Values()...)
+	return requirements
 }
 
 // topologyError allows lazily generating the error string in the topology error.  If a pod fails to schedule, most often
