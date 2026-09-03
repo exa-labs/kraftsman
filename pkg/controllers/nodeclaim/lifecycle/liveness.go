@@ -25,6 +25,7 @@ import (
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/api/errors"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +39,9 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
+	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
 type Liveness struct {
@@ -54,6 +58,8 @@ const (
 	registrationTimeoutReason   = "registration_timeout"
 	launchTimeoutReason         = "launch_timeout"
 	initializationTimeoutReason = "initialization_timeout"
+	// initializationTimeoutWorkloadRecheck is how often a timed-out but still-working node is re-examined.
+	initializationTimeoutWorkloadRecheck = 5 * time.Minute
 )
 
 // LaunchTimeout is a heuristic time that we expect to be able to launch within
@@ -135,12 +141,43 @@ func (l *Liveness) reconcileInitializationTimeout(ctx context.Context, nodeClaim
 	if timeUntilTimeout := initializationTimeout - l.clock.Since(registered.LastTransitionTime.Time); timeUntilTimeout > 0 {
 		return reconcile.Result{RequeueAfter: timeUntilTimeout}, nil
 	}
+	// A node that is serving workload pods is not stuck in the sense this timeout guards against, even if it never
+	// reports Initialized (e.g. an extended resource it advertised at launch never shows up). Deleting it would evict
+	// running workloads for no gain, so it is left alone and re-checked in case the pods later drain away.
+	hasWorkload, err := l.hasWorkloadPods(ctx, nodeClaim)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if hasWorkload {
+		log.FromContext(ctx).V(1).WithValues("timeout", initializationTimeout).Info("skipping initialization timeout for node running workload pods")
+		return reconcile.Result{RequeueAfter: initializationTimeoutWorkloadRecheck}, nil
+	}
 	if err := l.deleteNodeClaimForTimeout(ctx, initializationTimeout, initializationTimeoutReason, nodeClaim); err != nil {
 		if client.IgnoreNotFound(err) != nil {
 			return reconcile.Result{}, err
 		}
 	}
 	return reconcile.Result{}, nil
+}
+
+// hasWorkloadPods reports whether the NodeClaim's node is running any pod that isn't part of the node's own
+// bootstrap, i.e. a non-DaemonSet pod that hasn't finished or started terminating. A NodeClaim whose node is not
+// found has no workload.
+func (l *Liveness) hasWorkloadPods(ctx context.Context, nodeClaim *v1.NodeClaim) (bool, error) {
+	node, err := nodeclaimutils.NodeForNodeClaim(ctx, l.kubeClient, nodeClaim)
+	if err != nil {
+		if nodeclaimutils.IsNodeNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	pods, err := nodeutils.GetPods(ctx, l.kubeClient, node)
+	if err != nil {
+		return false, err
+	}
+	return lo.ContainsBy(pods, func(pod *corev1.Pod) bool {
+		return !podutils.IsOwnedByDaemonSet(pod) && !podutils.IsTerminal(pod) && !podutils.IsTerminating(pod)
+	}), nil
 }
 
 // updateNodePoolRegistrationHealth sets the NodeRegistrationHealthy=False
