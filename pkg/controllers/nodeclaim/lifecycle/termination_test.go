@@ -199,20 +199,43 @@ var _ = Describe("Termination", func() {
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
 
-		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_instance_termination_duration_seconds", 1, map[string]string{
-			metrics.NodePoolLabel: nodePool.Name,
-			"cause":               v1.NodeClaimTerminationCauseCloudInterrupted,
-		})
-		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_termination_duration_seconds", 1, map[string]string{
-			metrics.NodePoolLabel: nodePool.Name,
-			"cause":               v1.NodeClaimTerminationCauseCloudInterrupted,
-		})
-		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_lifetime_seconds", 1, map[string]string{
+		// The instance and capacity type the fake cloud provider stamped at launch travel onto every
+		// termination histogram, so interruptions can be broken down by what was actually running.
+		Expect(nodeClaim.Labels[corev1.LabelInstanceTypeStable]).ToNot(BeEmpty())
+		Expect(nodeClaim.Labels[v1.CapacityTypeLabelKey]).ToNot(BeEmpty())
+		launchedLabels := map[string]string{
 			metrics.NodePoolLabel:     nodePool.Name,
+			"instance_type":           nodeClaim.Labels[corev1.LabelInstanceTypeStable],
 			metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
-			"origin":                  "provisioning",
 			"cause":                   v1.NodeClaimTerminationCauseCloudInterrupted,
-		})
+		}
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_instance_termination_duration_seconds", 1, launchedLabels)
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_termination_duration_seconds", 1, launchedLabels)
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_lifetime_seconds", 1, lo.Assign(launchedLabels, map[string]string{
+			"origin": "provisioning",
+		}))
+	})
+	It("reports the instance and capacity type as unknown for a NodeClaim deleted before it launched", func() {
+		lifecycle.NodeClaimLifetimeSeconds.Reset()
+		lifecycle.NodeClaimTerminationDurationSeconds.Reset()
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+		Expect(nodeClaim.Labels).ToNot(HaveKey(corev1.LabelInstanceTypeStable))
+		Expect(nodeClaim.Labels).ToNot(HaveKey(v1.CapacityTypeLabelKey))
+
+		Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		ExpectNotFound(ctx, env.Client, nodeClaim)
+
+		unlaunchedLabels := map[string]string{
+			metrics.NodePoolLabel:     nodePool.Name,
+			"instance_type":           "unknown",
+			metrics.CapacityTypeLabel: "unknown",
+			"cause":                   "never_initialized",
+		}
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_termination_duration_seconds", 1, unlaunchedLabels)
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_lifetime_seconds", 1, lo.Assign(unlaunchedLabels, map[string]string{
+			"origin": "provisioning",
+		}))
 	})
 	It("shouldn't mark the root condition of the NodeClaim as unknown when setting the Termination condition", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)

@@ -258,10 +258,7 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 		if err := c.deleteUnregisteredNodes(ctx, nodeClaim); err != nil {
 			return reconcile.Result{}, err
 		}
-		InstanceTerminationDurationSeconds.Observe(time.Since(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).LastTransitionTime.Time).Seconds(), map[string]string{
-			metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
-			causeLabel:            terminationCause(nodeClaim),
-		})
+		InstanceTerminationDurationSeconds.Observe(time.Since(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).LastTransitionTime.Time).Seconds(), terminationLabels(nodeClaim))
 	}
 	stored := nodeClaim.DeepCopy() // The NodeClaim may have been modified in the EnsureTerminated function
 	controllerutil.RemoveFinalizer(nodeClaim, v1.TerminationFinalizer)
@@ -277,10 +274,7 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 			return reconcile.Result{}, client.IgnoreNotFound(fmt.Errorf("removing termination finalizer, %w", err))
 		}
 		log.FromContext(ctx).Info("deleted nodeclaim")
-		NodeClaimTerminationDurationSeconds.Observe(time.Since(stored.DeletionTimestamp.Time).Seconds(), map[string]string{
-			metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
-			causeLabel:            terminationCause(nodeClaim),
-		})
+		NodeClaimTerminationDurationSeconds.Observe(time.Since(stored.DeletionTimestamp.Time).Seconds(), terminationLabels(nodeClaim))
 		metrics.NodeClaimsTerminatedTotal.Inc(map[string]string{
 			metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
 			metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
@@ -321,12 +315,29 @@ func observeLifetime(nodeClaim *v1.NodeClaim) {
 	if nodeClaim.CreationTimestamp.IsZero() || nodeClaim.DeletionTimestamp.IsZero() {
 		return
 	}
-	NodeClaimLifetimeSeconds.Observe(nodeClaim.DeletionTimestamp.Sub(nodeClaim.CreationTimestamp.Time).Seconds(), map[string]string{
+	labels := terminationLabels(nodeClaim)
+	labels[originLabel] = lo.ValueOr(nodeClaim.Annotations, v1.NodeClaimReplacementOriginAnnotationKey, provisioningOrigin)
+	NodeClaimLifetimeSeconds.Observe(nodeClaim.DeletionTimestamp.Sub(nodeClaim.CreationTimestamp.Time).Seconds(), labels)
+}
+
+// terminationLabels names the NodePool, the instance and capacity type the NodeClaim launched with, and
+// the cause of its deletion, for the histograms recorded when a NodeClaim is torn down. The instance and
+// capacity type come from the labels the cloud provider stamped at launch, so a NodeClaim deleted before it
+// launched reports them as unknown rather than as an empty label.
+func terminationLabels(nodeClaim *v1.NodeClaim) map[string]string {
+	return map[string]string{
 		metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
-		metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
-		originLabel:               lo.ValueOr(nodeClaim.Annotations, v1.NodeClaimReplacementOriginAnnotationKey, provisioningOrigin),
+		instanceTypeLabel:         labelOrUnknown(nodeClaim, corev1.LabelInstanceTypeStable),
+		metrics.CapacityTypeLabel: labelOrUnknown(nodeClaim, v1.CapacityTypeLabelKey),
 		causeLabel:                terminationCause(nodeClaim),
-	})
+	}
+}
+
+func labelOrUnknown(nodeClaim *v1.NodeClaim, key string) string {
+	if value := nodeClaim.Labels[key]; value != "" {
+		return value
+	}
+	return unknownLabelValue
 }
 
 // terminationCause names why a NodeClaim was deleted from what the NodeClaim itself records: the
