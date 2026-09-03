@@ -72,6 +72,7 @@ type Cluster struct {
 	podsSchedulableTimes            sync.Map // pod namespaced name -> time when it was first marked as able to fit to a node
 	podHealthyNodePoolScheduledTime sync.Map // pod namespaced name -> time when pod scheduled to a nodePool that has NodeRegistrationHealthy=true, is marked as able to fit to a node
 	podToNodeClaim                  sync.Map // pod namespaced name -> nodeClaim name
+	podsUnprovisionableTimes        sync.Map // pod namespaced name -> time of the latest provisioning simulation that could place it nowhere
 
 	clusterStateMu sync.RWMutex // Separate mutex as this is called in some places that mu is held
 	// A monotonically increasing timestamp representing the time state of the
@@ -122,6 +123,7 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		podsSchedulingAttempted:         sync.Map{},
 		podHealthyNodePoolScheduledTime: sync.Map{},
 		podToNodeClaim:                  sync.Map{},
+		podsUnprovisionableTimes:        sync.Map{},
 	}
 }
 
@@ -506,6 +508,7 @@ func (c *Cluster) MarkPodSchedulingDecisions(ctx context.Context, podErrors map[
 		}
 		c.podHealthyNodePoolScheduledTime.Delete(nn)
 		c.podToNodeClaim.Delete(nn)
+		c.podsUnprovisionableTimes.Store(nn, now)
 	}
 	for nodePoolName, pods := range npPods {
 		nodePool := &v1.NodePool{}
@@ -522,6 +525,7 @@ func (c *Cluster) MarkPodSchedulingDecisions(ctx context.Context, podErrors map[
 			if podutils.IsScheduled(p) {
 				continue
 			}
+			c.podsUnprovisionableTimes.Delete(nn)
 			c.podsSchedulableTimes.LoadOrStore(nn, now)
 			_, alreadyExists := c.podsSchedulingAttempted.LoadOrStore(nn, now)
 			// If we already attempted this, we don't need to emit another metric.
@@ -548,9 +552,23 @@ func (c *Cluster) MarkPodSchedulingDecisions(ctx context.Context, podErrors map[
 func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 	for ncName, pods := range ncPods {
 		for _, p := range pods {
-			c.podToNodeClaim.Store(client.ObjectKeyFromObject(p), ncName)
+			nn := client.ObjectKeyFromObject(p)
+			c.podToNodeClaim.Store(nn, ncName)
+			c.podsUnprovisionableTimes.Delete(nn)
 		}
 	}
+}
+
+// PodUnprovisionableTime returns when the provisioner's most recent scheduling simulation last found
+// nowhere for the pod: no existing node, no in-flight NodeClaim, and no NodePool that could launch
+// for it. It is zero when the latest simulation placed the pod or never considered it. Unlike
+// PodSchedulingDecisionTime, which remembers the first decision, this follows the latest one, so a
+// caller can tell a fresh verdict from a stale one.
+func (c *Cluster) PodUnprovisionableTime(podKey types.NamespacedName) time.Time {
+	if val, found := c.podsUnprovisionableTimes.Load(podKey); found {
+		return val.(time.Time)
+	}
+	return time.Time{}
 }
 
 // PodSchedulingDecisionTime returns when Karpenter first decided if a pod could schedule a pod in scheduling simulations.
@@ -604,6 +622,7 @@ func (c *Cluster) ClearPodSchedulingMappings(podKey types.NamespacedName) {
 	c.podsSchedulingAttempted.Delete(podKey)
 	c.podHealthyNodePoolScheduledTime.Delete(podKey)
 	c.podToNodeClaim.Delete(podKey)
+	c.podsUnprovisionableTimes.Delete(podKey)
 }
 
 // MarkUnconsolidated marks the cluster state as being unconsolidated.  This should be called in any situation where
@@ -665,6 +684,7 @@ func (c *Cluster) Reset() {
 	c.podAcks = sync.Map{}
 	c.podsSchedulingAttempted = sync.Map{}
 	c.podsSchedulableTimes = sync.Map{}
+	c.podsUnprovisionableTimes = sync.Map{}
 	c.bufferPodCounts = map[string]int{}
 }
 

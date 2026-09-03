@@ -61,6 +61,7 @@ type OptionsFields struct {
 	ConsolidationAttributeReplacements  *bool
 	ConsolidationSkipUnchangedNegatives *bool
 	ConsolidationNegativeCacheTTL       *time.Duration
+	DisruptionUnprovisionablePodTTL     *time.Duration
 	NodeClaimInitializationTimeout      *time.Duration
 	ODToSpotConsolidation               *bool
 	TopologyCountCacheMode              *options.TopologyCountCacheMode
@@ -118,6 +119,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		ConsolidationAttributeReplacements:  lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
 		ConsolidationSkipUnchangedNegatives: lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
 		ConsolidationNegativeCacheTTL:       lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
+		DisruptionUnprovisionablePodTTL:     lo.FromPtrOr(opts.DisruptionUnprovisionablePodTTL, 2*time.Minute),
 		NodeClaimInitializationTimeout:      lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
 		ODToSpotConsolidation:               lo.FromPtrOr(opts.ODToSpotConsolidation, false),
 		TopologyCountCacheMode:              lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
