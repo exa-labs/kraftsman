@@ -403,6 +403,16 @@ func (r Results) DRAErrors() map[*corev1.Pod]error {
 	})
 }
 
+// PodsIncompatibleWithAllNodePools returns the pods every NodePool rejected for a reason that holds in any scheduling
+// pass over the same NodePools (see IsIncompatibleWithAllNodePools). Solve records a pod's most recent attempt, and
+// such a rejection does not depend on the other pods in the batch or on how far the pass got, so the verdict stands
+// even for a pass cut short by its deadline.
+func (r Results) PodsIncompatibleWithAllNodePools() []*corev1.Pod {
+	return lo.Keys(lo.PickBy(r.PodErrors, func(_ *corev1.Pod, err error) bool {
+		return IsIncompatibleWithAllNodePools(err)
+	}))
+}
+
 func (r Results) NodePoolToPodMapping() map[string][]*corev1.Pod {
 	result := make(map[string][]*corev1.Pod)
 
@@ -756,12 +766,12 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 			// Node limits can be enforced early, since we know exactly how much capacity in nodes will be consumed by any instance type (1 node).
 			nodesRemaining, ok := remaining[resources.Node]
 			if ok && nodesRemaining.IsZero() {
-				errs[i] = serrors.Wrap(fmt.Errorf("node limits have been exhausted for nodepool"), "NodePool", klog.KRef("", s.nodeClaimTemplates[i].NodePoolName))
+				errs[i] = s.limitRejection(s.nodeClaimTemplates[i], pod, "node limits have been exhausted for nodepool")
 				return true
 			}
 			its = filterByRemainingResources(its, remaining)
 			if len(its) == 0 {
-				errs[i] = serrors.Wrap(fmt.Errorf("all available instance types exceed limits for nodepool"), "NodePool", klog.KRef("", s.nodeClaimTemplates[i].NodePoolName))
+				errs[i] = s.limitRejection(s.nodeClaimTemplates[i], pod, "all available instance types exceed limits for nodepool")
 				return true
 			} else if len(s.nodeClaimTemplates[i].InstanceTypeOptions) != len(its) {
 				log.FromContext(ctx).V(1).WithValues(
@@ -772,6 +782,9 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 			}
 		}
 		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
+		if len(its) != len(s.nodeClaimTemplates[i].InstanceTypeOptions) {
+			nodeClaim.instanceTypesBeforeLimits = s.nodeClaimTemplates[i].InstanceTypeOptions
+		}
 		r, its, ofs, result, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if err != nil {
 			errs[i] = err
@@ -1040,6 +1053,16 @@ func volumeZoneReq(volumeReqs []scheduling.Requirements) *scheduling.Requirement
 		}
 	}
 	return merged
+}
+
+// limitRejection builds the error for a NodePool whose limits leave no room to launch for pod. A pod the NodePool would
+// reject even with unlimited capacity gets that rejection, a NodePoolIncompatibleError, so that a NodePool sitting at
+// its limits never hides an incompatibility the pod has with it; otherwise the rejection is a NodePoolLimitError.
+func (s *Scheduler) limitRejection(template *NodeClaimTemplate, pod *corev1.Pod, reason string) error {
+	if err := incompatibleIgnoringLimits(template, s.topology, s.daemonOverheadGroups[template], template.InstanceTypeOptions, pod, s.cachedPodData[pod.UID], s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort); err != nil {
+		return NewNodePoolIncompatibleError(err)
+	}
+	return NewNodePoolLimitError(serrors.Wrap(errors.New(reason), "NodePool", klog.KRef("", template.NodePoolName)))
 }
 
 // parallelizeUntil is an implementation of workqueue.ParallelizeUntil that modifies the
