@@ -33,20 +33,31 @@ import (
 )
 
 // A disruption simulation schedules the whole pending backlog alongside the candidate's pods, because
-// the backlog competes for the same capacity. A pending pod the provisioner cannot place anywhere -
-// pinned to a capacity type whose every offering is exhausted, to a NodePool at its limit, to
-// requirements no NodePool satisfies - competes for nothing: it lands on no existing node and opens
-// no NodeClaim, in the provisioner's simulation and in every disruption simulation alike, which
-// only see the cluster minus the candidate. Simulating it is pure cost, paid once per candidate,
-// and a backlog of thousands of such pods turns each candidate's budget into a timeout.
+// the backlog competes for the same capacity. A pending pod that every NodePool rejects on the pod and
+// the NodePool alone - it tolerates none of the NodePool's taints, its requirements contradict the
+// NodePool's, or no instance type with an available offering meets them (a capacity type whose every
+// offering is exhausted, say) - opens no NodeClaim in the provisioner's simulation or in any
+// disruption simulation, since those differ only in which nodes exist and what runs on them, and
+// never shares or sizes a replacement. Simulating it is pure cost, paid once per candidate, and a
+// backlog of thousands of such pods turns each candidate's budget into a timeout.
+//
+// What such a pod can still do is bind to an existing node another pod vacates, which kube-scheduler
+// decides after the fact whether or not the simulation modeled it. Leaving the pod out lets a
+// simulation hand that room to a candidate's pods instead; if the pending pod takes it first, the
+// candidate's pods return to the backlog and provisioning launches for them - the outcome any pod that
+// turns pending between simulation and execution already produces.
 //
 // The provisioner already computes the verdict: every provisioning pass places each pending pod or
-// records an error for it, and the cluster state keeps the time of the latest such error. A
-// disruption simulation excludes the pods whose latest verdict is an error younger than
+// records an error for it, and only an error of that pass-invariant kind (see
+// scheduling.IsIncompatibleWithAllNodePools) becomes an unprovisionable verdict in the cluster state.
+// Errors that hinge on the pass - a NodePool at its limit, which a candidate's removal can lift; a
+// reserved offering the strict provisioning mode deferred but the fallback mode of a disruption
+// simulation may grant; topology, DRA or minValues outcomes - record no verdict, so those pods stay
+// in every simulation. A disruption simulation excludes the pods whose verdict is younger than
 // DISRUPTION_UNPROVISIONABLE_POD_TTL. Nothing here re-derives schedulability, so the exclusion
-// follows the provisioner exactly, including reserved capacity, NodePool limits and instance type
-// availability, and is refreshed as often as the provisioner runs. The TTL bounds what happens when
-// it does not: a verdict older than the TTL is ignored and the pod is simulated again.
+// follows the provisioner exactly and is refreshed as often as it runs. The TTL bounds what happens
+// when it does not, and when instance type availability moves under a verdict: a verdict older than
+// the TTL is ignored and the pod is simulated again.
 //
 // Normal provisioning is untouched: it reads the backlog directly, never through this filter, so an
 // excluded pod is retried by every provisioning pass and re-enters simulations the moment one places it.
@@ -62,9 +73,9 @@ const (
 )
 
 // partitionUnprovisionablePods splits the pending backlog into the pods a disruption simulation
-// should schedule and the pods whose latest provisioning verdict, younger than ttl, found nowhere for
-// them. A ttl of zero or less excludes nothing. Both returned slices are freshly allocated; pods is
-// not modified.
+// should schedule and the pods whose latest provisioning verdict, younger than ttl, found every
+// NodePool incompatible with them. A ttl of zero or less excludes nothing. Both returned slices are
+// freshly allocated; pods is not modified.
 func partitionUnprovisionablePods(cluster *state.Cluster, clk clock.Clock, ttl time.Duration, pods []*corev1.Pod) (simulated, excluded []*corev1.Pod) {
 	if ttl <= 0 {
 		return append([]*corev1.Pod(nil), pods...), nil

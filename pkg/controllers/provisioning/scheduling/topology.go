@@ -621,6 +621,24 @@ func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, nam
 	return selected, nil
 }
 
+// Constrains reports whether any topology could tighten pod p's placement: p owns a topology spread, affinity or
+// anti-affinity, or another pod's anti-affinity selects it. It is a superset of getMatchingTopologies for every node,
+// since it ignores the node filter, so a false answer means no pass over any cluster state adds topology requirements
+// for p.
+func (t *Topology) Constrains(p *corev1.Pod) bool {
+	for _, tg := range t.topologyGroups {
+		if tg.IsOwnedBy(p.UID) {
+			return true
+		}
+	}
+	for _, tg := range t.inverseTopologyGroups {
+		if tg.selects(p) {
+			return true
+		}
+	}
+	return false
+}
+
 // getMatchingTopologies returns a sorted list of topologies that either control the scheduling of pod p, or for which
 // the topology selects pod p and the scheduling of p affects the count per topology domain
 func (t *Topology) getMatchingTopologies(p *corev1.Pod, taints []corev1.Taint, requirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) []*TopologyGroup {

@@ -54,29 +54,32 @@ func TestPartitionUnprovisionablePodsExcludesFreshVerdictsOnly(t *testing.T) {
 	ttl := 2 * time.Minute
 
 	stale := namespacedTestPod("stale")
-	cluster.MarkPodSchedulingDecisions(context.Background(), map[*corev1.Pod]error{stale: errors.New("no capacity")}, nil, nil)
+	cluster.MarkPodsUnprovisionable([]*corev1.Pod{stale})
 	clk.Step(ttl)
 
 	fresh := namespacedTestPod("fresh")
-	cluster.MarkPodSchedulingDecisions(context.Background(), map[*corev1.Pod]error{fresh: errors.New("no capacity")}, nil, nil)
+	cluster.MarkPodsUnprovisionable([]*corev1.Pod{fresh})
 	clk.Step(ttl / 2)
 
 	never := namespacedTestPod("never-decided")
 	placed := namespacedTestPod("placed")
-	cluster.MarkPodSchedulingDecisions(context.Background(), map[*corev1.Pod]error{placed: errors.New("no capacity")}, nil, nil)
+	cluster.MarkPodsUnprovisionable([]*corev1.Pod{placed})
 	cluster.MarkPodSchedulingDecisions(context.Background(), nil, nil, map[string][]*corev1.Pod{"existing-node": {placed}})
+	// An error the provisioner does not classify as pass-invariant is no verdict at all.
+	errored := namespacedTestPod("errored")
+	cluster.MarkPodSchedulingDecisions(context.Background(), map[*corev1.Pod]error{errored: errors.New("node limits have been exhausted for nodepool")}, nil, nil)
 
-	backlog := []*corev1.Pod{never, fresh, stale, placed}
+	backlog := []*corev1.Pod{never, fresh, stale, placed, errored}
 	simulated, excluded := partitionUnprovisionablePods(cluster, clk, ttl, backlog)
 
 	// A verdict exactly ttl old has expired; only the one younger than ttl excludes its pod.
-	if got := podNames(simulated); !slices.Equal(got, []string{"never-decided", "stale", "placed"}) {
+	if got := podNames(simulated); !slices.Equal(got, []string{"never-decided", "stale", "placed", "errored"}) {
 		t.Fatalf("unexpected simulated pods %v", got)
 	}
 	if got := podNames(excluded); !slices.Equal(got, []string{"fresh"}) {
 		t.Fatalf("unexpected excluded pods %v", got)
 	}
-	if got := podNames(backlog); !slices.Equal(got, []string{"never-decided", "fresh", "stale", "placed"}) {
+	if got := podNames(backlog); !slices.Equal(got, []string{"never-decided", "fresh", "stale", "placed", "errored"}) {
 		t.Fatalf("input backlog was modified: %v", got)
 	}
 }
@@ -86,7 +89,7 @@ func TestPartitionUnprovisionablePodsDisabledByZeroTTL(t *testing.T) {
 	cluster := newVerdictCluster(clk)
 
 	pod := namespacedTestPod("fresh")
-	cluster.MarkPodSchedulingDecisions(context.Background(), map[*corev1.Pod]error{pod: errors.New("no capacity")}, nil, nil)
+	cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 
 	backlog := []*corev1.Pod{pod}
 	simulated, excluded := partitionUnprovisionablePods(cluster, clk, 0, backlog)

@@ -467,6 +467,15 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		// Only passing existing nodes here and not new nodeClaims because
 		// these nodeClaims don't have a name until they are created
 		filterVirtualPodMapping(results.ExistingNodeToPodMapping()))
+	// Of the errored pods, only those every NodePool rejected for a reason that holds regardless of cluster state get
+	// an unprovisionable verdict for disruption simulations to rely on. Limits, reserved offerings, topology, volumes
+	// and DRA are all pass-dependent and record nothing; a NodePool at its limits still reports an incompatibility it
+	// would have with the pod anyway. Because such a verdict does not depend on what else the pass
+	// scheduled, one from a deadline-cut pass is as sound as one from a complete pass, even for a pod the deadline
+	// kept from being retried.
+	p.cluster.MarkPodsUnprovisionable(lo.Reject(results.PodsIncompatibleWithAllNodePools(), func(pod *corev1.Pod, _ int) bool {
+		return IsVirtualPod(pod)
+	}))
 	results.Record(ctx, p.recorder, p.cluster)
 	return results, nil
 }

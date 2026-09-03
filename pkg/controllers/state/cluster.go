@@ -72,7 +72,7 @@ type Cluster struct {
 	podsSchedulableTimes            sync.Map // pod namespaced name -> time when it was first marked as able to fit to a node
 	podHealthyNodePoolScheduledTime sync.Map // pod namespaced name -> time when pod scheduled to a nodePool that has NodeRegistrationHealthy=true, is marked as able to fit to a node
 	podToNodeClaim                  sync.Map // pod namespaced name -> nodeClaim name
-	podsUnprovisionableTimes        sync.Map // pod namespaced name -> time of the latest provisioning simulation that could place it nowhere
+	podsUnprovisionableTimes        sync.Map // pod namespaced name -> time of the latest provisioning simulation that found every NodePool incompatible with it
 
 	clusterStateMu sync.RWMutex // Separate mutex as this is called in some places that mu is held
 	// A monotonically increasing timestamp representing the time state of the
@@ -508,7 +508,10 @@ func (c *Cluster) MarkPodSchedulingDecisions(ctx context.Context, podErrors map[
 		}
 		c.podHealthyNodePoolScheduledTime.Delete(nn)
 		c.podToNodeClaim.Delete(nn)
-		c.podsUnprovisionableTimes.Store(nn, now)
+		// A scheduling error on its own is not an unprovisionable verdict: it may hinge on this pass's cluster state
+		// (NodePool limits, topology, reservation contention). The caller re-marks the pods whose error is
+		// pass-invariant through MarkPodsUnprovisionable; everything else loses any stale verdict here.
+		c.podsUnprovisionableTimes.Delete(nn)
 	}
 	for nodePoolName, pods := range npPods {
 		nodePool := &v1.NodePool{}
@@ -559,9 +562,22 @@ func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 	}
 }
 
-// PodUnprovisionableTime returns when the provisioner's most recent scheduling simulation last found
-// nowhere for the pod: no existing node, no in-flight NodeClaim, and no NodePool that could launch
-// for it. It is zero when the latest simulation placed the pod or never considered it. Unlike
+// MarkPodsUnprovisionable records that the provisioner's most recent scheduling simulation rejected
+// each pod for a reason that does not depend on cluster state: every NodePool is incompatible with
+// the pod's taints, requirements or instance-type needs (scheduling.IsIncompatibleWithAllNodePools).
+// Call it after MarkPodSchedulingDecisions for the same pass, which clears the previous verdict of
+// every pod that errored.
+func (c *Cluster) MarkPodsUnprovisionable(pods []*corev1.Pod) {
+	now := c.clock.Now()
+	for _, pod := range pods {
+		c.podsUnprovisionableTimes.Store(client.ObjectKeyFromObject(pod), now)
+	}
+}
+
+// PodUnprovisionableTime returns when the provisioner's most recent scheduling simulation last
+// rejected the pod for a cluster-state-independent reason (see MarkPodsUnprovisionable), which no
+// scheduling pass over the same NodePools can undo. It is zero when the latest simulation placed the
+// pod, rejected it for a reason that may not hold in another pass, or never considered it. Unlike
 // PodSchedulingDecisionTime, which remembers the first decision, this follows the latest one, so a
 // caller can tell a fresh verdict from a stale one.
 func (c *Cluster) PodUnprovisionableTime(podKey types.NamespacedName) time.Time {

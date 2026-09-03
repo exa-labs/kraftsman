@@ -172,27 +172,45 @@ var _ = Describe("Pod Unprovisionable Time", func() {
 		pod := test.Pod()
 		Expect(cluster.PodUnprovisionableTime(client.ObjectKeyFromObject(pod)).IsZero()).To(BeTrue())
 	})
-	It("should record the time of a pod scheduling error", func() {
+	It("should record the time a pod was found incompatible with every NodePool", func() {
 		pod := test.Pod()
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("no instance type satisfied requirements")}, nil, nil)
+		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("incompatible requirements")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 		Expect(cluster.PodUnprovisionableTime(client.ObjectKeyFromObject(pod))).To(Equal(env.Clock.Now()))
 	})
-	It("should follow the latest scheduling error rather than the first", func() {
+	It("should not record a verdict for a scheduling error alone", func() {
+		pod := test.Pod()
+		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("node limits have been exhausted for nodepool")}, nil, nil)
+		Expect(cluster.PodUnprovisionableTime(client.ObjectKeyFromObject(pod)).IsZero()).To(BeTrue())
+	})
+	It("should follow the latest verdict rather than the first", func() {
 		pod := test.Pod()
 		nn := client.ObjectKeyFromObject(pod)
 		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("first")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 		first := cluster.PodUnprovisionableTime(nn)
 
 		env.Clock.Step(time.Minute)
 		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("second")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 		Expect(cluster.PodUnprovisionableTime(nn)).To(Equal(first.Add(time.Minute)))
 		// The first-decision timestamp is unaffected.
 		Expect(cluster.PodSchedulingDecisionTime(nn)).To(Equal(first))
 	})
+	It("should clear the verdict once a later pass fails the pod for a reason that may not recur", func() {
+		pod := test.Pod()
+		nn := client.ObjectKeyFromObject(pod)
+		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("incompatible requirements")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
+		Expect(cluster.PodUnprovisionableTime(nn).IsZero()).To(BeFalse())
+
+		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("node limits have been exhausted for nodepool")}, nil, nil)
+		Expect(cluster.PodUnprovisionableTime(nn).IsZero()).To(BeTrue())
+	})
 	It("should clear the verdict once a simulation places the pod on a NodePool", func() {
 		pod := test.Pod()
 		nn := client.ObjectKeyFromObject(pod)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("no capacity")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 		Expect(cluster.PodUnprovisionableTime(nn).IsZero()).To(BeFalse())
 
 		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
@@ -201,7 +219,7 @@ var _ = Describe("Pod Unprovisionable Time", func() {
 	It("should clear the verdict once a simulation places the pod on an existing node", func() {
 		pod := test.Pod()
 		nn := client.ObjectKeyFromObject(pod)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("no capacity")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 		Expect(cluster.PodUnprovisionableTime(nn).IsZero()).To(BeFalse())
 
 		cluster.MarkPodSchedulingDecisions(ctx, nil, nil, map[string][]*corev1.Pod{"existing-node": {pod}})
@@ -210,7 +228,7 @@ var _ = Describe("Pod Unprovisionable Time", func() {
 	It("should clear the verdict when the pod is deleted", func() {
 		pod := test.Pod()
 		nn := client.ObjectKeyFromObject(pod)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("no capacity")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 		Expect(cluster.PodUnprovisionableTime(nn).IsZero()).To(BeFalse())
 
 		cluster.DeletePod(nn)
@@ -219,7 +237,7 @@ var _ = Describe("Pod Unprovisionable Time", func() {
 	It("should clear the verdict when cluster state is reset", func() {
 		pod := test.Pod()
 		nn := client.ObjectKeyFromObject(pod)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("no capacity")}, nil, nil)
+		cluster.MarkPodsUnprovisionable([]*corev1.Pod{pod})
 		Expect(cluster.PodUnprovisionableTime(nn).IsZero()).To(BeFalse())
 
 		cluster.Reset()
