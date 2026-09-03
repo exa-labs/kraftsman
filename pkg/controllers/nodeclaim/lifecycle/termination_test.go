@@ -485,19 +485,42 @@ var _ = Describe("Termination", func() {
 			v1.NodeClaimTerminationTimestampAnnotationKey: "2024-04-01T12:00:00-05:00",
 		}))
 	})
-	It("should not delete Nodes if the NodeClaim is not registered", func() {
-		node := test.NodeClaimLinkedNode(nodeClaim)
-		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+	It("should delete an unregistered Node only once the instance is gone", func() {
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
 		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 		_, err := cloudProvider.Get(ctx, nodeClaim.Status.ProviderID)
 		Expect(err).ToNot(HaveOccurred())
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue()).To(BeFalse())
+
+		// The kubelet joins after the NodeClaim was already marked for deletion (the registration timeout won the
+		// race), so the Node never registers and never receives the termination finalizer.
+		Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
+		node := test.NodeClaimLinkedNode(nodeClaim)
+		node.Finalizers = nil
+		ExpectApplied(ctx, env.Client, node)
+
+		// The instance is terminated first; the Node outlives it so a live kubelet cannot re-create it.
+		result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(result.RequeueAfter).To(BeEquivalentTo(5 * time.Second))
+		ExpectExists(ctx, env.Client, node)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue()).To(BeTrue())
+
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim) // the instance is gone, and the Node goes with it
+		ExpectNotFound(ctx, env.Client, node, nodeClaim)
+	})
+	It("should not delete Nodes of other instances when the NodeClaim is not registered", func() {
+		unrelated := test.Node(test.NodeOptions{ProviderID: test.RandomProviderID()})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, unrelated)
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue()).To(BeFalse())
 
 		Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
-		ExpectExists(ctx, env.Client, node)
+		ExpectExists(ctx, env.Client, unrelated)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
 	})
 })

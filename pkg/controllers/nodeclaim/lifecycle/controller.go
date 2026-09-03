@@ -207,10 +207,9 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 		return reconcile.Result{}, fmt.Errorf("adding nodeclaim terminationGracePeriod annotation, %w", err)
 	}
 
-	// Only delete Nodes if the NodeClaim has been registered. Deleting Nodes without the termination finalizer
-	// may result in leaked leases due to a kubelet bug until k8s 1.29. The Node should be garbage collected after the
-	// instance is terminated by CCM.
-	// Upstream Kubelet Fix: https://github.com/kubernetes/kubernetes/pull/119661
+	// Only drain Nodes through the termination finalizer if the NodeClaim has been registered: registration is what
+	// stamps the finalizer on the Node. A Node that joined without registering is deleted below, once its instance is
+	// gone, so a still-running kubelet cannot re-create it in between.
 	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue() {
 		nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nodeClaim)
 		if err != nil {
@@ -256,6 +255,9 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 		if !cloudprovider.IsNodeClaimNotFoundError(deleteErr) {
 			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+		if err := c.deleteUnregisteredNodes(ctx, nodeClaim); err != nil {
+			return reconcile.Result{}, err
+		}
 		InstanceTerminationDurationSeconds.Observe(time.Since(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).LastTransitionTime.Time).Seconds(), map[string]string{
 			metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
 			causeLabel:            terminationCause(nodeClaim),
@@ -288,6 +290,29 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 	}
 	return reconcile.Result{}, nil
 
+}
+
+// deleteUnregisteredNodes removes the Nodes still mapped to a NodeClaim whose instance is already gone. A kubelet that
+// joins after the NodeClaim was marked for deletion (typically the registration timeout winning the race against a slow
+// boot) creates a Node that never registers: it carries no owner reference and no termination finalizer, so the
+// registered-node drain above skips it, and without a cloud-controller-manager (self-managed GCE) nothing reaps the
+// Node of a missing instance. It would sit NotReady forever, holding the ClusterNodeNotReady alert. Only called once the
+// cloud provider reports the instance gone, so the kubelet cannot re-create the Node after it is deleted here.
+func (c *Controller) deleteUnregisteredNodes(ctx context.Context, nodeClaim *v1.NodeClaim) error {
+	nodes, err := nodeclaimutils.AllNodesForNodeClaim(ctx, c.kubeClient, nodeClaim)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if !node.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := c.kubeClient.Delete(ctx, node); client.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("deleting unregistered node, %w", err)
+		}
+		log.FromContext(ctx).WithValues("Node", klog.KRef("", node.Name)).Info("deleted unregistered node of terminated instance")
+	}
+	return nil
 }
 
 // observeLifetime records a finalized NodeClaim's lifetime under the origin that launched it and the
