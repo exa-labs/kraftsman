@@ -23,6 +23,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clock "k8s.io/utils/clock/testing"
@@ -310,6 +311,45 @@ var _ = Describe("IsProvisionable", func() {
 			},
 		}
 		Expect(pod.IsProvisionable(p)).To(BeFalse())
+	})
+})
+
+var _ = Describe("IsNominatedBehindEviction", func() {
+	terminatingOn := func(nodes ...string) func(string) bool {
+		return func(nodeName string) bool { return lo.Contains(nodes, nodeName) }
+	}
+	volcanoNominated := func(nodeName string) *corev1.Pod {
+		return &corev1.Pod{
+			Spec:   corev1.PodSpec{SchedulerName: pod.VolcanoSchedulerName},
+			Status: corev1.PodStatus{NominatedNodeName: nodeName},
+		}
+	}
+
+	It("should return true for a volcano pod nominated to a node with terminating pods", func() {
+		Expect(pod.IsNominatedBehindEviction(volcanoNominated("node-a"), terminatingOn("node-a"))).To(BeTrue())
+	})
+
+	It("should return false once nothing on the nominated node is terminating", func() {
+		Expect(pod.IsNominatedBehindEviction(volcanoNominated("node-a"), terminatingOn())).To(BeFalse())
+	})
+
+	It("should only consider the nominated node", func() {
+		Expect(pod.IsNominatedBehindEviction(volcanoNominated("node-a"), terminatingOn("node-b"))).To(BeFalse())
+	})
+
+	It("should return false for a volcano pod without a nomination", func() {
+		called := false
+		p := &corev1.Pod{Spec: corev1.PodSpec{SchedulerName: pod.VolcanoSchedulerName}}
+		Expect(pod.IsNominatedBehindEviction(p, func(string) bool { called = true; return true })).To(BeFalse())
+		Expect(called).To(BeFalse())
+	})
+
+	It("should return false for a kube-scheduler pod, which IsPreempting already covers", func() {
+		p := &corev1.Pod{
+			Spec:   corev1.PodSpec{SchedulerName: "default-scheduler"},
+			Status: corev1.PodStatus{NominatedNodeName: "node-a"},
+		}
+		Expect(pod.IsNominatedBehindEviction(p, terminatingOn("node-a"))).To(BeFalse())
 	})
 })
 
