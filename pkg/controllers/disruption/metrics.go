@@ -59,6 +59,7 @@ const (
 	policyLabel                  = "policy"
 	outcomeLabel                 = "outcome"
 	reasonLabel                  = "reason"
+	dispositionLabel             = "disposition"
 	replacementCountLabel        = "replacement_count"
 	capacityTypeTransitionLabel  = "capacity_type_transition"
 	instanceTypeLabel            = "instance_type"
@@ -421,6 +422,20 @@ var (
 			Buckets:   durationBuckets,
 		},
 		[]string{ConsolidationTypeLabel},
+	)
+	// SimulationPendingPods splits the pending backlog a disruption simulation received into the pods
+	// it scheduled and the pods it left out because the provisioner's latest pass found every NodePool
+	// incompatible with them (see unprovisionablepods.go). The excluded count is the population that
+	// was inflating every candidate's simulation without being able to affect its verdict.
+	SimulationPendingPods = opmetrics.NewPrometheusGauge(
+		crmetrics.Registry,
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulation_pending_pods",
+			Help:      "Number of pending pods the latest disruption scheduling simulation received from the provisioning backlog, by disposition: simulated pods entered the solve; excluded_unprovisionable pods were left out because the provisioner's most recent simulation found every NodePool incompatible with them, independent of cluster state, and that verdict is younger than DISRUPTION_UNPROVISIONABLE_POD_TTL.",
+		},
+		[]string{dispositionLabel},
 	)
 	ConsolidationPassOutcomesTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,

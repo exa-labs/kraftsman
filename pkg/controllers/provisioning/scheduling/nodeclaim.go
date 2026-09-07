@@ -26,6 +26,7 @@ import (
 	"unique"
 
 	"github.com/samber/lo"
+	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -59,6 +60,10 @@ type NodeClaim struct {
 	//   this expansion.
 	reservedOfferings    cloudprovider.Offerings
 	reservedOfferingMode ReservedOfferingMode
+	// instanceTypesBeforeLimits holds the template's full instance type set when NodePool limits trimmed it before this
+	// NodeClaim was built, and is nil otherwise. An instance type filter failure over a trimmed set may not recur once
+	// limits free up, so it only counts as an incompatibility if the full set rejects the pod too.
+	instanceTypesBeforeLimits []*cloudprovider.InstanceType
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -77,6 +82,59 @@ func IsReservedOfferingError(err error) bool {
 }
 
 func (e ReservedOfferingError) Unwrap() error {
+	return e.error
+}
+
+// NodePoolIncompatibleError marks a rejection that follows from the pod and the NodePool alone — the NodePool's taints,
+// requirements or instance types — and not from anything that differs between scheduling passes over the same
+// NodePools: which nodes exist and what runs on them, topology counts, NodePool limits, DRA device state or the
+// reserved-offering mode. A pod every NodePool rejects this way cannot open a NodeClaim in any such pass, which is what
+// lets disruption simulations leave it out (see Results.PodsIncompatibleWithAllNodePools). Error() is lazy so wrapping an
+// InstanceTypeFilterError stays cheap.
+type NodePoolIncompatibleError struct {
+	error
+}
+
+func NewNodePoolIncompatibleError(err error) NodePoolIncompatibleError {
+	return NodePoolIncompatibleError{error: err}
+}
+
+func IsNodePoolIncompatibleError(err error) bool {
+	nie := &NodePoolIncompatibleError{}
+	return errors.As(err, nie)
+}
+
+func (e NodePoolIncompatibleError) Unwrap() error {
+	return e.error
+}
+
+// IsIncompatibleWithAllNodePools reports whether err, the error Solve attached to a pod, consists solely of
+// NodePoolIncompatibleErrors: every NodePool rejected the pod for a reason that holds in any scheduling pass over the
+// same NodePools. Errors from other stages (no NodePools, DRA, minValues truncation) or any single pass-dependent
+// NodePool rejection (limits, topology, reserved offerings) make it false.
+func IsIncompatibleWithAllNodePools(err error) bool {
+	errs := multierr.Errors(err)
+	return len(errs) > 0 && lo.EveryBy(errs, IsNodePoolIncompatibleError)
+}
+
+// NodePoolLimitError marks a NodePool that rejected a pod only because launching for it would breach the NodePool's
+// limits given the nodes that exist in this pass. Removing a node, as every disruption simulation does, can lift it, so
+// it is never a NodePoolIncompatibleError. A NodePool that would reject the pod even with unlimited capacity reports
+// that incompatibility instead (see incompatibleIgnoringLimits).
+type NodePoolLimitError struct {
+	error
+}
+
+func NewNodePoolLimitError(err error) NodePoolLimitError {
+	return NodePoolLimitError{error: err}
+}
+
+func IsNodePoolLimitError(err error) bool {
+	nle := &NodePoolLimitError{}
+	return errors.As(err, nle)
+}
+
+func (e NodePoolLimitError) Unwrap() error {
 	return e.error
 }
 
@@ -124,14 +182,14 @@ func NewNodeClaim(
 func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData, relaxMinValues bool, allocator *dynamicresources.Allocator) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, allocationResult *dynamicresources.AllocationResult, err error) {
 	// Check Taints
 	if err := scheduling.Taints(n.Spec.Taints).ToleratesPod(pod); err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, NewNodePoolIncompatibleError(err)
 	}
 
 	baseRequirements := scheduling.NewRequirements(n.Requirements.Values()...)
 
 	// Check NodeClaim Affinity Requirements
 	if err := baseRequirements.Compatible(podData.Requirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("incompatible requirements, %w", err)
+		return nil, nil, nil, nil, NewNodePoolIncompatibleError(fmt.Errorf("incompatible requirements, %w", err))
 	}
 	baseRequirements.Add(podData.Requirements.Values()...)
 
@@ -146,13 +204,21 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	// Try each volume topology alternative. We need to iterate here because the selected
 	// volume topology constraints affect downstream topology checks (e.g., pod anti-affinity).
 	var lastErr error
+	allIncompatible := true
 	for _, volReqs := range volumeAlternatives {
 		reqs, its, ofs, result, err := n.tryVolumeAlternative(ctx, pod, podData, baseRequirements, volReqs, relaxMinValues, allocator)
 		if err != nil {
 			lastErr = err
+			allIncompatible = allIncompatible && IsNodePoolIncompatibleError(err)
 			continue
 		}
 		return reqs, its, ofs, result, nil
+	}
+	// The pod is incompatible with this NodePool only if every volume alternative is; if one failed for a reason that
+	// may not recur, the reported error must not claim otherwise.
+	nie := &NodePoolIncompatibleError{}
+	if !allIncompatible && errors.As(lastErr, nie) {
+		lastErr = nie.error
 	}
 	return nil, nil, nil, nil, lastErr
 }
@@ -218,8 +284,11 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 		}
 	}
 	if err != nil {
-		// We avoid wrapping this err because calling String() on InstanceTypeFilterError is an expensive operation
-		// due to calls to resources.Merge and stringifying the nodeClaimRequirements
+		// We avoid wrapping this err with fmt.Errorf because calling String() on InstanceTypeFilterError is an expensive
+		// operation due to calls to resources.Merge and stringifying the nodeClaimRequirements.
+		if n.instanceTypeFilterFailureIsInvariant(pod, podData, relaxMinValues) {
+			return nil, nil, nil, nil, NewNodePoolIncompatibleError(err)
+		}
 		return nil, nil, nil, nil, err
 	}
 	// Apply the DRA-specific instance type filter: only instance types whose device allocation succeeded survive.
@@ -239,6 +308,49 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 		return nil, nil, nil, nil, err
 	}
 	return nodeClaimRequirements, remaining, ofs, allocationResult, nil
+}
+
+// instanceTypeFilterFailureIsInvariant reports whether a failed instance type filter for pod rules the pod out of this
+// NodePool in every scheduling pass over the same NodePools. That holds when the filter saw the pod's own requirements
+// only — neither volumes, DRA nor topology could have tightened them — and, if NodePool limits trimmed the instance
+// types it saw, when the untrimmed set rejects the pod as well.
+func (n *NodeClaim) instanceTypeFilterFailureIsInvariant(pod *corev1.Pod, podData *PodData, relaxMinValues bool) bool {
+	if len(podData.VolumeRequirements) > 0 || podData.HasResourceClaimRequests || n.topology.Constrains(pod) {
+		return false
+	}
+	if n.instanceTypesBeforeLimits == nil {
+		return true
+	}
+	return incompatibleIgnoringLimits(&n.NodeClaimTemplate, n.topology, n.daemonOverheadGroups, n.instanceTypesBeforeLimits, pod, podData, relaxMinValues) != nil
+}
+
+// incompatibleIgnoringLimits returns why pod could not join a NodeClaim built from template even if NodePool limits left
+// every one of instanceTypes available: the template's taints, its requirements, or the instance types themselves
+// (with the pod's own requirements and requests) reject the pod. It returns nil when the pod is compatible, and also
+// when volumes, DRA or topology could tighten the pod's requirements, since those depend on the scheduling pass and
+// the instance type check would not be conclusive. It has no side effects on the scheduler's state.
+func incompatibleIgnoringLimits(
+	template *NodeClaimTemplate,
+	topology *Topology,
+	daemonOverheadGroups []DaemonOverheadGroup,
+	instanceTypes []*cloudprovider.InstanceType,
+	pod *corev1.Pod,
+	podData *PodData,
+	relaxMinValues bool,
+) error {
+	if err := scheduling.Taints(template.Spec.Taints).ToleratesPod(pod); err != nil {
+		return err
+	}
+	requirements := scheduling.NewRequirements(template.Requirements.Values()...)
+	if err := requirements.Compatible(podData.Requirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
+		return fmt.Errorf("incompatible requirements, %w", err)
+	}
+	if len(podData.VolumeRequirements) > 0 || podData.HasResourceClaimRequests || topology.Constrains(pod) {
+		return nil
+	}
+	requirements.Add(podData.Requirements.Values()...)
+	_, _, err := filterInstanceTypesByRequirements(instanceTypes, requirements, pod, podData.Requests, daemonOverheadGroups, podData.Requests, relaxMinValues)
+	return err
 }
 
 // Add updates the NodeClaim to schedule the pod to this NodeClaim, updating

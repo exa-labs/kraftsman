@@ -79,6 +79,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
+	pods = excludeUnprovisionablePods(ctx, cluster, clk, pods)
 
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
