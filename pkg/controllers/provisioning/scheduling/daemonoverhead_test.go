@@ -17,6 +17,7 @@ limitations under the License.
 package scheduling
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -25,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -131,6 +133,34 @@ func TestComputeDaemonOverheadHonorsEveryRequiredAffinityAlternative(t *testing.
 		t.Fatal("unexpected truncation")
 	}
 	expectOverhead(t, got, "800m", 2)
+}
+
+func TestBuildDaemonOverheadGroupsKeepsAffinityAlternativesAcrossInstanceTypes(t *testing.T) {
+	zoned := func(name, zone string) *cloudprovider.InstanceType {
+		return &cloudprovider.InstanceType{
+			Name:         name,
+			Requirements: scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone)),
+		}
+	}
+	// The zone b instance type comes first: it is compatible only through the daemon's second term, and the
+	// relaxation that establishes this must not drop the first term the zone a instance type needs.
+	nct := &NodeClaimTemplate{
+		NodePoolName:        "pool",
+		Requirements:        scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "a", "b")),
+		InstanceTypeOptions: []*cloudprovider.InstanceType{zoned("in-b", "b"), zoned("in-a", "a")},
+	}
+	daemon := daemonPodWithTerms("either", "400m", []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "a")}, []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "b")})
+	groups := buildDaemonOverheadGroupsForTemplate(context.Background(), nct, []*corev1.Pod{daemon})
+	if len(groups) != 1 {
+		t.Fatalf("expected one overhead group covering both instance types, got %d", len(groups))
+	}
+	if len(groups[0].InstanceTypes) != 2 {
+		t.Fatalf("expected both instance types in the group, got %d", len(groups[0].InstanceTypes))
+	}
+	expectOverhead(t, groups[0].DaemonOverhead, "400m", 1)
+	if got := len(daemon.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms); got != 2 {
+		t.Fatalf("daemon pod affinity was mutated: %d terms remain", got)
+	}
 }
 
 func TestComputeDaemonOverheadIgnoresAlternativesTheCandidateCannotRealize(t *testing.T) {

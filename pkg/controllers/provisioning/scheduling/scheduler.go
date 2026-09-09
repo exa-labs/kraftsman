@@ -1283,8 +1283,11 @@ func podSetKey(pods []*corev1.Pod) string {
 	return strings.Join(keys, ",")
 }
 
-// isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling
+// isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling.
+// The relaxation below rewrites the pod's tolerations and required node affinity terms; the daemon pods are shared
+// across instance types and templates, and computeDaemonOverhead reads every required term, so it runs on a copy.
 func isDaemonPodCompatible(nodeClaimTemplate *NodeClaimTemplate, it *cloudprovider.InstanceType, pod *corev1.Pod) bool {
+	pod = pod.DeepCopy()
 	preferences := &Preferences{}
 	// Add a toleration for PreferNoSchedule since a daemon pod shouldn't respect the preference
 	_ = preferences.toleratePreferNoScheduleTaints(pod)
