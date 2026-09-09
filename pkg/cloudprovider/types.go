@@ -633,6 +633,22 @@ func (ofs Offerings) WorstLaunchPrice(reqs scheduling.Requirements) float64 {
 	return math.MaxFloat64
 }
 
+// CheapestLaunchPrice is the best-case counterpart of WorstLaunchPrice: the cheapest compatible offering of the
+// capacity type that will launch (reserved, then spot, then on-demand), or MaxFloat64 when no compatible offering
+// exists.
+func (ofs Offerings) CheapestLaunchPrice(reqs scheduling.Requirements) float64 {
+	for _, ctReqs := range []scheduling.Requirements{
+		ReservedRequirement,
+		SpotRequirement,
+		OnDemandRequirement,
+	} {
+		if compatOfs := ofs.Compatible(reqs).Compatible(ctReqs); len(compatOfs) != 0 {
+			return compatOfs.Cheapest().Price
+		}
+	}
+	return math.MaxFloat64
+}
+
 // NodeClaimNotFoundError is an error type returned by CloudProviders when the reason for failure is NotFound
 type NodeClaimNotFoundError struct {
 	error

@@ -47,6 +47,10 @@ const (
 
 	modeLabel = "mode"
 
+	packingOutcomeInflight         = "inflight"
+	packingOutcomeInflightUnpriced = "inflight_unpriced"
+	packingOutcomeNew              = "new"
+
 	fingerprintModeRevision = "revision"
 	fingerprintModeContent  = "content"
 	fingerprintModeMixed    = "mixed"
@@ -233,6 +237,19 @@ var (
 		},
 		[]string{
 			modeLabel,
+		},
+	)
+	PackingDecisionsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "packing_decisions_total",
+			Help:      "Number of pods placed by the marginal-cost packing policy by outcome (inflight: joined an in-flight NodeClaim, new: opened a new NodeClaim because that was cheaper, inflight_unpriced: joined an in-flight NodeClaim because a launch price was unavailable).",
+		},
+		[]string{
+			metrics.NodePoolLabel,
+			outcomeLabel,
 		},
 	)
 	PendingPodsByEffectiveZone = opmetrics.NewPrometheusGauge(

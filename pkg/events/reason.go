@@ -32,6 +32,7 @@ const (
 	FailedScheduling          = "FailedScheduling"
 	NoCompatibleInstanceTypes = "NoCompatibleInstanceTypes"
 	Nominated                 = "Nominated"
+	InvalidPackingPolicy      = "InvalidPackingPolicy"
 
 	// node/health
 	NodeRepairBlocked = "NodeRepairBlocked"

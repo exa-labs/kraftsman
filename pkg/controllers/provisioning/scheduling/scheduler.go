@@ -170,31 +170,7 @@ func NewScheduler(
 	priceLimit := option.Resolve(opts...).newNodeClaimPriceLimit
 	templatesStart := time.Now()
 	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
-		return nodeClaimTemplateWithCache(ctx, np, instanceTypes[np.Name], minValuesPolicy, priceLimit, func() *NodeClaimTemplate {
-			var err error
-			nct := NewNodeClaimTemplate(np)
-			// the ceiling is judged against the offerings this template can actually launch, so it runs against
-			// the template's requirements rather than the raw provider list
-			poolInstanceTypes := instanceTypesBelowPrice(instanceTypes[np.Name], nct.Requirements, priceLimit)
-			nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(poolInstanceTypes, nct.Requirements, &corev1.Pod{}, corev1.ResourceList{}, []DaemonOverheadGroup{{InstanceTypes: poolInstanceTypes, HostPortUsage: scheduling.NewHostPortUsage()}}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
-			if len(nct.InstanceTypeOptions) == 0 {
-				// A price ceiling empties every NodePool priced above the candidate being split. That is the
-				// filter working, not a NodePool whose requirements match nothing, so the template is dropped
-				// without telling operators their NodePool is misconfigured.
-				if len(poolInstanceTypes) < len(instanceTypes[np.Name]) {
-					return nil
-				}
-				if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
-					recorder.Publish(NoCompatibleInstanceTypes(np, true))
-					log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types", "minValuesIncompatibleErr", instanceTypeFilterErr.minValuesIncompatibleErr)
-				} else {
-					recorder.Publish(NoCompatibleInstanceTypes(np, false))
-					log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types")
-				}
-				return nil
-			}
-			return nct
-		})
+		return nodeClaimTemplateForNodePool(ctx, np, instanceTypes[np.Name], minValuesPolicy, priceLimit, recorder)
 	})
 	ConstructionPhaseDurationSeconds.Observe(time.Since(templatesStart).Seconds(), map[string]string{phaseLabel: phaseNodeClaimTemplates})
 	// The daemonset generation must be updated before any daemon-derived cache reads (overhead
@@ -232,6 +208,9 @@ func NewScheduler(
 		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
 		daemonOverheadCache:     daemonOverheadCache,
 		nodeRequirementsCache:   NodeRequirementsCacheFromContext(ctx),
+		pricePlacements: lo.SomeBy(templates, func(nct *NodeClaimTemplate) bool {
+			return nct.PackingPolicy == PackingPolicyMarginalCost
+		}),
 	}
 
 	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
@@ -254,6 +233,50 @@ func NewScheduler(
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, option.Resolve(opts...).enforceConsolidateAfter)
 	ConstructionPhaseDurationSeconds.Observe(time.Since(existingNodesStart).Seconds(), map[string]string{phaseLabel: phaseExistingNodes})
 	return s
+}
+
+// nodeClaimTemplateForNodePool builds (or fetches from the cache) the new-capacity template for np with its
+// instance types prefiltered by the NodePool's requirements and the price limit. ok is false when nothing can launch
+// from the NodePool; that is reported to operators unless the price limit alone caused it. The packing policy is
+// read from the NodePool on every call since it is not part of the cached template.
+func nodeClaimTemplateForNodePool(
+	ctx context.Context,
+	np *v1.NodePool,
+	poolInstanceTypes []*cloudprovider.InstanceType,
+	minValuesPolicy karpopts.MinValuesPolicy,
+	priceLimit float64,
+	recorder events.Recorder,
+) (*NodeClaimTemplate, bool) {
+	nct, ok := nodeClaimTemplateWithCache(ctx, np, poolInstanceTypes, minValuesPolicy, priceLimit, func() *NodeClaimTemplate {
+		var err error
+		nct := NewNodeClaimTemplate(np)
+		// the ceiling is judged against the offerings this template can actually launch, so it runs against
+		// the template's requirements rather than the raw provider list
+		pricedInstanceTypes := instanceTypesBelowPrice(poolInstanceTypes, nct.Requirements, priceLimit)
+		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(pricedInstanceTypes, nct.Requirements, &corev1.Pod{}, corev1.ResourceList{}, []DaemonOverheadGroup{{InstanceTypes: pricedInstanceTypes, HostPortUsage: scheduling.NewHostPortUsage()}}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
+		if len(nct.InstanceTypeOptions) == 0 {
+			// A price ceiling empties every NodePool priced above the candidate being split. That is the
+			// filter working, not a NodePool whose requirements match nothing, so the template is dropped
+			// without telling operators their NodePool is misconfigured.
+			if len(pricedInstanceTypes) < len(poolInstanceTypes) {
+				return nil
+			}
+			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
+				recorder.Publish(NoCompatibleInstanceTypes(np, true))
+				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types", "minValuesIncompatibleErr", instanceTypeFilterErr.minValuesIncompatibleErr)
+			} else {
+				recorder.Publish(NoCompatibleInstanceTypes(np, false))
+				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types")
+			}
+			return nil
+		}
+		return nct
+	})
+	if !ok {
+		return nil, false
+	}
+	nct.PackingPolicy = resolvePackingPolicy(ctx, recorder, np)
+	return nct, true
 }
 
 type PodData struct {
@@ -291,6 +314,10 @@ type Scheduler struct {
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
 	deletingNodeNames       sets.Set[string]
+	// pricePlacements is set when any NodePool opts into PackingPolicyMarginalCost; it switches pod placement from
+	// first-fit onto in-flight NodeClaims to the priced comparison in addByMarginalCost (see packing.go for how
+	// binpack NodePools keep their behavior under it).
+	pricePlacements bool
 
 	// allocator simulates DRA device allocation for pods with ResourceClaims. It is nil when DRA support is disabled.
 	allocator *dynamicresources.Allocator
@@ -653,18 +680,76 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	// Consider using https://pkg.go.dev/container/heap
 	sort.Slice(s.newNodeClaims, func(a, b int) bool { return len(s.newNodeClaims[a].Pods) < len(s.newNodeClaims[b].Pods) })
 
+	if s.pricePlacements {
+		return s.addByMarginalCost(ctx, pod)
+	}
 	// Pick existing node that we are about to create
 	if err := s.addToInflightNode(ctx, pod); err == nil {
 		return nil
 	}
 	if len(s.nodeClaimTemplates) == 0 {
-		return fmt.Errorf("nodepool requirements filtered out all available instance types")
+		return errNoNodeClaimTemplates
 	}
-	err := s.addToNewNodeClaim(ctx, pod)
-	if err == nil {
-		return nil
+	return s.addToNewNodeClaim(ctx, pod)
+}
+
+var errNoNodeClaimTemplates = fmt.Errorf("nodepool requirements filtered out all available instance types")
+
+// addByMarginalCost places pod on whichever fitting in-flight NodeClaim or new NodeClaim raises the total launch
+// price the least, breaking ties in favor of an in-flight NodeClaim. In-flight NodeClaims of binpack NodePools
+// price at zero and so always absorb the pod when they fit, exactly as under addToInflightNode. A new NodeClaim is
+// only priced when some in-flight NodeClaim would become more expensive; when no in-flight NodeClaim fits, the pod
+// opens a new NodeClaim as under addToNewNodeClaim, and when none can be opened the in-flight NodeClaim takes it
+// regardless of price.
+func (s *Scheduler) addByMarginalCost(ctx context.Context, pod *corev1.Pod) error {
+	inflight := s.cheapestInflightPlacement(ctx, pod)
+	if inflight == nil {
+		if len(s.nodeClaimTemplates) == 0 {
+			return errNoNodeClaimTemplates
+		}
+		return s.addToNewNodeClaim(ctx, pod)
 	}
-	return err
+	if inflight.delta > 0 {
+		if fresh, err := s.evaluateNewNodeClaim(ctx, pod); err == nil {
+			if price, ok := launchPrice(fresh.instanceTypes, fresh.requirements, fresh.offeringsToReserve); ok && cheaperThan(price, inflight.delta) {
+				s.commitNewNodeClaim(ctx, pod, fresh)
+				PackingDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingOutcomeNew})
+				return nil
+			}
+		}
+	}
+	inflight.commit(ctx, pod, s.cachedPodData[pod.UID], s.allocator)
+	PackingDecisionsTotal.Inc(map[string]string{
+		metrics.NodePoolLabel: inflight.nodeClaim.NodePoolName,
+		outcomeLabel:          lo.Ternary(inflight.unpriced, packingOutcomeInflightUnpriced, packingOutcomeInflight),
+	})
+	return nil
+}
+
+// cheapestInflightPlacement evaluates every in-flight NodeClaim for pod and returns the one whose launch price
+// increases the least, the earliest in s.newNodeClaims order among equals, or nil when none fits.
+func (s *Scheduler) cheapestInflightPlacement(ctx context.Context, pod *corev1.Pod) *inflightPlacement {
+	candidates := make([]*inflightPlacement, len(s.newNodeClaims))
+	parallelizeUntil(s.numConcurrentReconciles, len(s.newNodeClaims), func(i int) bool {
+		nc := s.newNodeClaims[i]
+		r, its, ofr, result, err := nc.CanAdd(ctx, pod, s.cachedPodData[pod.UID], false, s.allocator)
+		if err != nil {
+			return true
+		}
+		candidate := &inflightPlacement{placement: placement{nodeClaim: nc, requirements: r, instanceTypes: its, offeringsToReserve: ofr, allocationResult: result}}
+		if nc.PackingPolicy == PackingPolicyMarginalCost {
+			candidate.delta, candidate.unpriced = marginalLaunchPrice(nc, its, r, ofr)
+		}
+		candidates[i] = candidate
+		return true
+	})
+	var best *inflightPlacement
+	for _, candidate := range candidates {
+		if candidate != nil && (best == nil || cheaperThan(candidate.delta, best.delta)) {
+			best = candidate
+		}
+	}
+	return best
 }
 
 func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error {
@@ -747,8 +832,30 @@ func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) erro
 	return fmt.Errorf("failed scheduling pod to inflight nodes")
 }
 
-//nolint:gocyclo
 func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) error {
+	fresh, err := s.evaluateNewNodeClaim(ctx, pod)
+	if err != nil {
+		return err
+	}
+	s.commitNewNodeClaim(ctx, pod, fresh)
+	return nil
+}
+
+// commitNewNodeClaim schedules pod onto the new NodeClaim of a placement returned by evaluateNewNodeClaim, adds the
+// NodeClaim to the in-flight set and charges its maximum possible resource usage against the NodePool's limits.
+func (s *Scheduler) commitNewNodeClaim(ctx context.Context, pod *corev1.Pod, fresh *placement) {
+	fresh.commit(ctx, pod, s.cachedPodData[pod.UID], s.allocator)
+	s.newNodeClaims = append(s.newNodeClaims, fresh.nodeClaim)
+	s.remainingResources[fresh.nodeClaim.NodePoolName] = subtractMax(s.remainingResources[fresh.nodeClaim.NodePoolName], fresh.nodeClaim.InstanceTypeOptions)
+}
+
+// evaluateNewNodeClaim builds a candidate NodeClaim for pod from every NodeClaim template in weight order and
+// returns the placement onto the first that accepts it, without scheduling the pod. It returns the combined
+// template errors when none does, including when a higher-weight template with reserved offerings rejected the pod,
+// since falling back past reserved capacity is never allowed.
+//
+//nolint:gocyclo
+func (s *Scheduler) evaluateNewNodeClaim(ctx context.Context, pod *corev1.Pod) (*placement, error) {
 	idx := math.MaxInt
 	var mu sync.Mutex
 
@@ -839,13 +946,15 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 		return false
 	})
 	if newNodeClaim != nil {
-		// we will launch this nodeClaim and need to track its maximum possible resource usage against our remaining resources
-		newNodeClaim.Add(ctx, pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, offeringsToReserve, allocationResult, s.allocator)
-		s.newNodeClaims = append(s.newNodeClaims, newNodeClaim)
-		s.remainingResources[newNodeClaim.NodePoolName] = subtractMax(s.remainingResources[newNodeClaim.NodePoolName], newNodeClaim.InstanceTypeOptions)
-		return nil
+		return &placement{
+			nodeClaim:          newNodeClaim,
+			requirements:       updatedRequirements,
+			instanceTypes:      updatedInstanceTypes,
+			offeringsToReserve: offeringsToReserve,
+			allocationResult:   allocationResult,
+		}, nil
 	}
-	return multierr.Combine(errs...)
+	return nil, multierr.Combine(errs...)
 }
 
 func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
@@ -1136,14 +1245,17 @@ func buildDaemonOverheadGroupsForTemplate(ctx context.Context, nct *NodeClaimTem
 			}
 			return isDaemonPodCompatible(nct, it, p)
 		})
-		key := podSetKey(compatible)
+		// Instance types with the same compatible daemon pods can still differ in overhead when they permit
+		// different label values (see daemonoverhead.go), so the overhead is part of the grouping key.
+		overhead, truncated := computeDaemonOverhead(candidateRequirements(nct, it), compatible)
+		if truncated {
+			log.FromContext(ctx).Info("daemon overhead realization space exceeded limit, reserving the sum of all compatible daemon pods",
+				"NodePool", klog.KRef("", nct.NodePoolName), "instance-type", it.Name, "daemon-pods", len(compatible), "limit", daemonOverheadRealizationLimit)
+		}
+		key := podSetKey(compatible) + "|" + resources.String(overhead)
 		if g, ok := groups[key]; ok {
 			g.InstanceTypes = append(g.InstanceTypes, it)
 		} else {
-			var overhead corev1.ResourceList
-			if len(compatible) > 0 {
-				overhead = resources.RequestsForPods(compatible...)
-			}
 			hostPortUsage := scheduling.NewHostPortUsage()
 			for _, p := range compatible {
 				hostPortUsage.Add(p, scheduling.GetHostPorts(p))
@@ -1171,8 +1283,11 @@ func podSetKey(pods []*corev1.Pod) string {
 	return strings.Join(keys, ",")
 }
 
-// isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling
+// isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling.
+// The relaxation below rewrites the pod's tolerations and required node affinity terms; the daemon pods are shared
+// across instance types and templates, and computeDaemonOverhead reads every required term, so it runs on a copy.
 func isDaemonPodCompatible(nodeClaimTemplate *NodeClaimTemplate, it *cloudprovider.InstanceType, pod *corev1.Pod) bool {
+	pod = pod.DeepCopy()
 	preferences := &Preferences{}
 	// Add a toleration for PreferNoSchedule since a daemon pod shouldn't respect the preference
 	_ = preferences.toleratePreferNoScheduleTaints(pod)

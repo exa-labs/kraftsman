@@ -61,6 +61,17 @@ func NoCompatibleInstanceTypes(np *v1.NodePool, minValuesIncompatibleError bool)
 	}
 }
 
+func InvalidPackingPolicyEvent(np *v1.NodePool, err error) events.Event {
+	return events.Event{
+		InvolvedObject: np,
+		Type:           corev1.EventTypeWarning,
+		Reason:         events.InvalidPackingPolicy,
+		Message:        fmt.Sprintf("Using the %s packing policy, %s", PackingPolicyBinpack, err),
+		DedupeValues:   []string{string(np.UID)},
+		DedupeTimeout:  1 * time.Minute,
+	}
+}
+
 func PodFailedToScheduleEvent(pod *corev1.Pod, err error) events.Event {
 	return events.Event{
 		InvolvedObject: pod,
