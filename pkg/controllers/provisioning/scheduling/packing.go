@@ -121,9 +121,9 @@ func launchPrice(instanceTypes []*cloudprovider.InstanceType, requirements sched
 	reservationIDs := sets.New(lo.Map(reserved, func(o *cloudprovider.Offering, _ int) string { return o.ReservationID() })...)
 	price = math.MaxFloat64
 	for _, it := range instanceTypes {
-		launchable := cloudprovider.Offerings(lo.Filter(it.Offerings.Available(), func(o *cloudprovider.Offering, _ int) bool {
+		launchable := lo.Filter(it.Offerings.Available(), func(o *cloudprovider.Offering, _ int) bool {
 			return o.CapacityType() != v1.CapacityTypeReserved || reservationIDs.Has(o.ReservationID())
-		}))
+		})
 		if p := launchable.CheapestLaunchPrice(requirements); p < price {
 			price = p
 		}
