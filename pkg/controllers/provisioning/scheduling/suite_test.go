@@ -31,6 +31,7 @@ import (
 	. "github.com/onsi/gomega"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -1824,6 +1825,158 @@ var _ = Context("Scheduling", func() {
 		})
 	})
 
+	Describe("Packing Policy", func() {
+		// acceleratorType models an accelerator family whose per-device price rises with size, like Inferentia2: a
+		// six-device box costs more than six one-device boxes, so packing six one-device pods onto it is a bad deal.
+		acceleratorType := func(name string, devices int64, spotPrice float64) *cloudprovider.InstanceType {
+			capacityOffering := func(capacityType string, price float64) cloudprovider.Offering {
+				return cloudprovider.Offering{
+					Available: true,
+					Price:     price,
+					Requirements: pscheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey:  capacityType,
+						corev1.LabelTopologyZone: "test-zone-1",
+					}),
+				}
+			}
+			return fake.NewInstanceType(name,
+				fake.WithResources(corev1.ResourceList{
+					corev1.ResourceCPU:      *resource.NewQuantity(4*devices, resource.DecimalSI),
+					corev1.ResourceMemory:   *resource.NewQuantity(16*devices<<30, resource.BinarySI),
+					corev1.ResourcePods:     resource.MustParse("110"),
+					fake.ResourceGPUVendorA: *resource.NewQuantity(devices, resource.DecimalSI),
+				}),
+				fake.WithOfferings(capacityOffering(v1.CapacityTypeSpot, spotPrice), capacityOffering(v1.CapacityTypeOnDemand, 4*spotPrice)),
+			)
+		}
+		oneDevicePods := func(count int) []*corev1.Pod {
+			return test.UnschedulablePods(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{fake.ResourceGPUVendorA: resource.MustParse("1")},
+				Limits:   corev1.ResourceList{fake.ResourceGPUVendorA: resource.MustParse("1")},
+			}}, count)
+		}
+		nodeCountsByInstanceType := func(pods []*corev1.Pod) map[string]int {
+			counts := map[string]int{}
+			nodeNames := sets.New[string]()
+			for _, p := range pods {
+				node := ExpectScheduled(ctx, env.Client, p)
+				if nodeNames.Has(node.Name) {
+					continue
+				}
+				nodeNames.Insert(node.Name)
+				counts[node.Labels[corev1.LabelInstanceTypeStable]]++
+			}
+			return counts
+		}
+		BeforeEach(func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+				acceleratorType("one-device", 1, 1),
+				acceleratorType("six-device", 6, 10),
+			}
+		})
+		It("should pack every pod onto one large NodeClaim by default", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			pods := oneDevicePods(6)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+			Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"six-device": 1}))
+		})
+		It("should pack every pod onto one large NodeClaim under the binpack policy", func() {
+			nodePool.Annotations = map[string]string{v1.NodePoolPackingPolicyAnnotationKey: "binpack"}
+			ExpectApplied(ctx, env.Client, nodePool)
+			pods := oneDevicePods(6)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+			Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"six-device": 1}))
+		})
+		It("should fall back to binpack on an unrecognized policy", func() {
+			nodePool.Annotations = map[string]string{v1.NodePoolPackingPolicyAnnotationKey: "cheapest-per-pod"}
+			ExpectApplied(ctx, env.Client, nodePool)
+			pods := oneDevicePods(6)
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+			Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"six-device": 1}))
+		})
+		Context("marginal-cost", func() {
+			BeforeEach(func() {
+				nodePool.Annotations = map[string]string{v1.NodePoolPackingPolicyAnnotationKey: "marginal-cost"}
+			})
+			It("should open a new NodeClaim when that is cheaper than growing an in-flight one", func() {
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(6)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				// six one-device boxes at $1 beat one six-device box at $10
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"one-device": 6}))
+				Expect(cloudProvider.CreateCalls).To(HaveLen(6))
+			})
+			It("should keep packing while growing costs no more than a new NodeClaim", func() {
+				// linear pricing: each step up the ladder costs exactly one more one-device box, and the tie keeps the
+				// in-flight NodeClaim, so the pods still share a node as under binpack
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+					acceleratorType("one-device", 1, 1),
+					acceleratorType("two-device", 2, 2),
+					acceleratorType("three-device", 3, 3),
+					acceleratorType("four-device", 4, 4),
+				}
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(4)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"four-device": 1}))
+			})
+			It("should pack pods onto an in-flight NodeClaim when it can still hold them at no extra cost", func() {
+				// a three-device pod pins its NodeClaim to six-device; three one-device pods then ride along for free
+				ExpectApplied(ctx, env.Client, nodePool)
+				large := test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), fake.ResourceGPUVendorA: resource.MustParse("3")},
+					Limits:   corev1.ResourceList{fake.ResourceGPUVendorA: resource.MustParse("3")},
+				}})
+				pods := append([]*corev1.Pod{large}, oneDevicePods(3)...)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"six-device": 1}))
+			})
+			It("should grow the in-flight NodeClaim when no new NodeClaim can be opened", func() {
+				// the first NodeClaim is charged the largest instance type it may become (six-device, 24 cpu) against the
+				// limit, so no second NodeClaim can be opened and the remaining pods grow the first one
+				nodePool.Spec.Limits = v1.Limits{corev1.ResourceCPU: resource.MustParse("24")}
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(6)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"six-device": 1}))
+			})
+			It("should choose by price across capacity types the NodePool allows", func() {
+				// six-device is only offered on-demand ($40) but one-device only spot ($1): splitting is still cheaper
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+					acceleratorType("one-device", 1, 1),
+					acceleratorType("six-device", 6, 10),
+				}
+				cloudProvider.InstanceTypes[1].Offerings = lo.Filter(cloudProvider.InstanceTypes[1].Offerings, func(o *cloudprovider.Offering, _ int) bool {
+					return o.Requirements.Get(v1.CapacityTypeLabelKey).Any() == v1.CapacityTypeOnDemand
+				})
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(6)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"one-device": 6}))
+			})
+			It("should leave in-flight NodeClaims of binpack NodePools absorbing pods", func() {
+				// the pods fit both pools; the binpack pool is evaluated first and its in-flight NodeClaim costs
+				// nothing to grow under its own policy, so the marginal-cost pool never opens NodeClaims for them
+				binpackPool := test.NodePool(v1.NodePool{
+					Spec: v1.NodePoolSpec{
+						Weight: lo.ToPtr[int32](100),
+						Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{Requirements: []v1.NodeSelectorRequirementWithMinValues{{
+							Key:      v1.CapacityTypeLabelKey,
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand},
+						}}}},
+					},
+				})
+				ExpectApplied(ctx, env.Client, nodePool, binpackPool)
+				pods := oneDevicePods(6)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"six-device": 1}))
+				Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+				Expect(cloudProvider.CreateCalls[0].Labels[v1.NodePoolLabelKey]).To(Equal(binpackPool.Name))
+			})
+		})
+	})
+
 	Describe("In-Flight Nodes", func() {
 		It("should not launch a second node if there is an in-flight node that can support the pod", func() {
 			opts := test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
@@ -2484,6 +2637,105 @@ var _ = Context("Scheduling", func() {
 					// only the DS pods are bound, so available is reduced by two and the DS requested is incremented by two
 					Expect(available.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 13.9))
 				}
+			})
+			Context("mutually exclusive topology selectors", func() {
+				// small fits the workload plus one zone-scoped daemon (1 + 0.6 + 100m kube-reserved), but not the
+				// workload plus every zone-scoped daemon (1 + 3*0.6 + 100m).
+				var zoneDaemonSet func(zone string, opts ...func(*test.PodOptions)) *appsv1.DaemonSet
+				BeforeEach(func() {
+					cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+						fake.NewInstanceType("small", fake.WithResources(corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("2"),
+							corev1.ResourceMemory: resource.MustParse("8Gi"),
+						})),
+						fake.NewInstanceType("large", fake.WithResources(corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("8"),
+							corev1.ResourceMemory: resource.MustParse("32Gi"),
+						})),
+					}
+					zoneDaemonSet = func(zone string, opts ...func(*test.PodOptions)) *appsv1.DaemonSet {
+						podOpts := test.PodOptions{
+							NodeRequirements: []corev1.NodeSelectorRequirement{{
+								Key:      corev1.LabelTopologyZone,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{zone},
+							}},
+							ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("600m"),
+							}},
+						}
+						for _, opt := range opts {
+							opt(&podOpts)
+						}
+						return test.DaemonSet(test.DaemonSetOptions{PodOptions: podOpts})
+					}
+				})
+				It("should reserve overhead for one zone's daemons, not the sum over every zone the NodeClaim permits", func() {
+					ExpectApplied(ctx, env.Client, nodePool, zoneDaemonSet("test-zone-1"), zoneDaemonSet("test-zone-2"), zoneDaemonSet("test-zone-3"))
+					pod := test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+					}})
+					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+					node := ExpectScheduled(ctx, env.Client, pod)
+					Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small"))
+
+					Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+					requests := cloudProvider.CreateCalls[0].Spec.Resources.Requests
+					Expect(requests.Cpu().Cmp(resource.MustParse("1600m"))).To(Equal(0))
+					Expect(requests.Pods().Value()).To(BeEquivalentTo(2))
+				})
+				It("should reserve overhead for exactly the daemons of a NodeClaim pinned to one zone", func() {
+					ExpectApplied(ctx, env.Client, nodePool, zoneDaemonSet("test-zone-1"), zoneDaemonSet("test-zone-2"), zoneDaemonSet("test-zone-3"))
+					pod := test.UnschedulablePod(test.PodOptions{
+						NodeSelector: map[string]string{corev1.LabelTopologyZone: "test-zone-2"},
+						ResourceRequirements: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+						},
+					})
+					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+					node := ExpectScheduled(ctx, env.Client, pod)
+					Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small"))
+					Expect(node.Labels[corev1.LabelTopologyZone]).To(Equal("test-zone-2"))
+					Expect(cloudProvider.CreateCalls[0].Spec.Resources.Requests.Cpu().Cmp(resource.MustParse("1600m"))).To(Equal(0))
+				})
+				It("should still sum daemons that can land on the same node", func() {
+					// two daemons on the same zone plus one on every zone all co-schedule in test-zone-1: 1 + 3*0.6 + 100m > 2
+					ExpectApplied(ctx, env.Client, nodePool,
+						zoneDaemonSet("test-zone-1"),
+						zoneDaemonSet("test-zone-1"),
+						test.DaemonSet(test.DaemonSetOptions{PodOptions: test.PodOptions{
+							ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("600m"),
+							}},
+						}}),
+					)
+					pod := test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+					}})
+					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+					node := ExpectScheduled(ctx, env.Client, pod)
+					Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("large"))
+					Expect(cloudProvider.CreateCalls[0].Spec.Resources.Requests.Cpu().Cmp(resource.MustParse("2800m"))).To(Equal(0))
+					Expect(cloudProvider.CreateCalls[0].Spec.Resources.Requests.Pods().Value()).To(BeEquivalentTo(4))
+				})
+				It("should keep host ports of every zone's daemons reserved", func() {
+					withHostPort := func(o *test.PodOptions) { o.HostPorts = []int32{8080} }
+					ExpectApplied(ctx, env.Client, nodePool,
+						zoneDaemonSet("test-zone-1", withHostPort),
+						zoneDaemonSet("test-zone-2", withHostPort),
+						zoneDaemonSet("test-zone-3", withHostPort),
+					)
+					// a pod without host ports is unaffected and still gets the small instance type
+					plain := test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+					}})
+					// a pod on the daemons' host port would collide with whichever daemon lands on the node
+					colliding := test.UnschedulablePod(test.PodOptions{HostPorts: []int32{8080}})
+					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, plain, colliding)
+					node := ExpectScheduled(ctx, env.Client, plain)
+					Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small"))
+					ExpectNotScheduled(ctx, env.Client, colliding)
+				})
 			})
 		})
 		// nolint:gosec

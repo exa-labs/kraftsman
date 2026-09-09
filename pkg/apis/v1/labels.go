@@ -65,6 +65,11 @@ const (
 	// the disruption queue, for example "cloud_interrupted" for cloud-initiated interruption or preemption.
 	// Termination metrics report it as the cause of the deletion.
 	NodeClaimTerminationCauseAnnotationKey = apis.Group + "/termination-cause"
+	// NodePoolPackingPolicyAnnotationKey selects how the scheduler places a pending pod that fits both an in-flight
+	// NodeClaim and a new one. "binpack" (the default) always grows the in-flight NodeClaim; "marginal-cost" opens a
+	// new NodeClaim whenever that is cheaper than the price increase of growing an existing one. It lives on the
+	// NodePool object, not its template, so toggling it does not change the template hash or drift existing nodes.
+	NodePoolPackingPolicyAnnotationKey = apis.Group + "/nodeclaim-packing-policy"
 )
 
 // NodeClaimTerminationCauseCloudInterrupted is the NodeClaimTerminationCauseAnnotationKey value for

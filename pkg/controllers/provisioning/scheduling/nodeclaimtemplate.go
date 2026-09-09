@@ -61,6 +61,9 @@ type NodeClaimTemplate struct {
 	InstanceTypeOptions cloudprovider.InstanceTypes
 	Requirements        scheduling.Requirements
 	IsStaticNodeClaim   bool
+	// PackingPolicy is the NodePool's v1.NodePoolPackingPolicyAnnotationKey value; the zero value behaves as
+	// PackingPolicyBinpack.
+	PackingPolicy PackingPolicy
 
 	// cacheFingerprint identifies the candidate-invariant inputs (NodePool identity, provider
 	// instance type revision, minValues policy) this template was built from. It is only set when
