@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -104,6 +105,57 @@ func TestComputeDaemonOverheadNarrowCandidateSeesOnlyItsRegion(t *testing.T) {
 		daemonPod("shared", "50m"),
 	})
 	expectOverhead(t, got, "750m", 2)
+}
+
+// daemonPodWithTerms builds a daemon pod requesting cpu whose required node affinity ORs one term per element of terms.
+func daemonPodWithTerms(name, cpu string, terms ...[]corev1.NodeSelectorRequirement) *corev1.Pod {
+	p := daemonPod(name, cpu)
+	p.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: lo.Map(terms, func(reqs []corev1.NodeSelectorRequirement, _ int) corev1.NodeSelectorTerm {
+				return corev1.NodeSelectorTerm{MatchExpressions: reqs}
+			}),
+		},
+	}}
+	return p
+}
+
+func TestComputeDaemonOverheadHonorsEveryRequiredAffinityAlternative(t *testing.T) {
+	candidate := scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "a", "b"))
+	got, truncated := computeDaemonOverhead(candidate, []*corev1.Pod{
+		// zone a OR zone b: schedules in both realizations, so it co-schedules with the zone b daemon
+		daemonPodWithTerms("either", "300m", []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "a")}, []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "b")}),
+		daemonPod("b-only", "500m", in(corev1.LabelTopologyZone, "b")),
+	})
+	if truncated {
+		t.Fatal("unexpected truncation")
+	}
+	expectOverhead(t, got, "800m", 2)
+}
+
+func TestComputeDaemonOverheadIgnoresAlternativesTheCandidateCannotRealize(t *testing.T) {
+	candidate := scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "a", "b"))
+	got, _ := computeDaemonOverhead(candidate, []*corev1.Pod{
+		// zone a OR zone c: no node satisfying candidate is in zone c, so only the zone a alternative counts
+		daemonPodWithTerms("a-or-c", "300m", []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "a")}, []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "c")}),
+		daemonPod("b-only", "500m", in(corev1.LabelTopologyZone, "b")),
+	})
+	expectOverhead(t, got, "500m", 1)
+}
+
+func TestComputeDaemonOverheadCombinesNodeSelectorWithEachAlternative(t *testing.T) {
+	candidate := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "a", "b"),
+		scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64", "arm64"),
+	)
+	either := daemonPodWithTerms("either-arm", "300m", []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "a")}, []corev1.NodeSelectorRequirement{in(corev1.LabelTopologyZone, "b")})
+	either.Spec.NodeSelector = map[string]string{corev1.LabelArchStable: "arm64"}
+	got, _ := computeDaemonOverhead(candidate, []*corev1.Pod{
+		either,
+		daemonPod("b-amd", "500m", in(corev1.LabelTopologyZone, "b"), in(corev1.LabelArchStable, "amd64")),
+	})
+	// the nodeSelector applies to every alternative, so the two never share an (arch, zone) realization
+	expectOverhead(t, got, "500m", 1)
 }
 
 func TestComputeDaemonOverheadTakesElementWiseMaxAcrossRealizations(t *testing.T) {

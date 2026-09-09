@@ -39,7 +39,9 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -110,23 +112,30 @@ type inflightPlacement struct {
 	unpriced bool
 }
 
-// launchPrice is the cheapest price at which a NodeClaim with these instance types and requirements can launch. ok is
-// false when no instance type has a compatible available offering to price.
-func launchPrice(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements) (price float64, ok bool) {
+// launchPrice is the cheapest price at which a NodeClaim with these instance types and requirements can launch. A
+// reserved offering is priced only when it is among the offerings reserved for the NodeClaim: the ReservationManager
+// tracks reservation consumption apart from Offering.Available, and a NodeClaim that could reserve nothing launches
+// as spot or on-demand (FinalizeScheduling pins the capacity type to reserved only when reservations were made). ok
+// is false when no instance type has a compatible available offering to price.
+func launchPrice(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, reserved []*cloudprovider.Offering) (price float64, ok bool) {
+	reservationIDs := sets.New(lo.Map(reserved, func(o *cloudprovider.Offering, _ int) string { return o.ReservationID() })...)
 	price = math.MaxFloat64
 	for _, it := range instanceTypes {
-		if p := it.Offerings.Available().CheapestLaunchPrice(requirements); p < price {
+		launchable := cloudprovider.Offerings(lo.Filter(it.Offerings.Available(), func(o *cloudprovider.Offering, _ int) bool {
+			return o.CapacityType() != v1.CapacityTypeReserved || reservationIDs.Has(o.ReservationID())
+		}))
+		if p := launchable.CheapestLaunchPrice(requirements); p < price {
 			price = p
 		}
 	}
 	return price, price != math.MaxFloat64
 }
 
-// marginalLaunchPrice is the increase in nc's launch price if its instance types and requirements become
-// instanceTypes and requirements. unpriced is set when either side cannot be priced.
-func marginalLaunchPrice(nc *NodeClaim, instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements) (delta float64, unpriced bool) {
-	before, okBefore := launchPrice(nc.InstanceTypeOptions, nc.Requirements)
-	after, okAfter := launchPrice(instanceTypes, requirements)
+// marginalLaunchPrice is the increase in nc's launch price if its instance types, requirements and reserved offerings
+// become instanceTypes, requirements and reserved. unpriced is set when either side cannot be priced.
+func marginalLaunchPrice(nc *NodeClaim, instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, reserved []*cloudprovider.Offering) (delta float64, unpriced bool) {
+	before, okBefore := launchPrice(nc.InstanceTypeOptions, nc.Requirements, nc.reservedOfferings)
+	after, okAfter := launchPrice(instanceTypes, requirements, reserved)
 	if !okBefore || !okAfter {
 		return 0, true
 	}

@@ -711,7 +711,7 @@ func (s *Scheduler) addByMarginalCost(ctx context.Context, pod *corev1.Pod) erro
 	}
 	if inflight.delta > 0 {
 		if fresh, err := s.evaluateNewNodeClaim(ctx, pod); err == nil {
-			if price, ok := launchPrice(fresh.instanceTypes, fresh.requirements); ok && cheaperThan(price, inflight.delta) {
+			if price, ok := launchPrice(fresh.instanceTypes, fresh.requirements, fresh.offeringsToReserve); ok && cheaperThan(price, inflight.delta) {
 				s.commitNewNodeClaim(ctx, pod, fresh)
 				PackingDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingOutcomeNew})
 				return nil
@@ -738,7 +738,7 @@ func (s *Scheduler) cheapestInflightPlacement(ctx context.Context, pod *corev1.P
 		}
 		candidate := &inflightPlacement{placement: placement{nodeClaim: nc, requirements: r, instanceTypes: its, offeringsToReserve: ofr, allocationResult: result}}
 		if nc.PackingPolicy == PackingPolicyMarginalCost {
-			candidate.delta, candidate.unpriced = marginalLaunchPrice(nc, its, r)
+			candidate.delta, candidate.unpriced = marginalLaunchPrice(nc, its, r, ofr)
 		}
 		candidates[i] = candidate
 		return true

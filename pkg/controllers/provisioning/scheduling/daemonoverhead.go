@@ -28,7 +28,8 @@ limitations under the License.
 //	overhead(candidate) = max over realizations r of  sum over daemon pods d accepting r of  requests(d)
 //
 // Daemon pods that genuinely co-schedule are still summed, and the result is never lower than what any concrete
-// node satisfying the candidate has to host.
+// node satisfying the candidate has to host. A daemon pod with several required node affinity terms (which
+// Kubernetes ORs) accepts a realization when any of its terms does.
 
 package scheduling
 
@@ -64,6 +65,30 @@ func candidateRequirements(nct *NodeClaimTemplate, it *cloudprovider.InstanceTyp
 	return candidate
 }
 
+// daemonAlternatives returns the node selection alternatives under which a daemon pod schedules onto a node
+// satisfying candidate. Kubernetes ORs the RequiredDuringScheduling node selector terms, so each term compatible with
+// candidate, combined with the pod's nodeSelector, is one alternative. Falls back to the pod's strict requirements
+// (its first term) when no term is compatible, which is how the caller established compatibility.
+func daemonAlternatives(candidate scheduling.Requirements, p *corev1.Pod) []scheduling.Requirements {
+	labels := scheduling.NewLabelRequirements(p.Spec.NodeSelector)
+	var terms []corev1.NodeSelectorTerm
+	if affinity := p.Spec.Affinity; affinity != nil && affinity.NodeAffinity != nil && affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		terms = affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	}
+	if len(terms) == 0 {
+		return []scheduling.Requirements{labels}
+	}
+	alternatives := lo.FilterMap(terms, func(term corev1.NodeSelectorTerm, _ int) (scheduling.Requirements, bool) {
+		alternative := scheduling.NewRequirements(labels.Values()...)
+		alternative.Add(scheduling.NewNodeSelectorRequirements(term.MatchExpressions...).Values()...)
+		return alternative, candidate.IsCompatible(alternative, scheduling.AllowUndefinedWellKnownLabels)
+	})
+	if len(alternatives) == 0 {
+		return []scheduling.Requirements{scheduling.NewStrictPodRequirements(p)}
+	}
+	return alternatives
+}
+
 // computeDaemonOverhead returns the resources a node satisfying candidate must reserve for daemonPods, every one of
 // which is individually compatible with candidate. See the file header for the model. truncated reports that the
 // realization space exceeded daemonOverheadRealizationLimit and the plain sum was reserved instead.
@@ -71,9 +96,10 @@ func computeDaemonOverhead(candidate scheduling.Requirements, daemonPods []*core
 	if len(daemonPods) == 0 {
 		return nil, false
 	}
-	daemonRequirements := lo.Map(daemonPods, func(p *corev1.Pod, _ int) scheduling.Requirements {
-		return scheduling.NewStrictPodRequirements(p)
+	alternatives := lo.Map(daemonPods, func(p *corev1.Pod, _ int) []scheduling.Requirements {
+		return daemonAlternatives(candidate, p)
 	})
+	daemonRequirements := lo.Flatten(alternatives)
 	var keys []string
 	var domains [][]labelValue
 	realizations := 1
@@ -98,7 +124,9 @@ func computeDaemonOverhead(candidate scheduling.Requirements, daemonPods []*core
 	walk = func(depth int) {
 		if depth == len(keys) {
 			accepted := lo.Filter(daemonPods, func(_ *corev1.Pod, i int) bool {
-				return acceptsRealization(daemonRequirements[i], keys, realization)
+				return lo.SomeBy(alternatives[i], func(alternative scheduling.Requirements) bool {
+					return acceptsRealization(alternative, keys, realization)
+				})
 			})
 			if len(accepted) != 0 {
 				overhead = resources.MaxResources(overhead, resources.RequestsForPods(accepted...))
@@ -114,9 +142,9 @@ func computeDaemonOverhead(candidate scheduling.Requirements, daemonPods []*core
 	return overhead, false
 }
 
-// partitioningLabelKeys returns, sorted, the label keys on which at least two of the daemon pods place differing
-// requirements. Only these keys can make daemon pods mutually exclusive; a key every constraining daemon pod agrees
-// on admits the same pods in every realization.
+// partitioningLabelKeys returns, sorted, the label keys on which at least two of the daemon alternatives place
+// differing requirements. Only these keys can make daemon pods mutually exclusive; a key every constraining
+// alternative agrees on admits the same pods in every realization.
 func partitioningLabelKeys(daemonRequirements []scheduling.Requirements) []string {
 	byKey := map[string][]*scheduling.Requirement{}
 	for _, reqs := range daemonRequirements {

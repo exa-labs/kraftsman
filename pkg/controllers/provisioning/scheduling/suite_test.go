@@ -1954,6 +1954,38 @@ var _ = Context("Scheduling", func() {
 				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
 				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"one-device": 6}))
 			})
+			It("should price a new NodeClaim only on reservations it can still take", func() {
+				// the first pod's NodeClaim pessimistically reserves one-device's only slot ($0.01) and one of two-device's two
+				// slots ($0.50). For the second pod, growing that NodeClaim to two-device costs $0.49; a new NodeClaim can
+				// still take two-device's second slot at $0.50 but not one-device's consumed $0.01 slot, so the pods share
+				// the two-device node instead of splitting on a reserved price the second NodeClaim cannot launch at
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true)}}))
+				withReservation := func(it *cloudprovider.InstanceType, capacity int, price float64) *cloudprovider.InstanceType {
+					it.Requirements.Get(v1.CapacityTypeLabelKey).Insert(v1.CapacityTypeReserved)
+					it.Offerings = append(it.Offerings, &cloudprovider.Offering{
+						ReservationCapacity: capacity,
+						Available:           true,
+						Price:               price,
+						Requirements: pscheduling.NewLabelRequirements(map[string]string{
+							v1.CapacityTypeLabelKey:          v1.CapacityTypeReserved,
+							corev1.LabelTopologyZone:         "test-zone-1",
+							cloudprovider.ReservationIDLabel: fmt.Sprintf("r-%s", it.Name),
+						}),
+					})
+					return it
+				}
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+					withReservation(acceleratorType("one-device", 1, 1), 1, 0.01),
+					withReservation(acceleratorType("two-device", 2, 1), 2, 0.5),
+				}
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(2)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"two-device": 1}))
+				node := ExpectScheduled(ctx, env.Client, pods[0])
+				Expect(node.Labels).To(HaveKeyWithValue(cloudprovider.ReservationIDLabel, "r-two-device"))
+				Expect(node.Labels).To(HaveKeyWithValue(v1.CapacityTypeLabelKey, v1.CapacityTypeReserved))
+			})
 			It("should leave in-flight NodeClaims of binpack NodePools absorbing pods", func() {
 				// the pods fit both pools; the binpack pool is evaluated first and its in-flight NodeClaim costs
 				// nothing to grow under its own policy, so the marginal-cost pool never opens NodeClaims for them
