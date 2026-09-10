@@ -18,6 +18,7 @@ package lifecycle_test
 
 import (
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -114,5 +115,26 @@ var _ = Describe("Launch", func() {
 		Expect(condition.Status).To(Equal(metav1.ConditionUnknown))
 		Expect(condition.Reason).To(Equal(conditionReason))
 		Expect(condition.Message).To(Equal(conditionMessage))
+	})
+	It("should keep the nodeclaim and requeue after the cloudprovider's interval if launch is deferred", func() {
+		cloudProvider.NextCreateErr = cloudprovider.NewLaunchDeferredError(fmt.Errorf("spot insufficient"), "SpotFirstWaiting", "waiting for stronger evidence", 20*time.Second)
+		nodeClaim := test.NodeClaim()
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(result.RequeueAfter).To(Equal(20 * time.Second))
+
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeTrue())
+		condition := ExpectStatusConditionExists(nodeClaim, v1.ConditionTypeLaunched)
+		Expect(condition.Status).To(Equal(metav1.ConditionUnknown))
+		Expect(condition.Reason).To(Equal("SpotFirstWaiting"))
+		Expect(condition.Message).To(Equal("waiting for stronger evidence"))
+		Expect(cloudProvider.CreateCalls).To(HaveLen(0))
+
+		// The next reconcile launches normally once the cloudprovider is ready.
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(ExpectStatusConditionExists(nodeClaim, v1.ConditionTypeLaunched).Status).To(Equal(metav1.ConditionTrue))
+		Expect(cloudProvider.CreateCalls).To(HaveLen(1))
 	})
 })
