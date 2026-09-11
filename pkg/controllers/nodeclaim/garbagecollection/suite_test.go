@@ -198,6 +198,66 @@ var _ = Describe("GarbageCollection", func() {
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectExists(ctx, env.Client, nodeClaim)
 	})
+	It("should delete the NodeClaim when the Node isn't there and the instance is gone past the launched grace period", func() {
+		nodeClaim := test.NodeClaim(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey: nodePool.Name,
+				},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+		nodeClaim, err := ExpectNodeClaimDeployedNoNode(ctx, env.Client, cloudProvider, nodeClaim)
+		Expect(err).ToNot(HaveOccurred())
+
+		// The cloud lost the instance between launch and registration (failed asynchronous insert, spot preemption during boot)
+		Expect(cloudProvider.Delete(ctx, nodeClaim)).To(Succeed())
+
+		// Step forward past the launched grace period
+		env.Clock.SetTime(time.Now().Add(nodeclaimgarbagecollection.LaunchedGracePeriod + time.Second))
+
+		// Expect the NodeClaim to be removed now rather than waiting for the registration timeout
+		ExpectSingletonReconciled(ctx, garbageCollectionController)
+		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+		ExpectNotFound(ctx, env.Client, nodeClaim)
+	})
+	It("shouldn't delete the NodeClaim when the Node isn't there and the instance is there past the launched grace period", func() {
+		nodeClaim := test.NodeClaim(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey: nodePool.Name,
+				},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+		nodeClaim, err := ExpectNodeClaimDeployedNoNode(ctx, env.Client, cloudProvider, nodeClaim)
+		Expect(err).ToNot(HaveOccurred())
+
+		// Step forward past the launched grace period
+		env.Clock.SetTime(time.Now().Add(nodeclaimgarbagecollection.LaunchedGracePeriod + time.Second))
+
+		// Expect the NodeClaim to remain since the instance is still provisioning at the CloudProvider
+		ExpectSingletonReconciled(ctx, garbageCollectionController)
+		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+		ExpectExists(ctx, env.Client, nodeClaim)
+	})
+	It("shouldn't delete a NodeClaim that never launched", func() {
+		nodeClaim := test.NodeClaim(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey: nodePool.Name,
+				},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+
+		// Step forward past the launched grace period
+		env.Clock.SetTime(time.Now().Add(nodeclaimgarbagecollection.LaunchedGracePeriod + time.Second))
+
+		// Expect the NodeClaim to remain: with no instance behind it, only the launch timeout may delete it
+		ExpectSingletonReconciled(ctx, garbageCollectionController)
+		ExpectExists(ctx, env.Client, nodeClaim)
+	})
 	It("shouldn't delete the NodeClaim when the Node isn't there but the instance is there", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{

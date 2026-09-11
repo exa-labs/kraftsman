@@ -43,6 +43,12 @@ import (
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
+// LaunchedGracePeriod is how long after Launched a NodeClaim that has not yet Registered must be absent from
+// the CloudProvider's List before it is garbage collected. It covers the CloudProvider's list-after-create
+// consistency window (instance caches, eventually consistent describe APIs) so a freshly launched instance is
+// never mistaken for one the cloud lost.
+var LaunchedGracePeriod = 5 * time.Minute
+
 type Controller struct {
 	clock         clock.Clock
 	kubeClient    client.Client
@@ -78,12 +84,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	cloudProviderProviderIDs := sets.New[string](lo.Map(cloudProviderNodeClaims, func(nc *v1.NodeClaim, _ int) string {
 		return nc.Status.ProviderID
 	})...)
-	// Only consider NodeClaims that are Registered since we don't want to fully rely on the CloudProvider
-	// API to trigger deletion of the Node. Instead, we'll wait for our registration timeout to trigger
 	nodeClaims = lo.Filter(nodeClaims, func(n *v1.NodeClaim, _ int) bool {
-		return n.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue() &&
-			n.DeletionTimestamp.IsZero() &&
-			!cloudProviderProviderIDs.Has(n.Status.ProviderID)
+		return n.DeletionTimestamp.IsZero() &&
+			!cloudProviderProviderIDs.Has(n.Status.ProviderID) &&
+			c.isCollectable(n)
 	})
 
 	errs := make([]error, len(nodeClaims))
@@ -119,6 +123,21 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, err
 	}
 	return reconciler.Result{RequeueAfter: time.Minute * 2}, nil
+}
+
+// isCollectable reports whether a NodeClaim the CloudProvider no longer lists may be garbage collected.
+// Registered NodeClaims always qualify (the Node Ready check in Reconcile guards against a stale List, since a
+// running kubelet proves the instance is alive). A NodeClaim that Launched but never Registered qualifies once
+// LaunchedGracePeriod has passed since launch: past that window a missing instance was lost by the cloud between
+// launch and registration (an asynchronous insert that failed after being accepted, a spot preemption during boot)
+// and the NodeClaim is replaced now instead of holding the pending pods until the registration timeout. A
+// NodeClaim that never Launched has no instance to lose and is left to the launch timeout.
+func (c *Controller) isCollectable(nodeClaim *v1.NodeClaim) bool {
+	if nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue() {
+		return true
+	}
+	launched := nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched)
+	return launched.IsTrue() && c.clock.Since(launched.LastTransitionTime.Time) >= LaunchedGracePeriod
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
