@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
 var _ = Describe("Liveness", func() {
@@ -536,6 +538,40 @@ var _ = Describe("Liveness", func() {
 			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
 			ExpectExists(ctx, env.Client, nodeClaim)
 			ExpectExists(ctx, env.Client, node)
+		})
+		It("shouldn't delete a registered NodeClaim past the initialization timeout while its node runs workload pods", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{NodeClaimInitializationTimeout: lo.ToPtr(time.Hour)}))
+			DeferCleanup(func() { ctx = options.ToContext(ctx, test.Options()) })
+			nodeClaim := registeredUninitializedNodeClaim()
+			node, err := nodeclaimutils.NodeForNodeClaim(ctx, env.Client, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+
+			// DaemonSet pods are part of the node's bootstrap and don't count as workload
+			daemonSetPod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+					APIVersion:         "apps/v1",
+					Kind:               "DaemonSet",
+					Name:               "bootstrap",
+					UID:                types.UID("bootstrap"),
+					Controller:         lo.ToPtr(true),
+					BlockOwnerDeletion: lo.ToPtr(true),
+				}}},
+				NodeName: node.Name,
+				Phase:    corev1.PodRunning,
+			})
+			workloadPod := test.Pod(test.PodOptions{NodeName: node.Name, Phase: corev1.PodRunning})
+			ExpectApplied(ctx, env.Client, daemonSetPod, workloadPod)
+
+			env.Clock.Step(2 * time.Hour)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+			ExpectExists(ctx, env.Client, nodeClaim)
+
+			// Once the workload pod is gone, only the DaemonSet pod remains and the timeout applies
+			ExpectDeleted(ctx, env.Client, workloadPod)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
 		})
 		It("should measure the initialization timeout from registration, not from the NodeClaim's creation", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{NodeClaimInitializationTimeout: lo.ToPtr(time.Hour)}))
