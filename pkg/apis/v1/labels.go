@@ -73,7 +73,7 @@ const (
 	// NodePoolRegistrationTimeoutAnnotationKey overrides how long a launched NodeClaim of this NodePool may stay
 	// unregistered before the lifecycle controller deletes it and provisions again. The value is a Go duration such
 	// as "45m"; unset selects the controller default. Raise it for capacity whose cloud-side provisioning alone
-	// approaches the default, for example GCE Spot TPU hosts that spend 14-18 minutes in PROVISIONING before the VM
+	// approaches the default, for example GCE Spot TPU hosts that spend 15-25 minutes in PROVISIONING before the VM
 	// boots — a timeout shorter than that deletes every instance moments before its kubelet could join, so the pool
 	// relaunches forever and never adds a node. It lives on the NodePool object, not its template, so tuning it does
 	// not change the template hash or drift existing nodes.
