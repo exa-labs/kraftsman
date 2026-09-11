@@ -17,6 +17,8 @@ limitations under the License.
 package lifecycle_test
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +28,8 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -205,6 +209,64 @@ var _ = Describe("Initialization", func() {
 
 		node = ExpectExists(ctx, env.Client, node)
 		Expect(node.Labels).To(HaveKeyWithValue(v1.NodeInitializedLabelKey, "true"))
+	})
+	It("should record the bootstrap stage durations when the nodeClaim is initialized", func() {
+		lifecycle.NodeClaimInitializationDurationSeconds.Reset()
+		nodeClaim := test.NodeClaim(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey:     nodePool.Name,
+					v1.CapacityTypeLabelKey: v1.CapacityTypeSpot,
+				},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+		// The fake clock starts at the NodeClaim's creation; each transition happens a known interval later.
+		env.Clock.SetTime(time.Now())
+		env.Clock.Step(time.Minute)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim) // Launched
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched).IsTrue()).To(BeTrue())
+
+		node := test.Node(test.NodeOptions{
+			ProviderID: nodeClaim.Status.ProviderID,
+			Taints:     []corev1.Taint{v1.UnregisteredNoExecuteTaint},
+		})
+		ExpectApplied(ctx, env.Client, node)
+		env.Clock.Step(2 * time.Minute)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim) // Registered
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).IsTrue()).To(BeTrue())
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeFalse())
+
+		ExpectMakeNodesReady(ctx, env.Client, env.Clock, node)
+		env.Clock.Step(10 * time.Minute)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim) // Initialized
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+
+		for _, stage := range []string{lifecycle.StageLaunch, lifecycle.StageRegistration, lifecycle.StageInitialization, lifecycle.StageTotal} {
+			ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_initialization_duration_seconds", 1, map[string]string{
+				lifecycle.StageLabel:      stage,
+				metrics.NodePoolLabel:     nodePool.Name,
+				metrics.CapacityTypeLabel: v1.CapacityTypeSpot,
+			})
+		}
+		// Stage samples are bounded by the clock steps that produced them: registration took 2m, initialization 10m.
+		registration, ok := FindMetricWithLabelValues("karpenter_nodeclaims_initialization_duration_seconds", map[string]string{lifecycle.StageLabel: lifecycle.StageRegistration, metrics.NodePoolLabel: nodePool.Name, metrics.CapacityTypeLabel: v1.CapacityTypeSpot})
+		Expect(ok).To(BeTrue())
+		Expect(registration.Histogram.GetSampleSum()).To(BeNumerically("~", (2 * time.Minute).Seconds(), 5))
+		initialization, ok := FindMetricWithLabelValues("karpenter_nodeclaims_initialization_duration_seconds", map[string]string{lifecycle.StageLabel: lifecycle.StageInitialization, metrics.NodePoolLabel: nodePool.Name, metrics.CapacityTypeLabel: v1.CapacityTypeSpot})
+		Expect(ok).To(BeTrue())
+		Expect(initialization.Histogram.GetSampleSum()).To(BeNumerically("~", (10 * time.Minute).Seconds(), 5))
+
+		// Re-reconciling an already initialized NodeClaim does not emit again.
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		ExpectMetricHistogramSampleCountValue("karpenter_nodeclaims_initialization_duration_seconds", 1, map[string]string{
+			lifecycle.StageLabel:      lifecycle.StageTotal,
+			metrics.NodePoolLabel:     nodePool.Name,
+			metrics.CapacityTypeLabel: v1.CapacityTypeSpot,
+		})
 	})
 	It("should not consider the Node to be initialized when the status of the Node is NotReady", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{

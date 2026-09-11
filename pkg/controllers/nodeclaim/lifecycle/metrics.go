@@ -83,3 +83,34 @@ var NodeClaimTerminationDurationSeconds = opmetrics.NewPrometheusHistogram(
 		Buckets:   prometheus.ExponentialBuckets(1, 2, 12)}, //The threshold values generated here are 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024. 2048
 	[]string{metrics.NodePoolLabel, instanceTypeLabel, metrics.CapacityTypeLabel, causeLabel},
 )
+
+const (
+	// StageLabel names the slice of the NodeClaim bootstrap a sample covers.
+	StageLabel = "stage"
+	// StageLaunch covers NodeClaim creation until the CloudProvider instance was created (Launched).
+	StageLaunch = "launch"
+	// StageRegistration covers Launched until the kubelet joined the cluster (Registered).
+	StageRegistration = "registration"
+	// StageInitialization covers Registered until the node went Ready with startup taints cleared and requested
+	// resources registered (Initialized).
+	StageInitialization = "initialization"
+	// StageTotal covers NodeClaim creation until Initialized, i.e. the time a replacement holds a disruption
+	// command (and its budget slot) before the candidate can be terminated.
+	StageTotal = "total"
+)
+
+// NodeClaimInitializationDurationSeconds records how long a NodeClaim spent in each bootstrap stage, observed once
+// when it becomes Initialized. The existing status condition transition histogram tops out at 10s, which says
+// nothing about boots that take minutes; this one is bucketed from 15s to 2h so slow pools (e.g. inf2 cold starts)
+// and stuck bootstraps are visible per nodepool and capacity type.
+var NodeClaimInitializationDurationSeconds = opmetrics.NewPrometheusHistogram(
+	crmetrics.Registry,
+	prometheus.HistogramOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: metrics.NodeClaimSubsystem,
+		Name:      "initialization_duration_seconds",
+		Help:      "Seconds a NodeClaim spent in each bootstrap stage (launch, registration, initialization, total), observed when it becomes Initialized.",
+		Buckets:   []float64{15, 30, 60, 120, 180, 240, 300, 420, 600, 900, 1200, 1800, 2700, 3600, 7200},
+	},
+	[]string{StageLabel, metrics.NodePoolLabel, metrics.CapacityTypeLabel},
+)
