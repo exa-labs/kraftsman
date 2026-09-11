@@ -70,6 +70,14 @@ const (
 	// new NodeClaim whenever that is cheaper than the price increase of growing an existing one. It lives on the
 	// NodePool object, not its template, so toggling it does not change the template hash or drift existing nodes.
 	NodePoolPackingPolicyAnnotationKey = apis.Group + "/nodeclaim-packing-policy"
+	// NodePoolRegistrationTimeoutAnnotationKey overrides how long a launched NodeClaim of this NodePool may stay
+	// unregistered before the lifecycle controller deletes it and provisions again. The value is a Go duration such
+	// as "45m"; unset selects the controller default. Raise it for capacity whose cloud-side provisioning alone
+	// approaches the default, for example GCE Spot TPU hosts that spend 14-18 minutes in PROVISIONING before the VM
+	// boots — a timeout shorter than that deletes every instance moments before its kubelet could join, so the pool
+	// relaunches forever and never adds a node. It lives on the NodePool object, not its template, so tuning it does
+	// not change the template hash or drift existing nodes.
+	NodePoolRegistrationTimeoutAnnotationKey = apis.Group + "/nodeclaim-registration-timeout"
 )
 
 // NodeClaimTerminationCauseCloudInterrupted is the NodeClaimTerminationCauseAnnotationKey value for
