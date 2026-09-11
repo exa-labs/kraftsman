@@ -143,10 +143,31 @@ const VolcanoSchedulerName = "volcano"
 // will free enough capacity for the pod, and clears it when the nomination becomes invalid.
 // Volcano also sets it on gang members pipelined behind an eviction while the gang as a whole
 // cannot bind (minAvailable unmet), and never clears it, so for volcano-scheduled pods the field
-// carries no will-soon-schedule guarantee — treating it as one deadlocks partially-satisfiable
+// alone carries no will-soon-schedule guarantee — treating it as one deadlocks partially-satisfiable
 // gangs (the nominated pods never appear provisionable, so the missing nodes are never launched).
+// Volcano nominations are honored only while their eviction is still draining; see
+// IsNominatedBehindEviction.
 func IsPreempting(pod *corev1.Pod) bool {
 	return pod.Status.NominatedNodeName != "" && pod.Spec.SchedulerName != VolcanoSchedulerName
+}
+
+// IsVolcanoNominated checks if a volcano-scheduled pod is pipelined onto a node it could not
+// bind to yet. Volcano writes the nomination when it preempts for the pod and, on the following
+// cycles, allocates the pod to that node first once the node's future-idle resources cover it.
+func IsVolcanoNominated(pod *corev1.Pod) bool {
+	return pod.Spec.SchedulerName == VolcanoSchedulerName && pod.Status.NominatedNodeName != ""
+}
+
+// IsNominatedBehindEviction checks if a volcano-scheduled pod is pipelined onto a node whose
+// preemption victims are still terminating — the one case where a volcano nomination does carry
+// a will-soon-schedule guarantee: the evictions free the capacity and volcano allocates the pod
+// to that node before considering any other. Provisioning for the pod meanwhile buys a node it
+// never uses, or binds to first while the node volcano cleared for it sits idle. Once nothing on
+// the nominated node is terminating the nomination is stale or a gang pipelined with minAvailable
+// unmet, and the pod counts as provisionable again so the deadlock IsPreempting describes cannot
+// occur. hasTerminatingPods reports whether the named node currently hosts a terminating pod.
+func IsNominatedBehindEviction(pod *corev1.Pod, hasTerminatingPods func(nodeName string) bool) bool {
+	return IsVolcanoNominated(pod) && hasTerminatingPods(pod.Status.NominatedNodeName)
 }
 
 func IsPending(pod *corev1.Pod) bool {
