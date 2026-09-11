@@ -126,9 +126,12 @@ func (i *NodeClaimTemplate) ToNodeClaim() *v1.NodeClaim {
 			return i.Name
 		})...))
 
-		// Collect available capacity types from the selected instance types
+		// Collect the capacity types the selected instance types are offered in. Availability is deliberately not
+		// consulted: an offering marked unavailable by a cloud provider's insufficient-capacity cooldown is a transient
+		// signal, and baking it into the NodeClaim's requirements would irreversibly pin a claim that could use spot to
+		// on-demand for the life of the node. The cloud provider decides which offering to launch at Create time.
 		capacityTypes := lo.Uniq(lo.FlatMap(instanceTypes, func(it *cloudprovider.InstanceType, _ int) []string {
-			return lo.Map(it.Offerings.Available().Compatible(i.Requirements), func(o *cloudprovider.Offering, _ int) string {
+			return lo.Map(it.Offerings.Compatible(i.Requirements), func(o *cloudprovider.Offering, _ int) string {
 				return o.CapacityType()
 			})
 		}))

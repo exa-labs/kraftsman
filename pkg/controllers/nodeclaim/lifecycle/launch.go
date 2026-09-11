@@ -68,6 +68,11 @@ func (l *Launch) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconc
 	} else {
 		created, err = l.launchNodeClaim(ctx, nodeClaim)
 	}
+	// The CloudProvider is holding the launch open on purpose; poll it on its own cadence rather than
+	// treating the deferral as a failure to back off from.
+	if deferred, ok := cloudprovider.AsLaunchDeferredError(err); ok {
+		return reconcile.Result{RequeueAfter: deferred.RetryAfter}, nil
+	}
 	// Either the Node launch failed or the Node was deleted due to InsufficientCapacity/NodeClassNotReady/NotFound
 	if err != nil || created == nil {
 		return reconcile.Result{}, err
@@ -107,6 +112,11 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 			})
 			return nil, nil
 		default:
+			if deferred, ok := cloudprovider.AsLaunchDeferredError(err); ok {
+				nodeClaim.StatusConditions(status.WithClock(l.clock)).SetUnknownWithReason(v1.ConditionTypeLaunched, deferred.ConditionReason, deferred.ConditionMessage)
+				log.FromContext(ctx).WithValues("reason", deferred.ConditionReason, "retry-after", deferred.RetryAfter).Info("nodeclaim launch deferred by cloudprovider")
+				return nil, err
+			}
 			var createError *cloudprovider.CreateError
 			if errors.As(err, &createError) {
 				nodeClaim.StatusConditions(status.WithClock(l.clock)).SetUnknownWithReason(v1.ConditionTypeLaunched, createError.ConditionReason, createError.ConditionMessage)

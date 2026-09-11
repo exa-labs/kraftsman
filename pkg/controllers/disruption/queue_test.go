@@ -176,6 +176,44 @@ var _ = Describe("Queue", func() {
 			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
 			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue()) // Expect the command to still be in the queue
 		})
+		It("should keep the candidate and untaint it when a replacement is deleted before initializing", func() {
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			replacements := []*disruption.Replacement{
+				{
+					NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct},
+				},
+			}
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Replacements:      replacements,
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
+			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
+			Expect(node1.Spec.Taints).To(ContainElement(v1.DisruptedNoScheduleTaint))
+
+			// The replacement never launches (e.g. spot insufficient capacity) and the lifecycle controller removes it.
+			replacementNodeClaim := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacementNodeClaim)).To(Succeed())
+			ExpectDeleted(ctx, env.Client, replacementNodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(replacementNodeClaim))
+
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeFalse())
+			Expect(cmd.Succeeded).To(BeFalse())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1).MarkedForDeletion()).To(BeFalse())
+			ExpectExists(ctx, env.Client, nodeClaim1)
+			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
+			Expect(node1.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
+		})
 		It("should untaint nodes when a command times out", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
