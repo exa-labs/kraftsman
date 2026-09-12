@@ -155,6 +155,19 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	// from NodePool totals computed once per pass, which the first move invalidates.
 	balancedNodePoolsHeld := sets.New[string]()
 
+	// With more than one discovery worker, candidate simulations run concurrently on the walker
+	// while this loop remains the single consumer: it applies every skip check, holds proposals,
+	// and admits commands strictly in candidate order, exactly as the serial walk does. The gate
+	// mirrors the loop's bookkeeping so workers can decline to simulate candidates the loop is
+	// already bound to skip.
+	var walker *candidateWalker
+	var gate *walkGate
+	if workers := options.FromContext(ctx).ConsolidationDiscoveryWorkers; workers > 1 {
+		gate = newWalkGate(lo.Assign(disruptionBudgetMapping), s.evaluator.CanPassThreshold)
+		walker = startCandidateWalker(ctx, candidates, workers, gate, s.computeConsolidationWithinCandidateBudget)
+		defer walker.stop()
+	}
+
 	timedOut := false
 	// The coverage cycle only accumulates across consecutive timed-out walks. Any pass that ends
 	// for another reason - it walked every candidate, returned its single command, or filled its
@@ -197,11 +210,13 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		if claimedProviderIDs.Has(candidate.ProviderID()) {
 			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipClaimedByPendingCommand)
 			depth = i + 1
+			walker.discard(i)
 			continue
 		}
 		if balancedNodePoolsHeld.Has(candidate.NodePool.Name) {
 			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipPoolCommandHeld)
 			depth = i + 1
+			walker.discard(i)
 			continue
 		}
 
@@ -213,6 +228,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			constrainedByBudgets = true
 			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipBudgetExhausted)
 			depth = i + 1
+			walker.discard(i)
 			continue
 		}
 		// Skip candidates whose best-case score (delete ratio) cannot pass the
@@ -220,6 +236,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		if !s.evaluator.CanPassThreshold(candidate) {
 			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipThreshold)
 			depth = i + 1
+			walker.discard(i)
 			continue
 		}
 
@@ -237,12 +254,30 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipUnchangedNegative)
 			skippedOnNegativeCache = true
 			depth = i + 1
+			walker.discard(i)
 			continue
 		}
 
 		// compute a possible consolidation option
-		candidateCtx, durability := withNoOpDurability(ctx)
-		cmd, err := s.computeConsolidationWithinCandidateBudget(candidateCtx, candidate)
+		var cmd Command
+		var err error
+		var durability *noOpDurability
+		if walker != nil {
+			res := walker.result(i)
+			if res.gateSkipped {
+				// Unreachable in practice: the gate is a subset of the in-order checks above
+				// (its state cannot move while this loop is blocked on the result), so a
+				// candidate that passed them cannot have been gate-skipped. Skip defensively
+				// rather than treat the sentinel as a verdict.
+				depth = i + 1
+				continue
+			}
+			cmd, err, durability = res.cmd, res.err, res.durability
+		} else {
+			var candidateCtx context.Context
+			candidateCtx, durability = withNoOpDurability(ctx)
+			cmd, err = s.computeConsolidationWithinCandidateBudget(candidateCtx, candidate)
+		}
 		depth = i + 1
 		if err != nil {
 			// A candidate that ran out of its own budget is abandoned, not an error: the walk
@@ -270,6 +305,9 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 		if maxCommands <= 1 {
+			// Nothing after validation reads further results, and validation re-simulates
+			// against live state: stop speculative work before it starts.
+			walker.stop()
 			if _, err = s.validator.Validate(ctx, cmd, commandValidationDelay); err != nil {
 				if IsValidationError(err) {
 					reason := getValidationFailureReason(err)
@@ -291,13 +329,21 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			claimedProviderIDs.Insert(held.ProviderID())
 		}
 		disruptionBudgetMapping[candidate.NodePool.Name]--
-		if candidate.NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced() {
+		isBalanced := candidate.NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced()
+		if isBalanced {
 			balancedNodePoolsHeld.Insert(candidate.NodePool.Name)
+		}
+		if gate != nil {
+			gate.hold(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() }), candidate.NodePool.Name, isBalanced)
 		}
 		if len(proposals) >= maxCommands {
 			break
 		}
 	}
+
+	// Admission observes and mutates live cluster state; no speculative simulation may run
+	// behind it.
+	walker.stop()
 
 	if len(proposals) > 0 {
 		admitted, err := s.admitProposals(ctx, proposals)
