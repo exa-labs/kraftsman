@@ -18,6 +18,7 @@ package lifecycle
 
 import (
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -42,6 +43,17 @@ func NodeClassNotReadyEvent(nodeClaim *v1.NodeClaim, err error) events.Event {
 		Reason:         events.NodeClassNotReady,
 		Message:        fmt.Sprintf("NodeClaim %s event: %s", nodeClaim.Name, truncateMessage(err.Error())),
 		DedupeValues:   []string{string(nodeClaim.UID)},
+	}
+}
+
+func InvalidRegistrationTimeoutEvent(np *v1.NodePool, err error) events.Event {
+	return events.Event{
+		InvolvedObject: np,
+		Type:           corev1.EventTypeWarning,
+		Reason:         events.InvalidRegistrationTimeout,
+		Message:        fmt.Sprintf("Using the default %s registration timeout, %s", registrationTimeout, err),
+		DedupeValues:   []string{string(np.UID)},
+		DedupeTimeout:  1 * time.Minute,
 	}
 }
 

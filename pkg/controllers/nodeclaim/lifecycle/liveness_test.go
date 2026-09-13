@@ -33,6 +33,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -302,6 +303,70 @@ var _ = Describe("Liveness", func() {
 
 		// expect that the nodeclaim was not deleted after the timeout
 		ExpectExists(ctx, env.Client, nodeClaim)
+	})
+
+	Context("NodePool registration timeout annotation", func() {
+		var nodeClaim *v1.NodeClaim
+		BeforeEach(func() {
+			nodeClaim = test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey: nodePool.Name,
+					},
+				},
+				Spec: v1.NodeClaimSpec{
+					Resources: v1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("2"),
+							corev1.ResourceMemory: resource.MustParse("50Mi"),
+						},
+					},
+				},
+			})
+		})
+		It("should wait for the NodePool's registration timeout before deleting an unregistered NodeClaim", func() {
+			nodePool.Annotations = map[string]string{v1.NodePoolRegistrationTimeoutAnnotationKey: "45m"}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+
+			// Past the default 15m timeout but inside the NodePool's: kept, and requeued for the remainder
+			env.Clock.Step(20 * time.Minute)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(result.RequeueAfter).To(BeNumerically("<=", 25*time.Minute))
+
+			// Past the NodePool's timeout: deleted
+			env.Clock.Step(26 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+		})
+		It("should keep the default registration timeout and warn on the NodePool when the annotation is not a positive duration", func() {
+			nodePool.Annotations = map[string]string{v1.NodePoolRegistrationTimeoutAnnotationKey: "soon"}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+
+			env.Clock.Step(20 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+			Expect(recorder.Calls(events.InvalidRegistrationTimeout)).To(BeNumerically(">=", 1))
+		})
+		It("should use the default registration timeout when the NodePool is gone", func() {
+			nodePool.Annotations = map[string]string{v1.NodePoolRegistrationTimeoutAnnotationKey: "45m"}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectDeleted(ctx, env.Client, nodePool)
+
+			env.Clock.Step(20 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+			ExpectNotFound(ctx, env.Client, nodeClaim)
+		})
 	})
 
 	It("should update NodeRegistrationHealthy status condition to False if it was previously set to True and there are >=2 registration failures", func() {

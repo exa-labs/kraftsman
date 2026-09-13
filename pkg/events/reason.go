@@ -34,6 +34,9 @@ const (
 	Nominated                 = "Nominated"
 	InvalidPackingPolicy      = "InvalidPackingPolicy"
 
+	// nodeclaim/lifecycle
+	InvalidRegistrationTimeout = "InvalidRegistrationTimeout"
+
 	// node/health
 	NodeRepairBlocked = "NodeRepairBlocked"
 

@@ -18,6 +18,7 @@ package lifecycle
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/awslabs/operatorpkg/object"
@@ -28,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"k8s.io/utils/clock"
@@ -35,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
@@ -43,11 +46,13 @@ import (
 type Liveness struct {
 	clock      clock.Clock
 	kubeClient client.Client
+	recorder   events.Recorder
 	npState    *nodepoolhealth.State
 }
 
 // registrationTimeout is a heuristic time that we expect the node to register within
-// If we don't see the node within this time, then we should delete the NodeClaim and try again
+// If we don't see the node within this time, then we should delete the NodeClaim and try again.
+// A NodePool overrides it with v1.NodePoolRegistrationTimeoutAnnotationKey (see registrationTimeoutFor).
 
 const (
 	registrationTimeout         = time.Minute * 15
@@ -91,9 +96,13 @@ func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reco
 	if registered == nil {
 		return reconcile.Result{Requeue: true}, nil
 	}
+	timeout, err := l.registrationTimeoutFor(ctx, nodeClaim)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
 	// If the Registered statusCondition hasn't gone True during the timeout since we first updated it, we should terminate the NodeClaim
 	// NOTE: Timeout has to be stored and checked in the same place since l.clock can advance after the check causing a race
-	if timeUntilTimeout := registrationTimeout - l.clock.Since(registered.LastTransitionTime.Time); timeUntilTimeout > 0 {
+	if timeUntilTimeout := timeout - l.clock.Since(registered.LastTransitionTime.Time); timeUntilTimeout > 0 {
 		return reconcile.Result{RequeueAfter: timeUntilTimeout}, nil
 	}
 	if err := l.updateNodePoolRegistrationHealth(ctx, nodeClaim); client.IgnoreNotFound(err) != nil {
@@ -103,13 +112,55 @@ func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reco
 		return reconcile.Result{}, err
 	}
 	// Delete the NodeClaim if we believe the NodeClaim won't register since we haven't seen the node
-	if err := l.deleteNodeClaimForTimeout(ctx, registrationTimeout, registrationTimeoutReason, nodeClaim); err != nil {
+	if err := l.deleteNodeClaimForTimeout(ctx, timeout, registrationTimeoutReason, nodeClaim); err != nil {
 		if client.IgnoreNotFound(err) != nil {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, nil
 	}
 	return reconcile.Result{}, nil
+}
+
+// RegistrationTimeoutForNodePool reads the NodePool's v1.NodePoolRegistrationTimeoutAnnotationKey. A missing or
+// empty annotation selects the controller default; a value that is not a positive Go duration also selects it and is
+// reported through the returned error.
+func RegistrationTimeoutForNodePool(np *v1.NodePool) (time.Duration, error) {
+	value := np.Annotations[v1.NodePoolRegistrationTimeoutAnnotationKey]
+	if value == "" {
+		return registrationTimeout, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		return registrationTimeout, fmt.Errorf("parsing %s annotation value %q, %w", v1.NodePoolRegistrationTimeoutAnnotationKey, value, err)
+	}
+	if timeout <= 0 {
+		return registrationTimeout, fmt.Errorf("invalid %s annotation value %q, expected a positive duration", v1.NodePoolRegistrationTimeoutAnnotationKey, value)
+	}
+	return timeout, nil
+}
+
+// registrationTimeoutFor resolves the registration timeout that governs nodeClaim: its owning NodePool's
+// RegistrationTimeoutForNodePool, or the controller default when the NodeClaim has no NodePool or the NodePool is
+// gone. An invalid annotation keeps the default so unregistered NodeClaims are still reclaimed, and is surfaced as a
+// NodePool event and a log line on every evaluation until it is fixed.
+func (l *Liveness) registrationTimeoutFor(ctx context.Context, nodeClaim *v1.NodeClaim) (time.Duration, error) {
+	nodePoolName, ok := nodeClaim.Labels[v1.NodePoolLabelKey]
+	if !ok {
+		return registrationTimeout, nil
+	}
+	nodePool := &v1.NodePool{}
+	if err := l.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+		if errors.IsNotFound(err) {
+			return registrationTimeout, nil
+		}
+		return 0, fmt.Errorf("getting nodepool %s for the registration timeout, %w", nodePoolName, err)
+	}
+	timeout, err := RegistrationTimeoutForNodePool(nodePool)
+	if err != nil {
+		l.recorder.Publish(InvalidRegistrationTimeoutEvent(nodePool, err))
+		log.FromContext(ctx).WithValues("NodePool", klog.KObj(nodePool)).Error(err, "using the default registration timeout", "timeout", registrationTimeout)
+	}
+	return timeout, nil
 }
 
 // reconcileInitializationTimeout deletes a NodeClaim whose node registered but never initialized. Registration only
