@@ -617,6 +617,47 @@ var _ = Describe("Instance Type Selection", func() {
 		node := ExpectScheduled(ctx, env.Client, pod)
 		Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("test-instance1"))
 	})
+	It("should keep spot in the NodeClaim's capacity-type requirement when the spot offering is transiently unavailable", func() {
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+			fake.NewInstanceType("test-instance1",
+				fake.WithArchitecture("amd64"),
+				fake.WithOperatingSystems(string(corev1.Linux)),
+				fake.WithResources(corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				}),
+				fake.WithOfferings(
+					cloudprovider.Offering{
+						Available:    true,
+						Requirements: scheduler.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
+						Price:        1.0,
+					},
+					cloudprovider.Offering{
+						Available:    false,
+						Requirements: scheduler.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1a"}),
+						Price:        0.2,
+					},
+				),
+			),
+		}
+		nodePool.Spec.Template.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
+			{
+				Key:      v1.CapacityTypeLabelKey,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand},
+			},
+		}
+
+		ExpectApplied(ctx, env.Client, nodePool)
+		pod := test.UnschedulablePod()
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+		ExpectScheduled(ctx, env.Client, pod)
+		nodeClaims := ExpectNodeClaims(ctx, env.Client)
+		Expect(nodeClaims).To(HaveLen(1))
+		capacityTypes := scheduler.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(v1.CapacityTypeLabelKey)
+		Expect(capacityTypes.Has(v1.CapacityTypeSpot)).To(BeTrue(), "an unavailable-offering cooldown must not pin the claim to on-demand")
+		Expect(capacityTypes.Has(v1.CapacityTypeOnDemand)).To(BeTrue())
+	})
 	Context("MinValues", func() {
 		It("should schedule respecting the minValues from instance-type requirements", func() {
 			var instanceTypes []*cloudprovider.InstanceType

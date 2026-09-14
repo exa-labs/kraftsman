@@ -1192,6 +1192,118 @@ var _ = Describe("Drift", func() {
 			ExpectExists(ctx, env.Client, nodeClaim)
 			ExpectExists(ctx, env.Client, node)
 		})
+		It("should reclaim an expired on-demand lease ahead of older drift and pin its replacement to spot", func() {
+			labels := map[string]string{
+				"app": "test",
+			}
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			pods := test.Pods(2, test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					},
+				},
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("30")},
+				},
+			})
+
+			// nodeClaim is an on-demand node whose lease just expired; nodeClaim2 has been template-drifted for an hour.
+			nodeClaim.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeOnDemand
+			node.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeOnDemand
+			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDrifted, string(cloudprovider.DriftReasonOnDemandLeaseExpired), "lease expired")
+			nodeClaim2, node2 := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					ProviderID:  test.RandomProviderID(),
+					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
+				},
+			})
+			nodeClaim2.Status.Conditions = append(nodeClaim2.Status.Conditions, status.Condition{
+				Type:               v1.ConditionTypeDrifted,
+				Status:             metav1.ConditionTrue,
+				Reason:             v1.ConditionTypeDrifted,
+				Message:            v1.ConditionTypeDrifted,
+				LastTransitionTime: metav1.Time{Time: time.Now().Add(-time.Hour)},
+			})
+
+			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], nodeClaim, node, nodeClaim2, node2, nodePool)
+			ExpectManualBinding(ctx, env.Client, pods[0], node)
+			ExpectManualBinding(ctx, env.Client, pods[1], node2)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node, node2}, []*v1.NodeClaim{nodeClaim, nodeClaim2})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Candidates).To(HaveLen(1))
+			Expect(cmds[0].Candidates[0].NodeClaim.Name).To(Equal(nodeClaim.Name), "the lease reclaim goes ahead of the older ordinary drift")
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+			replacement := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, client.ObjectKey{Name: cmds[0].Replacements[0].Name}, replacement)).To(Succeed())
+			capacityTypes := scheduling.NewNodeSelectorRequirementsWithMinValues(replacement.Spec.Requirements...).Get(v1.CapacityTypeLabelKey)
+			Expect(capacityTypes.Values()).To(ConsistOf(v1.CapacityTypeSpot))
+
+			// The on-demand node is only removed once the spot replacement is initialized.
+			ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim, nodeClaim2)
+			ExpectNotFound(ctx, env.Client, nodeClaim, node)
+			ExpectExists(ctx, env.Client, nodeClaim2)
+		})
+		It("should not reclaim an expired on-demand lease when the replacement cannot launch spot", func() {
+			nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, v1.NodeSelectorRequirementWithMinValues{
+				Key:      v1.CapacityTypeLabelKey,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{v1.CapacityTypeOnDemand},
+			})
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "test"},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					},
+				},
+				ResourceRequirements: corev1.ResourceRequirements{
+					Requests: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("30")},
+				},
+			})
+			nodeClaim.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeOnDemand
+			node.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeOnDemand
+			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDrifted, string(cloudprovider.DriftReasonOnDemandLeaseExpired), "lease expired")
+
+			ExpectApplied(ctx, env.Client, rs, pod, nodeClaim, node, nodePool)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(HaveLen(0))
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			ExpectExists(ctx, env.Client, nodeClaim)
+		})
 	})
 
 	Context("Static NodePool", func() {

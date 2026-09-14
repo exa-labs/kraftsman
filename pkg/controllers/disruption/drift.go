@@ -22,17 +22,22 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 // Drift is a subreconciler that deletes drifted candidates.
@@ -61,9 +66,14 @@ func (d *Drift) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 
 // ComputeCommand generates a disruption command given candidates
 func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	// On-demand lease reclaims go first: they swap expensive fallback capacity for spot and would otherwise queue
+	// behind every NodeClaim a template change marked drifted at once. Within each tier, oldest drift first.
 	sort.Slice(candidates, func(i int, j int) bool {
-		return candidates[i].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time.Before(
-			candidates[j].NodeClaim.StatusConditions().Get(string(d.Reason())).LastTransitionTime.Time)
+		ci, cj := candidates[i].NodeClaim.StatusConditions().Get(string(d.Reason())), candidates[j].NodeClaim.StatusConditions().Get(string(d.Reason()))
+		if li, lj := isLeaseReclaim(ci), isLeaseReclaim(cj); li != lj {
+			return li
+		}
+		return ci.LastTransitionTime.Time.Before(cj.LastTransitionTime.Time)
 	})
 
 	emptyCandidates, nonEmptyCandidates := lo.FilterReject(candidates, func(c *Candidate, _ int) bool {
@@ -94,6 +104,13 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
+		// A lease reclaim exists only to swap on-demand for spot: pin its replacements to spot so an
+		// insufficient-capacity launch fails the command (and the on-demand node stays) instead of
+		// falling back to another on-demand node. Skip candidates whose replacements cannot be pinned.
+		if isLeaseReclaim(candidate.NodeClaim.StatusConditions().Get(string(d.Reason()))) && !pinReplacementsToSpot(results.NewNodeClaims) {
+			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "on-demand lease reclaim requires replacements that can launch spot")...)
+			continue
+		}
 
 		cmd := Command{
 			Candidates:          []*Candidate{candidate},
@@ -105,6 +122,27 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 
 	}
 	return []Command{}, nil
+}
+
+// isLeaseReclaim reports whether a Drifted condition was raised because the node is on-demand capacity whose
+// spot-fallback lease expired (cloudprovider.DriftReasonOnDemandLeaseExpired).
+func isLeaseReclaim(drifted *status.Condition) bool {
+	return drifted != nil && drifted.Reason == string(cloudprovider.DriftReasonOnDemandLeaseExpired)
+}
+
+// pinReplacementsToSpot narrows every replacement NodeClaim's capacity type to spot. It reports false, leaving
+// the claims untouched, when any replacement cannot launch spot or pinning would violate its minValues.
+func pinReplacementsToSpot(newNodeClaims []*pscheduling.NodeClaim) bool {
+	for _, nc := range newNodeClaims {
+		ctReq := nc.Requirements.Get(v1.CapacityTypeLabelKey)
+		if !ctReq.Has(v1.CapacityTypeSpot) || !satisfiesMinValues(ctReq, 1) {
+			return false
+		}
+	}
+	for _, nc := range newNodeClaims {
+		nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot))
+	}
+	return true
 }
 
 func (d *Drift) Reason() v1.DisruptionReason {
