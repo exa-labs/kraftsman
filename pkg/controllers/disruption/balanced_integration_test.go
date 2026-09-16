@@ -104,7 +104,7 @@ var _ = Describe("Balanced Consolidation", func() {
 
 			// Replace should create a cheaper node
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			nodeClaims := ExpectNodeClaims(ctx, env.Client)
@@ -236,7 +236,7 @@ var _ = Describe("Balanced Consolidation", func() {
 			Expect(len(cmds[0].Candidates)).To(BeNumerically(">=", 2))
 
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims...)
 
 			remaining := ExpectNodeClaims(ctx, env.Client)
@@ -791,7 +791,7 @@ var _ = Describe("Balanced Consolidation", func() {
 
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 			}
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, balancedNodeClaim, defaultNodeClaim)
 
