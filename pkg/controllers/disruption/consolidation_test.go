@@ -435,7 +435,7 @@ var _ = Describe("Consolidation", func() {
 			launched := &v1.NodeClaim{}
 			Expect(env.Client.Get(ctx, client.ObjectKey{Name: cmds[0].Replacements[0].Name}, launched)).To(Succeed())
 			Expect(launched.Labels[corev1.LabelInstanceTypeStable]).ToNot(BeEmpty())
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_executed_nodes_total", map[string]string{
 				metrics.NodePoolLabel:     nodePool.Name,
@@ -503,7 +503,7 @@ var _ = Describe("Consolidation", func() {
 			// Execute command, thus deleting 3 nodes
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
 		It("should allow all empty nodes to be disrupted", func() {
@@ -526,7 +526,7 @@ var _ = Describe("Consolidation", func() {
 			// Execute command, thus deleting all nodes
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(0))
 		})
 		It("should allow no empty nodes to be disrupted", func() {
@@ -591,7 +591,7 @@ var _ = Describe("Consolidation", func() {
 			// Execute command, thus deleting 3 nodes
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
 		It("should only allow 3 nodes to be deleted in single node consolidation delete", func() {
@@ -636,7 +636,7 @@ var _ = Describe("Consolidation", func() {
 			// Execute all commands in the queue, only deleting 3 nodes
 			cmds := queue.GetCommands()
 			for _, cmd := range cmds {
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 			}
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
@@ -702,7 +702,7 @@ var _ = Describe("Consolidation", func() {
 			// Execute the command in the queue, only deleting 20 node claims
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(10))
 		})
@@ -767,7 +767,7 @@ var _ = Describe("Consolidation", func() {
 			// Execute the command in the queue, deleting all node claims
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(0))
 		})
 		It("should allow no nodes from each nodePool to be deleted", func() {
@@ -1158,7 +1158,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
@@ -1247,7 +1247,7 @@ var _ = Describe("Consolidation", func() {
 				Expect(cmds).To(HaveLen(1))
 				Expect(cmds[0].Replacements).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 				nodeClaims := ExpectNodeClaims(ctx, env.Client)
 				Expect(nodeClaims).To(HaveLen(1))
@@ -1321,7 +1321,7 @@ var _ = Describe("Consolidation", func() {
 
 			// consolidation won't delete the old nodeclaim until the new nodeclaim is ready
 			ExpectSingletonReconciled(ctx, disruptionController)
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 			// shouldn't delete the node
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
@@ -1403,7 +1403,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(spotNodeClaim))
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
 
@@ -1534,7 +1534,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(spotNodeClaim))
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
 
@@ -1628,7 +1628,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(spotNodeClaim))
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
 
@@ -1836,7 +1836,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(spotNodeClaim))
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
 
@@ -1954,7 +1954,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(spotNodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
@@ -2084,7 +2084,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims...)
 
 			// Eventually expect consolidation to evaluate that it can delete one of the first two nodes
@@ -2179,7 +2179,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, spotNodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(spotNodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, spotNodeClaim)
@@ -2340,7 +2340,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -2484,7 +2484,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -2553,7 +2553,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -2644,7 +2644,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 				// Cascade any deletion of the nodeClaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
@@ -2732,7 +2732,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -3024,7 +3024,7 @@ var _ = Describe("Consolidation", func() {
 			// all replacements must be launched and initialized before the candidate is drained
 			ExpectExists(ctx, env.Client, nodeClaim)
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			nodeClaims := ExpectNodeClaims(ctx, env.Client)
@@ -3067,7 +3067,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Replacements).To(HaveLen(2))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
@@ -3209,7 +3209,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Replacements).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			nodeClaims := ExpectNodeClaims(ctx, env.Client)
@@ -3389,7 +3389,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Replacements).To(HaveLen(2))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			nodeClaims := ExpectNodeClaims(ctx, env.Client)
@@ -3438,7 +3438,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Replacements).To(HaveLen(2))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			nodeClaims := ExpectNodeClaims(ctx, env.Client)
@@ -3483,7 +3483,7 @@ var _ = Describe("Consolidation", func() {
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Replacements).To(HaveLen(2))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
@@ -3654,7 +3654,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -3731,7 +3731,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -3779,7 +3779,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Process the item so that the nodes can be deleted.
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[0])
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaims[0]))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -3835,7 +3835,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Process the item so that the nodes can be deleted.
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[0])
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaims[0]))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -3880,7 +3880,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[0])
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaims[0]))
 			// Cascade any deletion of the nodeClaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
 
@@ -3922,7 +3922,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[0])
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaims[0]))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -4062,7 +4062,7 @@ var _ = Describe("Consolidation", func() {
 			// Only nodes[0] (no annotated pods) can be consolidated
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
 
 			// nodes[0] deleted, nodes[1] still protected
@@ -4152,7 +4152,7 @@ var _ = Describe("Consolidation", func() {
 			// Invalid annotation format should not block consolidation
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
 
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -4195,7 +4195,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -4317,7 +4317,7 @@ var _ = Describe("Consolidation", func() {
 			// Now consolidation should proceed — consolidateAfter window has expired
 			cmds = queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
 
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -4388,7 +4388,7 @@ var _ = Describe("Consolidation", func() {
 			// Consolidation should succeed — destination node accepts pods regardless of time
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
 
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
@@ -4437,7 +4437,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			// Should have replaced with a cheaper node
@@ -4578,7 +4578,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, consolidatableNodeClaim)
 			// Expect no events that state that the pods would schedule against a uninitialized node
@@ -4630,7 +4630,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -4735,7 +4735,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -4850,7 +4850,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -5260,7 +5260,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -5320,7 +5320,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -5388,7 +5388,7 @@ var _ = Describe("Consolidation", func() {
 				// Process the item so that the nodes can be deleted.
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
-				ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
@@ -5467,7 +5467,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1])
@@ -5533,7 +5533,7 @@ var _ = Describe("Consolidation", func() {
 				Expect(cmds).To(HaveLen(1))
 
 				// Multi-node consolidation deletes all empty nodes
-				ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -5628,7 +5628,7 @@ var _ = Describe("Consolidation", func() {
 				// Process the item so that the nodes can be deleted.
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
-				ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0], nodeClaims[1], nodeClaims[2])
@@ -5717,7 +5717,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Process the item so that the nodes can be deleted.
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[1])
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaims[1]))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -5825,7 +5825,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -6119,7 +6119,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, reservedNodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(reservedNodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, reservedNodeClaim)
@@ -6179,7 +6179,7 @@ var _ = Describe("Consolidation", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-				ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 				// Cascade any deletion of the nodeclaim to the node
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -6259,7 +6259,7 @@ var _ = Describe("Consolidation", func() {
 			// Process the item so that the nodes can be deleted.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
-			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmds[0].Candidates[0].NodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
@@ -6297,7 +6297,7 @@ var _ = Describe("Consolidation", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 
 			// Cascade any deletion of the nodeclaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
@@ -6515,7 +6515,7 @@ var _ = Describe("Consolidation", func() {
 			// Second pass: buffer deleted → counts cleared
 			cluster.UpdateBufferPodCounts(map[string]int{})
 			ExpectSingletonReconciled(ctx, disruptionController)
-			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))

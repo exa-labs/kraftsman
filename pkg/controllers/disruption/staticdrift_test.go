@@ -126,7 +126,7 @@ var _ = Describe("StaticDrift", func() {
 			Expect(cmds).To(HaveLen(2))
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
@@ -185,7 +185,7 @@ var _ = Describe("StaticDrift", func() {
 			Expect(cmds).To(HaveLen(1))
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
@@ -341,7 +341,7 @@ var _ = Describe("StaticDrift", func() {
 			// Execute the commands
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
@@ -446,7 +446,7 @@ var _ = Describe("StaticDrift", func() {
 			Expect(cmds).To(HaveLen(2))
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
@@ -504,7 +504,7 @@ var _ = Describe("StaticDrift", func() {
 			Expect(cmds).To(HaveLen(2))
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
@@ -560,7 +560,7 @@ var _ = Describe("StaticDrift", func() {
 					ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
 					// Any point in time we should not go over limit
 					Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(6))
-					ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+					ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 					// Cascade any deletion of the nodeClaims to the nodes
 					ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
 					ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
@@ -651,7 +651,7 @@ var _ = Describe("StaticDrift", func() {
 			Expect(cmds).To(HaveLen(1))
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
@@ -804,7 +804,7 @@ var _ = Describe("StaticDrift", func() {
 			// Execute the commands
 			for _, cmd := range cmds {
 				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
-				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))

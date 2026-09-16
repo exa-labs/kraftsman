@@ -146,14 +146,16 @@ func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
 			),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 100, 1000),
 		}).
-		Complete(reconcile.AsReconciler(m.GetClient(), q))
+		Complete(q)
 }
 
-func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
+// Reconcile drives the command whose candidate NodeClaim is named by the request. The request is
+// resolved against the queue's own bookkeeping rather than the API server: a candidate can be
+// deleted out from under an in-flight command (cloud interruption, garbage collection, an operator),
+// and the command must still terminate its remaining candidates or time out and untaint them.
+func (q *Queue) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, q.Name())
-	q.RLock()
-	cmd, exists := q.ProviderIDToCommand[nodeClaim.Status.ProviderID]
-	q.RUnlock()
+	cmd, exists := q.commandForNodeClaim(req.Name)
 	if !exists {
 		log.FromContext(ctx).Error(fmt.Errorf("no command found"), "")
 		return reconcile.Result{}, nil
@@ -195,6 +197,18 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 	}
 	q.CompleteCommand(cmd)
 	return reconcile.Result{}, nil
+}
+
+// commandForNodeClaim finds the in-flight command that has a candidate with the given NodeClaim name.
+func (q *Queue) commandForNodeClaim(name string) (*Command, bool) {
+	q.RLock()
+	defer q.RUnlock()
+	for _, cmd := range q.ProviderIDToCommand {
+		if lo.ContainsBy(cmd.Candidates, func(c *Candidate) bool { return c.NodeClaim.Name == name }) {
+			return cmd, true
+		}
+	}
+	return nil, false
 }
 
 // waitOrTerminate will wait until launched nodeclaims are ready.

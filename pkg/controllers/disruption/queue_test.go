@@ -112,7 +112,7 @@ var _ = Describe("Queue", func() {
 			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
 			Expect(node1.Spec.Taints).To(ContainElement(v1.DisruptedNoScheduleTaint))
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 
 			// Update state
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
@@ -142,7 +142,7 @@ var _ = Describe("Queue", func() {
 				Replacements:      replacements,
 			}
 			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue()) // Expect the command to still be in the queue
 		})
 		It("should not return an error when the NodeClaim doesn't exist but the NodeCliam is in cluster state", func() {
@@ -173,7 +173,7 @@ var _ = Describe("Queue", func() {
 			replacementNodeClaim, _ = ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim)
 
 			cluster.UpdateNodeClaim(replacementNodeClaim)
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue()) // Expect the command to still be in the queue
 		})
 		It("should keep the candidate and untaint it when a replacement is deleted before initializing", func() {
@@ -206,7 +206,7 @@ var _ = Describe("Queue", func() {
 			ExpectDeleted(ctx, env.Client, replacementNodeClaim)
 			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(replacementNodeClaim))
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(queue.HasAny(stateNode.ProviderID())).To(BeFalse())
 			Expect(cmd.Succeeded).To(BeFalse())
 			Expect(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1).MarkedForDeletion()).To(BeFalse())
@@ -240,7 +240,7 @@ var _ = Describe("Queue", func() {
 			// Step the clock to trigger the timeout.
 			env.Clock.Step(11 * time.Minute)
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
 			Expect(node1.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
 		})
@@ -271,7 +271,7 @@ var _ = Describe("Queue", func() {
 			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacementNodeClaim))
 			replacementNodeClaim, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim)
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			// Get the command
 			Expect(cmd.Replacements[0].Initialized).To(BeFalse())
 
@@ -281,7 +281,7 @@ var _ = Describe("Queue", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
 				[]*corev1.Node{replacementNode}, []*v1.NodeClaim{replacementNodeClaim})
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeTrue())
 
 			terminatingEvents := disruptionevents.Terminating(node1, nodeClaim1, string(cmd.Reason()))
@@ -291,6 +291,58 @@ var _ = Describe("Queue", func() {
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim1)
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim1, node1)
+		})
+		It("should finish a command when the candidate keying the queue is deleted out-of-band before the replacement initializes", func() {
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+			stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
+
+			nct := scheduling.NewNodeClaimTemplate(nodePool)
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			replacements := []*disruption.Replacement{
+				{
+					NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct},
+				},
+			}
+
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}, {StateNode: stateNode2, NodePool: nodePool}},
+				Replacements:      replacements,
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
+
+			// The first candidate (the one the queue keys its reconciles on) is interrupted and
+			// garbage collected while the replacement is still launching.
+			ExpectDeleted(ctx, env.Client, nodeClaim1, node1)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim1))
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
+
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim1))
+			Expect(queue.HasAny(stateNode2.ProviderID())).To(BeTrue())
+			node2 = ExpectNodeExists(ctx, env.Client, node2.Name)
+			Expect(node2.Spec.Taints).To(ContainElement(v1.DisruptedNoScheduleTaint))
+
+			replacementNodeClaim := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacementNodeClaim)).To(Succeed())
+			replacementNodeClaim, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+				[]*corev1.Node{replacementNode}, []*v1.NodeClaim{replacementNodeClaim})
+
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim1))
+			Expect(cmd.Succeeded).To(BeTrue())
+			Expect(queue.HasAny(stateNode.ProviderID(), stateNode2.ProviderID())).To(BeFalse())
+
+			terminatingEvents := disruptionevents.Terminating(node2, nodeClaim2, string(cmd.Reason()))
+			Expect(recorder.DetectedEvent(terminatingEvents[0].Message)).To(BeTrue())
+			Expect(recorder.DetectedEvent(terminatingEvents[1].Message)).To(BeTrue())
+
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim2)
+			ExpectNotFound(ctx, env.Client, nodeClaim2, node2)
 		})
 		It("should only finish a command when all replacements are initialized", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
@@ -327,21 +379,21 @@ var _ = Describe("Queue", func() {
 			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[1].Name}, replacementNodeClaim2))
 			replacementNodeClaim2, replacementNode2 := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim2)
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeFalse())
 			Expect(recorder.DetectedEvent(disruptionevents.WaitingOnReadiness(nodeClaim1).Message)).To(BeTrue())
 			Expect(cmd.Replacements[1].Initialized).To(BeFalse())
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{replacementNode1}, []*v1.NodeClaim{replacementNodeClaim1})
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeTrue())
 			Expect(cmd.Replacements[1].Initialized).To(BeFalse())
 			Expect(recorder.DetectedEvent(disruptionevents.WaitingOnReadiness(nodeClaim1).Message)).To(BeTrue())
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{replacementNode2}, []*v1.NodeClaim{replacementNodeClaim2})
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeTrue())
 			Expect(cmd.Replacements[1].Initialized).To(BeTrue())
 
@@ -364,7 +416,7 @@ var _ = Describe("Queue", func() {
 			}
 			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
 
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 
 			terminatingEvents := disruptionevents.Terminating(node1, nodeClaim1, string(cmd.Reason()))
 			Expect(recorder.DetectedEvent(terminatingEvents[0].Message)).To(BeTrue())
@@ -419,7 +471,7 @@ var _ = Describe("Queue", func() {
 			replacementNodeClaim2, replacementNode2 := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim2)
 
 			// Reconcile the first command and expect nothing to be initialized
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(stateNode.NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeFalse())
 			Expect(recorder.DetectedEvent(disruptionevents.WaitingOnReadiness(nodeClaim1).Message)).To(BeTrue())
 			Expect(cmd2.Replacements[0].Initialized).To(BeFalse())
@@ -428,14 +480,14 @@ var _ = Describe("Queue", func() {
 			// Make the first command's node initialized
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{replacementNode1}, []*v1.NodeClaim{replacementNodeClaim1})
 			// Reconcile the second command and expect nothing to be initialized
-			ExpectObjectReconciled(ctx, env.Client, queue, cmd2.Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd2.Candidates[0].NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeFalse())
 			Expect(recorder.DetectedEvent(disruptionevents.WaitingOnReadiness(nodeClaim1).Message)).To(BeTrue())
 			Expect(cmd2.Replacements[0].Initialized).To(BeFalse())
 			Expect(recorder.DetectedEvent(disruptionevents.WaitingOnReadiness(nodeClaim2).Message)).To(BeTrue())
 
 			// Reconcile the first command and expect the replacement to be initialized
-			ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd.Candidates[0].NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeTrue())
 			Expect(cmd2.Replacements[0].Initialized).To(BeFalse())
 
@@ -446,7 +498,7 @@ var _ = Describe("Queue", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{replacementNode2}, []*v1.NodeClaim{replacementNodeClaim2})
 
 			// Reconcile the second command and expect the replacement to be initialized
-			ExpectObjectReconciled(ctx, env.Client, queue, cmd2.Candidates[0].NodeClaim)
+			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(cmd2.Candidates[0].NodeClaim))
 			Expect(cmd.Replacements[0].Initialized).To(BeTrue())
 			Expect(cmd2.Replacements[0].Initialized).To(BeTrue())
 
