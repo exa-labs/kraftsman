@@ -216,10 +216,7 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if o.CPURequests <= 0 {
 		o.CPURequests = 1000
 	}
-	if err := o.validateLeaderElection(); err != nil {
-		return err
-	}
-	if err := o.validateConsolidation(); err != nil {
+	if err := errors.Join(o.validateLeaderElection(), o.validateConsolidation()); err != nil {
 		return err
 	}
 	if !lo.Contains([]TopologyCountCacheMode{TopologyCountCacheModeOff, TopologyCountCacheModeShadow, TopologyCountCacheModeOn}, TopologyCountCacheMode(o.topologyCountCacheModeRaw)) {
