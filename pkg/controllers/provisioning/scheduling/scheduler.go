@@ -784,18 +784,7 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 	if len(s.nodeClaimTemplates) == 0 {
 		return
 	}
-	var firstFit, cheapest *inflightPlacement
-	for _, candidate := range s.inflightPlacements(ctx, pod) {
-		if candidate == nil {
-			continue
-		}
-		if firstFit == nil {
-			firstFit = candidate
-		}
-		if cheapest == nil || cheaperThan(candidate.delta, cheapest.delta) {
-			cheapest = candidate
-		}
-	}
+	firstFit, cheapest := s.firstAndCheapestInflight(ctx, pod)
 	// No in-flight NodeClaim fits: binpack and marginal-cost both open a new one.
 	if cheapest == nil {
 		nodePool := ""
@@ -832,6 +821,23 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 		return
 	}
 	PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: firstFit.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeSameInflight})
+}
+
+// firstAndCheapestInflight returns the first in-flight NodeClaim that fits pod (binpack's choice) and the one
+// with the smallest marginal-cost delta; both are nil when nothing in flight fits.
+func (s *Scheduler) firstAndCheapestInflight(ctx context.Context, pod *corev1.Pod) (firstFit, cheapest *inflightPlacement) {
+	for _, candidate := range s.inflightPlacements(ctx, pod) {
+		if candidate == nil {
+			continue
+		}
+		if firstFit == nil {
+			firstFit = candidate
+		}
+		if cheapest == nil || cheaperThan(candidate.delta, cheapest.delta) {
+			cheapest = candidate
+		}
+	}
+	return firstFit, cheapest
 }
 
 // evaluateFreshPlacement prices the new NodeClaim marginal-cost would open for pod; ok is false when no
