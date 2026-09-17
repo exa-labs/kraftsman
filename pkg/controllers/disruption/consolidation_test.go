@@ -3190,6 +3190,36 @@ var _ = Describe("Consolidation", func() {
 			Expect(queue.GetCommands()).To(BeEmpty())
 			ExpectExists(ctx, env.Client, nodeClaim)
 		})
+		It("shadows the retry it would have made while od-to-spot is disabled", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidationShadow: lo.ToPtr(true)}))
+			disruption.ConsolidationODToSpotShadowTotal.Reset()
+			disruption.ConsolidationODToSpotRetryTotal.Reset()
+			applyPackedNode()
+			recorder.Reset()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotShadowTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotRetryOutcomeArmed,
+			})
+			ExpectMetricCounterValue(disruption.ConsolidationODToSpotShadowTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.ODToSpotShadowOutcomeWouldAdmit,
+			})
+			// the live counter stays untouched and the candidate still gets the unarmed skip event
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_od_to_spot_retries_total", map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			Expect(found).To(BeFalse())
+			_, ok := lo.Find(recorder.Events(), func(e events.Event) bool {
+				return strings.Contains(e.Message, "Can't replace with a cheaper node")
+			})
+			Expect(ok).To(BeTrue())
+		})
 		It("replaces an on-demand node with a spot node pinned to the cheap zones", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ODToSpotConsolidation: lo.ToPtr(true)}))
 			applyPackedNode()
@@ -3376,6 +3406,41 @@ var _ = Describe("Consolidation", func() {
 			Expect(queue.GetCommands()).To(BeEmpty())
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 			ExpectExists(ctx, env.Client, nodeClaim)
+		})
+		It("shadows the split it would have made while the fallback is disabled", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				MaxConsolidationReplacements: lo.ToPtr(3),
+				ConsolidationSplitShadow:     lo.ToPtr(true),
+			}))
+			disruption.ConsolidationSplitShadowTotal.Reset()
+			disruption.ConsolidationSplitAttemptsTotal.Reset()
+			applyTwoPodNode()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectMetricCounterValue(disruption.ConsolidationSplitShadowTotal, 1, map[string]string{
+				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
+				metrics.NodePoolLabel:             nodePool.Name,
+				"outcome":                         disruption.SplitOutcomeWouldSplit,
+			})
+			// the live attempt counter must stay untouched so the shadow readout can't be mistaken for action
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_split_attempts_total", map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			Expect(found).To(BeFalse())
+		})
+		It("observes no shadow verdict while the shadow is off", func() {
+			disruption.ConsolidationSplitShadowTotal.Reset()
+			applyTwoPodNode()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_split_shadow_total", map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			Expect(found).To(BeFalse())
 		})
 		It("splits a node no cheaper single replacement can absorb", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{

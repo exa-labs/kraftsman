@@ -2007,6 +2007,66 @@ var _ = Context("Scheduling", func() {
 				Expect(cloudProvider.CreateCalls[0].Labels[v1.NodePoolLabelKey]).To(Equal(binpackPool.Name))
 			})
 		})
+		Context("marginal-cost-shadow", func() {
+			BeforeEach(func() {
+				nodePool.Annotations = map[string]string{v1.NodePoolPackingPolicyAnnotationKey: "marginal-cost-shadow"}
+				scheduling.PackingShadowDecisionsTotal.Reset()
+			})
+			It("should act as binpack while counting where marginal-cost would diverge", func() {
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(2)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				// binpack packs both pods onto one node, but the second would have opened a new one-device
+				// NodeClaim under marginal-cost: growing to six-device costs $9 where a fresh one-device is $1
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"six-device": 1}))
+				Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+				ExpectMetricCounterValue(scheduling.PackingShadowDecisionsTotal, 1, map[string]string{
+					"nodepool": nodePool.Name,
+					"outcome":  "same_new",
+				})
+				ExpectMetricCounterValue(scheduling.PackingShadowDecisionsTotal, 1, map[string]string{
+					"nodepool": nodePool.Name,
+					"outcome":  "would_open_new",
+				})
+			})
+			It("should count same_inflight when marginal-cost would pack the same way", func() {
+				// linear pricing: growing the in-flight NodeClaim costs exactly a fresh one-device, so the
+				// tie keeps the in-flight NodeClaim under marginal-cost too
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+					acceleratorType("one-device", 1, 1),
+					acceleratorType("two-device", 2, 2),
+					acceleratorType("four-device", 4, 4),
+				}
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(2)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"two-device": 1}))
+				ExpectMetricCounterValue(scheduling.PackingShadowDecisionsTotal, 1, map[string]string{
+					"nodepool": nodePool.Name,
+					"outcome":  "same_inflight",
+				})
+			})
+			It("should emit nothing once a live marginal-cost NodePool exists", func() {
+				marginalPool := test.NodePool(v1.NodePool{
+					Spec: v1.NodePoolSpec{
+						Weight: lo.ToPtr[int32](100),
+						Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{Requirements: []v1.NodeSelectorRequirementWithMinValues{{
+							Key:      v1.CapacityTypeLabelKey,
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand},
+						}}}},
+					},
+				})
+				marginalPool.Annotations = map[string]string{v1.NodePoolPackingPolicyAnnotationKey: "marginal-cost"}
+				ExpectApplied(ctx, env.Client, nodePool, marginalPool)
+				pods := oneDevicePods(2)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				_, found := FindMetricWithLabelValues("karpenter_scheduler_packing_shadow_decisions_total", map[string]string{
+					"nodepool": nodePool.Name,
+				})
+				Expect(found).To(BeFalse())
+			})
+		})
 	})
 
 	Describe("In-Flight Nodes", func() {

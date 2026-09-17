@@ -179,6 +179,9 @@ const (
 	SplitOutcomeNoOp                = "no_op"
 	SplitOutcomeError               = "error"
 	SplitOutcomeAttemptCapExhausted = "attempt_cap_exhausted"
+	// SplitOutcomeWouldSplit means a shadow split simulation produced a replace command the live
+	// fallback would have taken; counted instead of acted on.
+	SplitOutcomeWouldSplit = "would_split"
 
 	// ODToSpotRetryOutcomeArmed means the ordinary price filter emptied the replacement claims and
 	// started the spot-only repricing retry.
@@ -193,6 +196,10 @@ const (
 	ODToSpotRetryOutcomeZoneMinValues = "zone_min_values"
 	// ODToSpotRetryOutcomeAggregatePrice means the final aggregate price filter rejected the retry.
 	ODToSpotRetryOutcomeAggregatePrice = "aggregate_price"
+
+	// ODToSpotShadowOutcomeWouldAdmit means the shadow spot-only repricing retry produced a command
+	// the live feature would have taken; counted instead of acted on.
+	ODToSpotShadowOutcomeWouldAdmit = "would_admit"
 )
 
 var (
@@ -539,6 +546,26 @@ var (
 		},
 		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, outcomeLabel},
 	)
+	ConsolidationSplitShadowTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_split_shadow_total",
+			Help:      "Number of shadow split fallback simulations by consolidation type, NodePool, and outcome. Runs only while consolidation-split-fallback is off and consolidation-split-shadow is on: each outcome is what the fallback would have found - would_split counts candidates the live fallback would turn into replace commands. The evidence to collect before enabling the fallback.",
+		},
+		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, outcomeLabel},
+	)
+	ConsolidationODToSpotShadowTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_od_to_spot_shadow_total",
+			Help:      "Number of shadow on-demand to spot repricing retries by outcome, consolidation type, and NodePool. Runs only while od-to-spot-consolidation is off and od-to-spot-consolidation-shadow is on: armed means the ordinary price filter emptied the replacements and the retry ran, would_admit means the live retry would have produced a command, and the rejection outcomes are the live retry's, so the would_admit share of armed predicts the real retry's admission rate.",
+		},
+		[]string{ConsolidationTypeLabel, metrics.NodePoolLabel, outcomeLabel},
+	)
 	ConsolidationODToSpotRetryTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
@@ -798,6 +825,28 @@ func ObserveConsolidationCandidateSkip(consolidationType, nodePool, instanceType
 		metrics.CapacityTypeLabel: orUnknown(capacityType),
 		reasonLabel:               reason,
 	})
+}
+
+// ObserveConsolidationSplitShadowAttempt records a shadow split simulation: what the split fallback
+// would have decided for the candidate while acting disabled.
+func ObserveConsolidationSplitShadowAttempt(ctx context.Context, nodePool, outcome string) {
+	ConsolidationSplitShadowTotal.Inc(map[string]string{
+		ConsolidationTypeLabel: consolidationTypeFromContext(ctx),
+		metrics.NodePoolLabel:  nodePool,
+		outcomeLabel:           outcome,
+	})
+}
+
+// ObserveConsolidationODToSpotShadow records a shadow spot-only repricing verdict while
+// od-to-spot-consolidation is disabled, one observation per candidate like the live counter.
+func ObserveConsolidationODToSpotShadow(consolidationType string, candidates []*Candidate, outcome string) {
+	for _, candidate := range candidates {
+		ConsolidationODToSpotShadowTotal.Inc(map[string]string{
+			ConsolidationTypeLabel: consolidationType,
+			metrics.NodePoolLabel:  candidate.NodePool.Name,
+			outcomeLabel:           outcome,
+		})
+	}
 }
 
 func ObserveConsolidationODToSpotRetry(consolidationType string, candidates []*Candidate, outcome string) {

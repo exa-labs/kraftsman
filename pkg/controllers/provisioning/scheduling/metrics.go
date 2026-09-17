@@ -51,6 +51,11 @@ const (
 	packingOutcomeInflightUnpriced = "inflight_unpriced"
 	packingOutcomeNew              = "new"
 
+	packingShadowOutcomeSameNew              = "same_new"
+	packingShadowOutcomeWouldOpenNew         = "would_open_new"
+	packingShadowOutcomeWouldJoinOtherInflight = "would_join_other_inflight"
+	packingShadowOutcomeSameInflight         = "same_inflight"
+
 	fingerprintModeRevision = "revision"
 	fingerprintModeContent  = "content"
 	fingerprintModeMixed    = "mixed"
@@ -246,6 +251,19 @@ var (
 			Subsystem: schedulerSubsystem,
 			Name:      "packing_decisions_total",
 			Help:      "Number of pods placed by the marginal-cost packing policy by outcome (inflight: joined an in-flight NodeClaim, new: opened a new NodeClaim because that was cheaper, inflight_unpriced: joined an in-flight NodeClaim because a launch price was unavailable).",
+		},
+		[]string{
+			metrics.NodePoolLabel,
+			outcomeLabel,
+		},
+	)
+	PackingShadowDecisionsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "packing_shadow_decisions_total",
+			Help:      "Per-pod counterfactual of the marginal-cost-shadow packing policy: the decision marginal-cost would have made for the pod compared against what binpack actually did (same_new: both open a NodeClaim, same_inflight: both join the same in-flight NodeClaim, would_join_other_inflight: marginal-cost would have joined a different in-flight NodeClaim, would_open_new: marginal-cost would have opened a new NodeClaim where binpack joined an in-flight one). Labeled by the NodePool of the marginal-cost choice. Emitted only while no live marginal-cost NodePool exists; with one present every pod is genuinely priced and the verdicts land in packing_decisions_total.",
 		},
 		[]string{
 			metrics.NodePoolLabel,

@@ -53,6 +53,8 @@ type OptionsFields struct {
 	MaxConsolidationReplacements        *int
 	MaxConsolidationCommandsPerPass     *int
 	ConsolidationSplitFallback          *bool
+	ConsolidationSplitShadow            *bool
+	ConsolidationSplitShadowMaxReplacements *int
 	ConsolidationSplitMaxAttempts       *int
 	ConsolidationSplitMinSavings        *float64
 	ConsolidationReplaceMinSavings      *float64
@@ -63,7 +65,9 @@ type OptionsFields struct {
 	ConsolidationNegativeCacheTTL       *time.Duration
 	DisruptionUnprovisionablePodTTL     *time.Duration
 	NodeClaimInitializationTimeout      *time.Duration
+	NodeClaimInitializationTimeoutShadow *bool
 	ODToSpotConsolidation               *bool
+	ODToSpotConsolidationShadow         *bool
 	TopologyCountCacheMode              *options.TopologyCountCacheMode
 	FeatureGates                        FeatureGates
 }
@@ -109,6 +113,8 @@ func Options(overrides ...OptionsFields) *options.Options {
 		MaxConsolidationReplacements:     lo.FromPtrOr(opts.MaxConsolidationReplacements, 1),
 		MaxConsolidationCommandsPerPass:  lo.FromPtrOr(opts.MaxConsolidationCommandsPerPass, 1),
 		ConsolidationSplitFallback:       lo.FromPtrOr(opts.ConsolidationSplitFallback, false),
+		ConsolidationSplitShadow:        lo.FromPtrOr(opts.ConsolidationSplitShadow, false),
+		ConsolidationSplitShadowMaxReplacements: lo.FromPtrOr(opts.ConsolidationSplitShadowMaxReplacements, 8),
 		ConsolidationSplitMaxAttempts:    lo.FromPtrOr(opts.ConsolidationSplitMaxAttempts, 50),
 		ConsolidationSplitMinSavings:     lo.FromPtrOr(opts.ConsolidationSplitMinSavings, 0.05),
 		ConsolidationReplaceMinSavings:   lo.FromPtrOr(opts.ConsolidationReplaceMinSavings, 0),
@@ -121,7 +127,9 @@ func Options(overrides ...OptionsFields) *options.Options {
 		ConsolidationNegativeCacheTTL:       lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
 		DisruptionUnprovisionablePodTTL:     lo.FromPtrOr(opts.DisruptionUnprovisionablePodTTL, 2*time.Minute),
 		NodeClaimInitializationTimeout:      lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
+		NodeClaimInitializationTimeoutShadow: lo.FromPtrOr(opts.NodeClaimInitializationTimeoutShadow, false),
 		ODToSpotConsolidation:               lo.FromPtrOr(opts.ODToSpotConsolidation, false),
+		ODToSpotConsolidationShadow:         lo.FromPtrOr(opts.ODToSpotConsolidationShadow, false),
 		TopologyCountCacheMode:              lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
 		FeatureGates: options.FeatureGates{
 			NodeRepair:              lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),

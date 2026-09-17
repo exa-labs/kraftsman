@@ -37,6 +37,7 @@ func TestPackingPolicyForNodePool(t *testing.T) {
 		{annotation: ptr(""), want: PackingPolicyBinpack},
 		{annotation: ptr("binpack"), want: PackingPolicyBinpack},
 		{annotation: ptr("marginal-cost"), want: PackingPolicyMarginalCost},
+		{annotation: ptr("marginal-cost-shadow"), want: PackingPolicyMarginalCostShadow},
 		{annotation: ptr("Marginal-Cost"), want: PackingPolicyBinpack, wantErr: true},
 		{annotation: ptr("cheapest"), want: PackingPolicyBinpack, wantErr: true},
 	} {
