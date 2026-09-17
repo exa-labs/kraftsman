@@ -391,7 +391,7 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 			if !simOpts.silent {
 				ObserveConsolidationODToSpotRetry(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
 			}
-			if c.retrySpotOnlyReplacements(ctx, consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, nil) {
+			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, nil) {
 				cmd := Command{
 					Candidates:            candidates,
 					Replacements:          replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -479,7 +479,7 @@ func (c *consolidation) shadowODToSpotRetry(ctx context.Context, consolidationTy
 	ObserveConsolidationODToSpotShadow(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
 	silentOpts := simOpts
 	silentOpts.silent = true
-	if c.retrySpotOnlyReplacements(ctx, consolidationType, silentOpts, candidates, newNodeClaims, snapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, func(outcome string) {
+	if c.retrySpotOnlyReplacements(consolidationType, silentOpts, candidates, newNodeClaims, snapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, func(outcome string) {
 		ObserveConsolidationODToSpotShadow(consolidationType, candidates, lo.Ternary(outcome == ODToSpotRetryOutcomeAdmitted, ODToSpotShadowOutcomeWouldAdmit, outcome))
 	}) {
 		log.FromContext(ctx).WithValues(
@@ -497,7 +497,7 @@ func (c *consolidation) shadowODToSpotRetry(ctx context.Context, consolidationTy
 	}
 }
 
-func (c *consolidation) retrySpotOnlyReplacements(ctx context.Context, consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, spotLaunchCap int, observe func(outcome string)) bool {
+func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, spotLaunchCap int, observe func(outcome string)) bool {
 	observeOutcome := func(outcome string) {
 		if observe != nil {
 			observe(outcome)

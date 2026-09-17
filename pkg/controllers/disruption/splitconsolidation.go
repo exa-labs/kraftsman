@@ -100,29 +100,41 @@ func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts conso
 	if !ok || (!live && !shadow) {
 		return Command{}, false
 	}
-	// No budget on the context means this simulation is not part of a budgeted pass at all, which is
-	// a different condition from a pass that spent its cap and must not be reported as one.
+	if !acquireSplitAttempt(ctx, candidate, shadow) {
+		return Command{}, false
+	}
+	if shadow {
+		c.shadowSplit(ctx, opts, candidate, candidatePrice)
+		return Command{}, false
+	}
+	return c.liveSplit(ctx, opts, candidate, candidatePrice)
+}
+
+// acquireSplitAttempt draws one attempt from the pass's split budget and reports the exhaust condition on the
+// right counter. No budget on the context means this simulation is not part of a budgeted pass at all, which is
+// a different condition from a pass that spent its cap and must not be reported as one.
+func acquireSplitAttempt(ctx context.Context, candidate *Candidate, shadow bool) bool {
 	budget := SplitAttemptBudgetFromContext(ctx)
 	if budget == nil {
-		return Command{}, false
+		return false
 	}
-	if !budget.TryAcquire() {
-		if shadow {
-			ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeAttemptCapExhausted)
-		} else {
-			ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeAttemptCapExhausted)
-			// The pass's attempt budget, not the candidate, decided this no-op: a fresh pass would
-			// have run the split, so the verdict must not outlive the pass.
-			markNoOpInconclusive(ctx)
-		}
-		return Command{}, false
+	if budget.TryAcquire() {
+		return true
 	}
-
-	start := time.Now()
-	maxReplacements := 0
 	if shadow {
-		maxReplacements = opts.ConsolidationSplitShadowMaxReplacements
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeAttemptCapExhausted)
+	} else {
+		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeAttemptCapExhausted)
+		// The pass's attempt budget, not the candidate, decided this no-op: a fresh pass would
+		// have run the split, so the verdict must not outlive the pass.
+		markNoOpInconclusive(ctx)
 	}
+	return false
+}
+
+// splitSimulation runs the 1->N simulation both the live fallback and the shadow path share.
+func (c *consolidation) splitSimulation(ctx context.Context, opts *options.Options, candidate *Candidate, candidatePrice float64, maxReplacements int) (Command, error) {
+	start := time.Now()
 	cmd, err := c.computeConsolidationWithOptions(ctx, consolidationSimulationOptions{
 		newCapacityPriceLimit: candidatePrice,
 		// The split margin guards against trading one node for several; the replace floor is the
@@ -132,20 +144,11 @@ func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts conso
 		silent:          true,
 	}, candidate)
 	ObserveConsolidationSplitDuration(ctx, candidate.NodePool.Name, time.Since(start))
+	return cmd, err
+}
 
-	if shadow {
-		switch {
-		case err != nil:
-			ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeError)
-		case cmd.Decision() != ReplaceDecision:
-			ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeNoOp)
-		default:
-			ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeWouldSplit)
-			logShadowSplit(ctx, candidate, candidatePrice, cmd)
-		}
-		return Command{}, false
-	}
-
+func (c *consolidation) liveSplit(ctx context.Context, opts *options.Options, candidate *Candidate, candidatePrice float64) (Command, bool) {
+	cmd, err := c.splitSimulation(ctx, opts, candidate, candidatePrice, 0)
 	switch {
 	case err != nil:
 		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeError)
@@ -157,6 +160,19 @@ func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts conso
 	default:
 		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeCommand)
 		return cmd, true
+	}
+}
+
+func (c *consolidation) shadowSplit(ctx context.Context, opts *options.Options, candidate *Candidate, candidatePrice float64) {
+	cmd, err := c.splitSimulation(ctx, opts, candidate, candidatePrice, opts.ConsolidationSplitShadowMaxReplacements)
+	switch {
+	case err != nil:
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeError)
+	case cmd.Decision() != ReplaceDecision:
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeNoOp)
+	default:
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeWouldSplit)
+		logShadowSplit(ctx, candidate, candidatePrice, cmd)
 	}
 }
 

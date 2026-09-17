@@ -799,7 +799,7 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 	// No in-flight NodeClaim fits: binpack and marginal-cost both open a new one.
 	if cheapest == nil {
 		nodePool := ""
-		if fresh, err := s.evaluateNewNodeClaim(ctx, pod); err == nil {
+		if fresh, _, ok := s.evaluateFreshPlacement(ctx, pod); ok {
 			nodePool = fresh.nodeClaim.NodePoolName
 		}
 		PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: nodePool, outcomeLabel: packingShadowOutcomeSameNew})
@@ -808,18 +808,16 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 	// Marginal-cost would open a new NodeClaim only when growing the cheapest in-flight option costs more than a
 	// fresh launch; binpack joins firstFit regardless.
 	if cheapest.delta > 0 {
-		if fresh, err := s.evaluateNewNodeClaim(ctx, pod); err == nil {
-			if price, ok := launchPrice(fresh.instanceTypes, fresh.requirements, fresh.offeringsToReserve); ok && cheaperThan(price, cheapest.delta) {
-				PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeWouldOpenNew})
-				log.FromContext(ctx).V(1).WithValues(
-					"Pod", klog.KObj(pod),
-					"binpackNodeClaim", klog.KRef("", firstFit.nodeClaim.Name),
-					"binpackNodeClaimDelta", firstFit.delta,
-					"cheapestDelta", cheapest.delta,
-					"newNodeClaimPrice", price,
-				).Info("marginal-cost would open a new NodeClaim where binpack joined an in-flight one")
-				return
-			}
+		if fresh, price, ok := s.evaluateFreshPlacement(ctx, pod); ok && cheaperThan(price, cheapest.delta) {
+			PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeWouldOpenNew})
+			log.FromContext(ctx).V(1).WithValues(
+				"Pod", klog.KObj(pod),
+				"binpackNodeClaim", klog.KRef("", firstFit.nodeClaim.Name),
+				"binpackNodeClaimDelta", firstFit.delta,
+				"cheapestDelta", cheapest.delta,
+				"newNodeClaimPrice", price,
+			).Info("marginal-cost would open a new NodeClaim where binpack joined an in-flight one")
+			return
 		}
 	}
 	if cheapest.nodeClaim != firstFit.nodeClaim {
@@ -834,6 +832,17 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 		return
 	}
 	PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: firstFit.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeSameInflight})
+}
+
+// evaluateFreshPlacement prices the new NodeClaim marginal-cost would open for pod; ok is false when no
+// template can be evaluated or when the result has no priced offering.
+func (s *Scheduler) evaluateFreshPlacement(ctx context.Context, pod *corev1.Pod) (fresh *placement, price float64, ok bool) {
+	fresh, err := s.evaluateNewNodeClaim(ctx, pod)
+	if err != nil {
+		return nil, 0, false
+	}
+	price, ok = launchPrice(fresh.instanceTypes, fresh.requirements, fresh.offeringsToReserve)
+	return fresh, price, ok
 }
 
 func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error {
