@@ -56,6 +56,9 @@ var _ = Describe("Options", func() {
 		"DISABLE_LEADER_ELECTION",
 		"DISABLE_CLUSTER_STATE_OBSERVABILITY",
 		"LEADER_ELECTION_NAMESPACE",
+		"LEADER_ELECTION_LEASE_DURATION",
+		"LEADER_ELECTION_RENEW_DEADLINE",
+		"LEADER_ELECTION_RETRY_PERIOD",
 		"MEMORY_LIMIT",
 		"LOG_LEVEL",
 		"LOG_OUTPUT_PATHS",
@@ -155,6 +158,9 @@ var _ = Describe("Options", func() {
 				"--disable-cluster-state-observability=true",
 				"--leader-election-name=karpenter-controller",
 				"--leader-election-namespace=karpenter",
+				"--leader-election-lease-duration", "60s",
+				"--leader-election-renew-deadline", "40s",
+				"--leader-election-retry-period", "5s",
 				"--memory-limit", "0",
 				"--log-level", "debug",
 				"--log-output-paths", "/etc/k8s/test",
@@ -178,6 +184,9 @@ var _ = Describe("Options", func() {
 				DisableClusterStateObservability: new(true),
 				LeaderElectionName:               new("karpenter-controller"),
 				LeaderElectionNamespace:          new("karpenter"),
+				LeaderElectionLeaseDuration:      lo.ToPtr(60 * time.Second),
+				LeaderElectionRenewDeadline:      lo.ToPtr(40 * time.Second),
+				LeaderElectionRetryPeriod:        lo.ToPtr(5 * time.Second),
 				MemoryLimit:                      lo.ToPtr[int64](0),
 				LogLevel:                         new("debug"),
 				LogOutputPaths:                   new("/etc/k8s/test"),
@@ -210,6 +219,9 @@ var _ = Describe("Options", func() {
 			os.Setenv("DISABLE_CLUSTER_STATE_OBSERVABILITY", "true")
 			os.Setenv("LEADER_ELECTION_NAME", "karpenter-controller")
 			os.Setenv("LEADER_ELECTION_NAMESPACE", "karpenter")
+			os.Setenv("LEADER_ELECTION_LEASE_DURATION", "60s")
+			os.Setenv("LEADER_ELECTION_RENEW_DEADLINE", "40s")
+			os.Setenv("LEADER_ELECTION_RETRY_PERIOD", "5s")
 			os.Setenv("MEMORY_LIMIT", "0")
 			os.Setenv("LOG_LEVEL", "debug")
 			os.Setenv("LOG_OUTPUT_PATHS", "/etc/k8s/test")
@@ -237,6 +249,9 @@ var _ = Describe("Options", func() {
 				DisableClusterStateObservability: new(true),
 				LeaderElectionName:               new("karpenter-controller"),
 				LeaderElectionNamespace:          new("karpenter"),
+				LeaderElectionLeaseDuration:      lo.ToPtr(60 * time.Second),
+				LeaderElectionRenewDeadline:      lo.ToPtr(40 * time.Second),
+				LeaderElectionRetryPeriod:        lo.ToPtr(5 * time.Second),
 				MemoryLimit:                      lo.ToPtr[int64](0),
 				LogLevel:                         new("debug"),
 				LogOutputPaths:                   new("/etc/k8s/test"),
@@ -317,6 +332,27 @@ var _ = Describe("Options", func() {
 				IgnoreDRARequests: new(true),
 			}))
 		})
+
+		It("should default the leader election timings to controller-runtime's", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.LeaderElectionLeaseDuration).To(Equal(15 * time.Second))
+			Expect(opts.LeaderElectionRenewDeadline).To(Equal(10 * time.Second))
+			Expect(opts.LeaderElectionRetryPeriod).To(Equal(2 * time.Second))
+		})
+
+		DescribeTable("should fail validation when the leader election timings are misordered",
+			func(lease, renew, retry string) {
+				Expect(opts.Parse(fs,
+					"--leader-election-lease-duration", lease,
+					"--leader-election-renew-deadline", renew,
+					"--leader-election-retry-period", retry,
+				)).ToNot(Succeed())
+			},
+			Entry("lease equal to the renew deadline", "40s", "40s", "5s"),
+			Entry("lease below the renew deadline", "30s", "40s", "5s"),
+			Entry("renew deadline within the retry jitter", "60s", "6s", "5s"),
+			Entry("zero retry period", "60s", "40s", "0s"),
+		)
 
 		It("should default od-to-spot-consolidation to true", func() {
 			Expect(opts.Parse(fs)).To(Succeed())
@@ -511,6 +547,9 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.DisableControllerWarmup).To(Equal(optsB.DisableControllerWarmup))
 	Expect(optsA.DisableLeaderElection).To(Equal(optsB.DisableLeaderElection))
 	Expect(optsA.DisableClusterStateObservability).To(Equal(optsB.DisableClusterStateObservability))
+	Expect(optsA.LeaderElectionLeaseDuration).To(Equal(optsB.LeaderElectionLeaseDuration))
+	Expect(optsA.LeaderElectionRenewDeadline).To(Equal(optsB.LeaderElectionRenewDeadline))
+	Expect(optsA.LeaderElectionRetryPeriod).To(Equal(optsB.LeaderElectionRetryPeriod))
 	Expect(optsA.MemoryLimit).To(Equal(optsB.MemoryLimit))
 	Expect(optsA.LogLevel).To(Equal(optsB.LogLevel))
 	Expect(optsA.LogOutputPaths).To(Equal(optsB.LogOutputPaths))

@@ -63,6 +63,10 @@ var (
 	Injectables = []Injectable{&Options{}}
 )
 
+// leaderElectionJitterFactor mirrors k8s.io/client-go/tools/leaderelection.JitterFactor, which bounds
+// the renew deadline from below relative to the retry period.
+const leaderElectionJitterFactor = 1.2
+
 type optionsKey struct{}
 
 type FeatureGates struct {
@@ -89,6 +93,9 @@ type Options struct {
 	DisableClusterStateObservability        bool
 	LeaderElectionName                      string
 	LeaderElectionNamespace                 string
+	LeaderElectionLeaseDuration             time.Duration
+	LeaderElectionRenewDeadline             time.Duration
+	LeaderElectionRetryPeriod               time.Duration
 	MemoryLimit                             int64
 	CPURequests                             int64
 	LogLevel                                string
@@ -154,6 +161,9 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.BoolVarWithEnv(&o.DisableClusterStateObservability, "disable-cluster-state-observability", "DISABLE_CLUSTER_STATE_OBSERVABILITY", false, "Disable cluster state metrics and events")
 	fs.StringVar(&o.LeaderElectionName, "leader-election-name", env.WithDefaultString("LEADER_ELECTION_NAME", "karpenter-leader-election"), "Leader election name to create and monitor the lease if running outside the cluster")
 	fs.StringVar(&o.LeaderElectionNamespace, "leader-election-namespace", env.WithDefaultString("LEADER_ELECTION_NAMESPACE", ""), "Leader election namespace to create and monitor the lease if running outside the cluster")
+	fs.DurationVar(&o.LeaderElectionLeaseDuration, "leader-election-lease-duration", env.WithDefaultDuration("LEADER_ELECTION_LEASE_DURATION", 15*time.Second), "How long a non-leader candidate waits after the last observed lease renewal before it tries to acquire leadership. Must be greater than leader-election-renew-deadline.")
+	fs.DurationVar(&o.LeaderElectionRenewDeadline, "leader-election-renew-deadline", env.WithDefaultDuration("LEADER_ELECTION_RENEW_DEADLINE", 10*time.Second), "How long the leader retries renewing its lease before it gives up leadership and exits. Bounds the control-plane stall the leader survives. Must be less than leader-election-lease-duration and greater than 1.2 x leader-election-retry-period.")
+	fs.DurationVar(&o.LeaderElectionRetryPeriod, "leader-election-retry-period", env.WithDefaultDuration("LEADER_ELECTION_RETRY_PERIOD", 2*time.Second), "How long a leader-election client waits between lease acquire or renew attempts.")
 	fs.Int64Var(&o.MemoryLimit, "memory-limit", env.WithDefaultInt64("MEMORY_LIMIT", -1), "Memory limit on the container running the controller. The GC soft memory limit is set to 90% of this value.")
 	fs.Int64Var(&o.CPURequests, "cpu-requests", env.WithDefaultInt64("CPU_REQUESTS", 1000), "CPU requests in millicores on the container running the controller.")
 	fs.StringVar(&o.LogLevel, "log-level", env.WithDefaultString("LOG_LEVEL", "info"), "Log verbosity level. Can be one of 'debug', 'info', or 'error'")
@@ -206,6 +216,9 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if o.CPURequests <= 0 {
 		o.CPURequests = 1000
 	}
+	if err := o.validateLeaderElection(); err != nil {
+		return err
+	}
 	if err := o.validateConsolidation(); err != nil {
 		return err
 	}
@@ -223,6 +236,22 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	o.PreferencePolicy = PreferencePolicy(o.preferencePolicyRaw)
 	o.MinValuesPolicy = MinValuesPolicy(o.minValuesPolicyRaw)
 	o.TopologyCountCacheMode = TopologyCountCacheMode(o.topologyCountCacheModeRaw)
+	return nil
+}
+
+// validateLeaderElection enforces the ordering client-go's leaderelection package requires of the
+// three timings, so a misconfiguration fails at startup with a named variable instead of inside the
+// manager constructor.
+func (o *Options) validateLeaderElection() error {
+	if o.LeaderElectionRetryPeriod <= 0 {
+		return fmt.Errorf("validating cli flags / env vars, LEADER_ELECTION_RETRY_PERIOD must be > 0, got %s", o.LeaderElectionRetryPeriod)
+	}
+	if o.LeaderElectionRenewDeadline <= time.Duration(leaderElectionJitterFactor*float64(o.LeaderElectionRetryPeriod)) {
+		return fmt.Errorf("validating cli flags / env vars, LEADER_ELECTION_RENEW_DEADLINE must be > %.1f x LEADER_ELECTION_RETRY_PERIOD, got %s and %s", leaderElectionJitterFactor, o.LeaderElectionRenewDeadline, o.LeaderElectionRetryPeriod)
+	}
+	if o.LeaderElectionLeaseDuration <= o.LeaderElectionRenewDeadline {
+		return fmt.Errorf("validating cli flags / env vars, LEADER_ELECTION_LEASE_DURATION must be > LEADER_ELECTION_RENEW_DEADLINE, got %s and %s", o.LeaderElectionLeaseDuration, o.LeaderElectionRenewDeadline)
+	}
 	return nil
 }
 
