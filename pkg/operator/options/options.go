@@ -78,51 +78,51 @@ type FeatureGates struct {
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
 type Options struct {
-	ServiceName                         string
-	MetricsPort                         int
-	HealthProbePort                     int
-	KubeClientQPS                       int
-	KubeClientBurst                     int
-	EnableProfiling                     bool
-	DisableControllerWarmup             bool
-	DisableLeaderElection               bool
-	DisableClusterStateObservability    bool
-	LeaderElectionName                  string
-	LeaderElectionNamespace             string
-	MemoryLimit                         int64
-	CPURequests                         int64
-	LogLevel                            string
-	LogOutputPaths                      string
-	LogErrorOutputPaths                 string
-	BatchMaxDuration                    time.Duration
-	BatchIdleDuration                   time.Duration
-	NodeMetricsInterval                 time.Duration
-	preferencePolicyRaw                 string
-	PreferencePolicy                    PreferencePolicy
-	minValuesPolicyRaw                  string
-	MinValuesPolicy                     MinValuesPolicy
-	IgnoreDRARequests                   bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
-	MaxConsolidationReplacements        int
-	MaxConsolidationCommandsPerPass     int
-	ConsolidationSplitFallback          bool
-	ConsolidationSplitShadow            bool
+	ServiceName                             string
+	MetricsPort                             int
+	HealthProbePort                         int
+	KubeClientQPS                           int
+	KubeClientBurst                         int
+	EnableProfiling                         bool
+	DisableControllerWarmup                 bool
+	DisableLeaderElection                   bool
+	DisableClusterStateObservability        bool
+	LeaderElectionName                      string
+	LeaderElectionNamespace                 string
+	MemoryLimit                             int64
+	CPURequests                             int64
+	LogLevel                                string
+	LogOutputPaths                          string
+	LogErrorOutputPaths                     string
+	BatchMaxDuration                        time.Duration
+	BatchIdleDuration                       time.Duration
+	NodeMetricsInterval                     time.Duration
+	preferencePolicyRaw                     string
+	PreferencePolicy                        PreferencePolicy
+	minValuesPolicyRaw                      string
+	MinValuesPolicy                         MinValuesPolicy
+	IgnoreDRARequests                       bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
+	MaxConsolidationReplacements            int
+	MaxConsolidationCommandsPerPass         int
+	ConsolidationSplitFallback              bool
+	ConsolidationSplitShadow                bool
 	ConsolidationSplitShadowMaxReplacements int
-	ConsolidationSplitMaxAttempts       int
-	ConsolidationSplitMinSavings        float64
-	ConsolidationReplaceMinSavings      float64
-	SpotToSpotMinInstanceTypes          int
-	ConsolidationCandidateTimeout       time.Duration
-	ConsolidationAttributeReplacements  bool
-	ConsolidationSkipUnchangedNegatives bool
-	ConsolidationNegativeCacheTTL       time.Duration
-	DisruptionUnprovisionablePodTTL     time.Duration
-	NodeClaimInitializationTimeout      time.Duration
-	NodeClaimInitializationTimeoutShadow bool
-	ODToSpotConsolidation               bool
-	ODToSpotConsolidationShadow         bool
-	topologyCountCacheModeRaw           string
-	TopologyCountCacheMode              TopologyCountCacheMode
-	FeatureGates                        FeatureGates
+	ConsolidationSplitMaxAttempts           int
+	ConsolidationSplitMinSavings            float64
+	ConsolidationReplaceMinSavings          float64
+	SpotToSpotMinInstanceTypes              int
+	ConsolidationCandidateTimeout           time.Duration
+	ConsolidationAttributeReplacements      bool
+	ConsolidationSkipUnchangedNegatives     bool
+	ConsolidationNegativeCacheTTL           time.Duration
+	DisruptionUnprovisionablePodTTL         time.Duration
+	NodeClaimInitializationTimeout          time.Duration
+	NodeClaimInitializationTimeoutShadow    bool
+	ODToSpotConsolidation                   bool
+	ODToSpotConsolidationShadow             bool
+	topologyCountCacheModeRaw               string
+	TopologyCountCacheMode                  TopologyCountCacheMode
+	FeatureGates                            FeatureGates
 }
 
 type FlagSet struct {

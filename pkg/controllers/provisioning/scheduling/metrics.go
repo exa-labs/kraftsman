@@ -51,10 +51,10 @@ const (
 	packingOutcomeInflightUnpriced = "inflight_unpriced"
 	packingOutcomeNew              = "new"
 
-	packingShadowOutcomeSameNew              = "same_new"
-	packingShadowOutcomeWouldOpenNew         = "would_open_new"
+	packingShadowOutcomeSameNew                = "same_new"
+	packingShadowOutcomeWouldOpenNew           = "would_open_new"
 	packingShadowOutcomeWouldJoinOtherInflight = "would_join_other_inflight"
-	packingShadowOutcomeSameInflight         = "same_inflight"
+	packingShadowOutcomeSameInflight           = "same_inflight"
 
 	fingerprintModeRevision = "revision"
 	fingerprintModeContent  = "content"

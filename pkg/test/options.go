@@ -28,48 +28,48 @@ import (
 
 type OptionsFields struct {
 	// Vendor Neutral
-	ServiceName                         *string
-	MetricsPort                         *int
-	HealthProbePort                     *int
-	KubeClientQPS                       *int
-	KubeClientBurst                     *int
-	EnableProfiling                     *bool
-	DisableControllerWarmup             *bool
-	DisableLeaderElection               *bool
-	DisableClusterStateObservability    *bool
-	LeaderElectionName                  *string
-	LeaderElectionNamespace             *string
-	MemoryLimit                         *int64
-	CPURequests                         *int64
-	LogLevel                            *string
-	LogOutputPaths                      *string
-	LogErrorOutputPaths                 *string
-	PreferencePolicy                    *options.PreferencePolicy
-	MinValuesPolicy                     *options.MinValuesPolicy
-	BatchMaxDuration                    *time.Duration
-	BatchIdleDuration                   *time.Duration
-	NodeMetricsInterval                 *time.Duration
-	IgnoreDRARequests                   *bool
-	MaxConsolidationReplacements        *int
-	MaxConsolidationCommandsPerPass     *int
-	ConsolidationSplitFallback          *bool
-	ConsolidationSplitShadow            *bool
+	ServiceName                             *string
+	MetricsPort                             *int
+	HealthProbePort                         *int
+	KubeClientQPS                           *int
+	KubeClientBurst                         *int
+	EnableProfiling                         *bool
+	DisableControllerWarmup                 *bool
+	DisableLeaderElection                   *bool
+	DisableClusterStateObservability        *bool
+	LeaderElectionName                      *string
+	LeaderElectionNamespace                 *string
+	MemoryLimit                             *int64
+	CPURequests                             *int64
+	LogLevel                                *string
+	LogOutputPaths                          *string
+	LogErrorOutputPaths                     *string
+	PreferencePolicy                        *options.PreferencePolicy
+	MinValuesPolicy                         *options.MinValuesPolicy
+	BatchMaxDuration                        *time.Duration
+	BatchIdleDuration                       *time.Duration
+	NodeMetricsInterval                     *time.Duration
+	IgnoreDRARequests                       *bool
+	MaxConsolidationReplacements            *int
+	MaxConsolidationCommandsPerPass         *int
+	ConsolidationSplitFallback              *bool
+	ConsolidationSplitShadow                *bool
 	ConsolidationSplitShadowMaxReplacements *int
-	ConsolidationSplitMaxAttempts       *int
-	ConsolidationSplitMinSavings        *float64
-	ConsolidationReplaceMinSavings      *float64
-	SpotToSpotMinInstanceTypes          *int
-	ConsolidationCandidateTimeout       *time.Duration
-	ConsolidationAttributeReplacements  *bool
-	ConsolidationSkipUnchangedNegatives *bool
-	ConsolidationNegativeCacheTTL       *time.Duration
-	DisruptionUnprovisionablePodTTL     *time.Duration
-	NodeClaimInitializationTimeout      *time.Duration
-	NodeClaimInitializationTimeoutShadow *bool
-	ODToSpotConsolidation               *bool
-	ODToSpotConsolidationShadow         *bool
-	TopologyCountCacheMode              *options.TopologyCountCacheMode
-	FeatureGates                        FeatureGates
+	ConsolidationSplitMaxAttempts           *int
+	ConsolidationSplitMinSavings            *float64
+	ConsolidationReplaceMinSavings          *float64
+	SpotToSpotMinInstanceTypes              *int
+	ConsolidationCandidateTimeout           *time.Duration
+	ConsolidationAttributeReplacements      *bool
+	ConsolidationSkipUnchangedNegatives     *bool
+	ConsolidationNegativeCacheTTL           *time.Duration
+	DisruptionUnprovisionablePodTTL         *time.Duration
+	NodeClaimInitializationTimeout          *time.Duration
+	NodeClaimInitializationTimeoutShadow    *bool
+	ODToSpotConsolidation                   *bool
+	ODToSpotConsolidationShadow             *bool
+	TopologyCountCacheMode                  *options.TopologyCountCacheMode
+	FeatureGates                            FeatureGates
 }
 
 type FeatureGates struct {
@@ -90,47 +90,47 @@ func Options(overrides ...OptionsFields) *options.Options {
 	}
 
 	return &options.Options{
-		ServiceName:                      lo.FromPtrOr(opts.ServiceName, ""),
-		MetricsPort:                      lo.FromPtrOr(opts.MetricsPort, 8080),
-		HealthProbePort:                  lo.FromPtrOr(opts.HealthProbePort, 8081),
-		KubeClientQPS:                    lo.FromPtrOr(opts.KubeClientQPS, 200),
-		KubeClientBurst:                  lo.FromPtrOr(opts.KubeClientBurst, 300),
-		EnableProfiling:                  lo.FromPtrOr(opts.EnableProfiling, false),
-		DisableControllerWarmup:          lo.FromPtrOr(opts.DisableControllerWarmup, true),
-		DisableLeaderElection:            lo.FromPtrOr(opts.DisableLeaderElection, false),
-		DisableClusterStateObservability: lo.FromPtrOr(opts.DisableClusterStateObservability, false),
-		MemoryLimit:                      lo.FromPtrOr(opts.MemoryLimit, -1),
-		CPURequests:                      lo.FromPtrOr(opts.CPURequests, 5000), // use 5 threads to enforce parallelism
-		LogLevel:                         lo.FromPtrOr(opts.LogLevel, ""),
-		LogOutputPaths:                   lo.FromPtrOr(opts.LogOutputPaths, "stdout"),
-		LogErrorOutputPaths:              lo.FromPtrOr(opts.LogErrorOutputPaths, "stderr"),
-		BatchMaxDuration:                 lo.FromPtrOr(opts.BatchMaxDuration, 10*time.Second),
-		BatchIdleDuration:                lo.FromPtrOr(opts.BatchIdleDuration, time.Second),
-		NodeMetricsInterval:              lo.FromPtrOr(opts.NodeMetricsInterval, 30*time.Second),
-		PreferencePolicy:                 lo.FromPtrOr(opts.PreferencePolicy, options.PreferencePolicyRespect),
-		MinValuesPolicy:                  lo.FromPtrOr(opts.MinValuesPolicy, options.MinValuesPolicyStrict),
-		IgnoreDRARequests:                lo.FromPtrOr(opts.IgnoreDRARequests, true),
-		MaxConsolidationReplacements:     lo.FromPtrOr(opts.MaxConsolidationReplacements, 1),
-		MaxConsolidationCommandsPerPass:  lo.FromPtrOr(opts.MaxConsolidationCommandsPerPass, 1),
-		ConsolidationSplitFallback:       lo.FromPtrOr(opts.ConsolidationSplitFallback, false),
-		ConsolidationSplitShadow:        lo.FromPtrOr(opts.ConsolidationSplitShadow, false),
+		ServiceName:                             lo.FromPtrOr(opts.ServiceName, ""),
+		MetricsPort:                             lo.FromPtrOr(opts.MetricsPort, 8080),
+		HealthProbePort:                         lo.FromPtrOr(opts.HealthProbePort, 8081),
+		KubeClientQPS:                           lo.FromPtrOr(opts.KubeClientQPS, 200),
+		KubeClientBurst:                         lo.FromPtrOr(opts.KubeClientBurst, 300),
+		EnableProfiling:                         lo.FromPtrOr(opts.EnableProfiling, false),
+		DisableControllerWarmup:                 lo.FromPtrOr(opts.DisableControllerWarmup, true),
+		DisableLeaderElection:                   lo.FromPtrOr(opts.DisableLeaderElection, false),
+		DisableClusterStateObservability:        lo.FromPtrOr(opts.DisableClusterStateObservability, false),
+		MemoryLimit:                             lo.FromPtrOr(opts.MemoryLimit, -1),
+		CPURequests:                             lo.FromPtrOr(opts.CPURequests, 5000), // use 5 threads to enforce parallelism
+		LogLevel:                                lo.FromPtrOr(opts.LogLevel, ""),
+		LogOutputPaths:                          lo.FromPtrOr(opts.LogOutputPaths, "stdout"),
+		LogErrorOutputPaths:                     lo.FromPtrOr(opts.LogErrorOutputPaths, "stderr"),
+		BatchMaxDuration:                        lo.FromPtrOr(opts.BatchMaxDuration, 10*time.Second),
+		BatchIdleDuration:                       lo.FromPtrOr(opts.BatchIdleDuration, time.Second),
+		NodeMetricsInterval:                     lo.FromPtrOr(opts.NodeMetricsInterval, 30*time.Second),
+		PreferencePolicy:                        lo.FromPtrOr(opts.PreferencePolicy, options.PreferencePolicyRespect),
+		MinValuesPolicy:                         lo.FromPtrOr(opts.MinValuesPolicy, options.MinValuesPolicyStrict),
+		IgnoreDRARequests:                       lo.FromPtrOr(opts.IgnoreDRARequests, true),
+		MaxConsolidationReplacements:            lo.FromPtrOr(opts.MaxConsolidationReplacements, 1),
+		MaxConsolidationCommandsPerPass:         lo.FromPtrOr(opts.MaxConsolidationCommandsPerPass, 1),
+		ConsolidationSplitFallback:              lo.FromPtrOr(opts.ConsolidationSplitFallback, false),
+		ConsolidationSplitShadow:                lo.FromPtrOr(opts.ConsolidationSplitShadow, false),
 		ConsolidationSplitShadowMaxReplacements: lo.FromPtrOr(opts.ConsolidationSplitShadowMaxReplacements, 8),
-		ConsolidationSplitMaxAttempts:    lo.FromPtrOr(opts.ConsolidationSplitMaxAttempts, 50),
-		ConsolidationSplitMinSavings:     lo.FromPtrOr(opts.ConsolidationSplitMinSavings, 0.05),
-		ConsolidationReplaceMinSavings:   lo.FromPtrOr(opts.ConsolidationReplaceMinSavings, 0),
-		SpotToSpotMinInstanceTypes:       lo.FromPtrOr(opts.SpotToSpotMinInstanceTypes, 15),
+		ConsolidationSplitMaxAttempts:           lo.FromPtrOr(opts.ConsolidationSplitMaxAttempts, 50),
+		ConsolidationSplitMinSavings:            lo.FromPtrOr(opts.ConsolidationSplitMinSavings, 0.05),
+		ConsolidationReplaceMinSavings:          lo.FromPtrOr(opts.ConsolidationReplaceMinSavings, 0),
+		SpotToSpotMinInstanceTypes:              lo.FromPtrOr(opts.SpotToSpotMinInstanceTypes, 15),
 		// Tests drive a fake clock, and a per-candidate deadline is wall-clock, so it is off by
 		// default here: a suite opts in when it is what is under test.
-		ConsolidationCandidateTimeout:       lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
-		ConsolidationAttributeReplacements:  lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
-		ConsolidationSkipUnchangedNegatives: lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
-		ConsolidationNegativeCacheTTL:       lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
-		DisruptionUnprovisionablePodTTL:     lo.FromPtrOr(opts.DisruptionUnprovisionablePodTTL, 2*time.Minute),
-		NodeClaimInitializationTimeout:      lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
+		ConsolidationCandidateTimeout:        lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
+		ConsolidationAttributeReplacements:   lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
+		ConsolidationSkipUnchangedNegatives:  lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
+		ConsolidationNegativeCacheTTL:        lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
+		DisruptionUnprovisionablePodTTL:      lo.FromPtrOr(opts.DisruptionUnprovisionablePodTTL, 2*time.Minute),
+		NodeClaimInitializationTimeout:       lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
 		NodeClaimInitializationTimeoutShadow: lo.FromPtrOr(opts.NodeClaimInitializationTimeoutShadow, false),
-		ODToSpotConsolidation:               lo.FromPtrOr(opts.ODToSpotConsolidation, false),
-		ODToSpotConsolidationShadow:         lo.FromPtrOr(opts.ODToSpotConsolidationShadow, false),
-		TopologyCountCacheMode:              lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
+		ODToSpotConsolidation:                lo.FromPtrOr(opts.ODToSpotConsolidation, false),
+		ODToSpotConsolidationShadow:          lo.FromPtrOr(opts.ODToSpotConsolidationShadow, false),
+		TopologyCountCacheMode:               lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
 		FeatureGates: options.FeatureGates{
 			NodeRepair:              lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),
 			ReservedCapacity:        lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, true),
