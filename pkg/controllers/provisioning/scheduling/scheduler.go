@@ -212,6 +212,9 @@ func NewScheduler(
 			return nct.PackingPolicy == PackingPolicyMarginalCost
 		}),
 	}
+	s.shadowPricePlacements = !s.pricePlacements && lo.SomeBy(templates, func(nct *NodeClaimTemplate) bool {
+		return nct.PackingPolicy == PackingPolicyMarginalCostShadow
+	})
 
 	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
 		return np.Name, np
@@ -318,6 +321,11 @@ type Scheduler struct {
 	// first-fit onto in-flight NodeClaims to the priced comparison in addByMarginalCost (see packing.go for how
 	// binpack NodePools keep their behavior under it).
 	pricePlacements bool
+	// shadowPricePlacements is set when no NodePool opts into PackingPolicyMarginalCost but at least one opts into
+	// PackingPolicyMarginalCostShadow; placement still runs the binpack path, and shadowMarginalCost first computes
+	// and counts the divergent decision marginal-cost would have made. The live policy wins over shadow because a
+	// priced scheduler no longer makes the binpack decision a shadow verdict is measured against.
+	shadowPricePlacements bool
 
 	// allocator simulates DRA device allocation for pods with ResourceClaims. It is nil when DRA support is disabled.
 	allocator *dynamicresources.Allocator
@@ -683,6 +691,9 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	if s.pricePlacements {
 		return s.addByMarginalCost(ctx, pod)
 	}
+	if s.shadowPricePlacements {
+		s.shadowMarginalCost(ctx, pod)
+	}
 	// Pick existing node that we are about to create
 	if err := s.addToInflightNode(ctx, pod); err == nil {
 		return nil
@@ -726,9 +737,17 @@ func (s *Scheduler) addByMarginalCost(ctx context.Context, pod *corev1.Pod) erro
 	return nil
 }
 
-// cheapestInflightPlacement evaluates every in-flight NodeClaim for pod and returns the one whose launch price
-// increases the least, the earliest in s.newNodeClaims order among equals, or nil when none fits.
-func (s *Scheduler) cheapestInflightPlacement(ctx context.Context, pod *corev1.Pod) *inflightPlacement {
+// marginalCostPrices reports whether nc's in-flight price matters under the active packing policy mode: under a
+// live marginal-cost scheduler only marginal-cost NodeClaims are priced (binpack and shadow ones stay at zero and
+// always absorb what they fit), while under a shadow scheduler the shadow NodeClaims are the ones being measured.
+func (s *Scheduler) marginalCostPrices(nc *NodeClaim) bool {
+	return nc.PackingPolicy == PackingPolicyMarginalCost ||
+		(s.shadowPricePlacements && nc.PackingPolicy == PackingPolicyMarginalCostShadow)
+}
+
+// inflightPlacements evaluates every in-flight NodeClaim for pod in parallel and returns one placement per claim
+// in s.newNodeClaims order, nil where the pod does not fit. Only claims priced by the active policy carry a delta.
+func (s *Scheduler) inflightPlacements(ctx context.Context, pod *corev1.Pod) []*inflightPlacement {
 	candidates := make([]*inflightPlacement, len(s.newNodeClaims))
 	parallelizeUntil(s.numConcurrentReconciles, len(s.newNodeClaims), func(i int) bool {
 		nc := s.newNodeClaims[i]
@@ -737,19 +756,99 @@ func (s *Scheduler) cheapestInflightPlacement(ctx context.Context, pod *corev1.P
 			return true
 		}
 		candidate := &inflightPlacement{placement: placement{nodeClaim: nc, requirements: r, instanceTypes: its, offeringsToReserve: ofr, allocationResult: result}}
-		if nc.PackingPolicy == PackingPolicyMarginalCost {
+		if s.marginalCostPrices(nc) {
 			candidate.delta, candidate.unpriced = marginalLaunchPrice(nc, its, r, ofr)
 		}
 		candidates[i] = candidate
 		return true
 	})
+	return candidates
+}
+
+// cheapestInflightPlacement returns the fitting in-flight NodeClaim whose launch price increases the least, the
+// earliest in s.newNodeClaims order among equals, or nil when none fits.
+func (s *Scheduler) cheapestInflightPlacement(ctx context.Context, pod *corev1.Pod) *inflightPlacement {
 	var best *inflightPlacement
-	for _, candidate := range candidates {
+	for _, candidate := range s.inflightPlacements(ctx, pod) {
 		if candidate != nil && (best == nil || cheaperThan(candidate.delta, best.delta)) {
 			best = candidate
 		}
 	}
 	return best
+}
+
+// shadowMarginalCost computes where marginal-cost would have placed pod and counts the divergence from the
+// binpack decision the caller is about to commit. It commits nothing: the inflight evaluation never reserves
+// offerings or touches NodePool limits, and evaluateNewNodeClaim's placement is only priced, never committed.
+func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
+	if len(s.nodeClaimTemplates) == 0 {
+		return
+	}
+	firstFit, cheapest := s.firstAndCheapestInflight(ctx, pod)
+	// No in-flight NodeClaim fits: binpack and marginal-cost both open a new one.
+	if cheapest == nil {
+		nodePool := ""
+		if fresh, _, _ := s.evaluateFreshPlacement(ctx, pod); fresh != nil {
+			nodePool = fresh.nodeClaim.NodePoolName
+		}
+		PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: nodePool, outcomeLabel: packingShadowOutcomeSameNew})
+		return
+	}
+	// Marginal-cost would open a new NodeClaim only when growing the cheapest in-flight option costs more than a
+	// fresh launch; binpack joins firstFit regardless.
+	if cheapest.delta > 0 {
+		if fresh, price, ok := s.evaluateFreshPlacement(ctx, pod); ok && cheaperThan(price, cheapest.delta) {
+			PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeWouldOpenNew})
+			log.FromContext(ctx).V(1).WithValues(
+				"Pod", klog.KObj(pod),
+				"binpackNodeClaim", klog.KRef("", firstFit.nodeClaim.Name),
+				"binpackNodeClaimDelta", firstFit.delta,
+				"cheapestDelta", cheapest.delta,
+				"newNodeClaimPrice", price,
+			).Info("marginal-cost would open a new NodeClaim where binpack joined an in-flight one")
+			return
+		}
+	}
+	if cheapest.nodeClaim != firstFit.nodeClaim {
+		PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: cheapest.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeWouldJoinOtherInflight})
+		log.FromContext(ctx).V(1).WithValues(
+			"Pod", klog.KObj(pod),
+			"binpackNodeClaim", klog.KRef("", firstFit.nodeClaim.Name),
+			"marginalNodeClaim", klog.KRef("", cheapest.nodeClaim.Name),
+			"binpackDelta", firstFit.delta,
+			"cheapestDelta", cheapest.delta,
+		).Info("marginal-cost would join a different in-flight NodeClaim than binpack")
+		return
+	}
+	PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: firstFit.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeSameInflight})
+}
+
+// firstAndCheapestInflight returns the first in-flight NodeClaim that fits pod (binpack's choice) and the one
+// with the smallest marginal-cost delta; both are nil when nothing in flight fits.
+func (s *Scheduler) firstAndCheapestInflight(ctx context.Context, pod *corev1.Pod) (firstFit, cheapest *inflightPlacement) {
+	for _, candidate := range s.inflightPlacements(ctx, pod) {
+		if candidate == nil {
+			continue
+		}
+		if firstFit == nil {
+			firstFit = candidate
+		}
+		if cheapest == nil || cheaperThan(candidate.delta, cheapest.delta) {
+			cheapest = candidate
+		}
+	}
+	return firstFit, cheapest
+}
+
+// evaluateFreshPlacement prices the new NodeClaim marginal-cost would open for pod; ok is false when no
+// template can be evaluated or when the result has no priced offering.
+func (s *Scheduler) evaluateFreshPlacement(ctx context.Context, pod *corev1.Pod) (fresh *placement, price float64, ok bool) {
+	fresh, err := s.evaluateNewNodeClaim(ctx, pod)
+	if err != nil {
+		return nil, 0, false
+	}
+	price, ok = launchPrice(fresh.instanceTypes, fresh.requirements, fresh.offeringsToReserve)
+	return fresh, price, ok
 }
 
 func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error {

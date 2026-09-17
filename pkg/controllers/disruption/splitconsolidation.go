@@ -18,8 +18,13 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/samber/lo"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -81,37 +86,69 @@ func (b *SplitAttemptBudget) Remaining() int {
 // gating and validation, with an extra savings margin so a node isn't churned into several nodes
 // for a negligible difference.
 //
+// In shadow mode the same simulation runs with the shadow replacement cap and reports to
+// consolidation_split_shadow_total instead of producing a command: the verdict measures what the fallback
+// would have found, which is the evidence to collect before enabling it. Shadow runs never return a command
+// and never mark the no-op inconclusive, since the candidate's real verdict is a genuine no-op.
+//
 // Returns the command and whether the fallback produced one.
 func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts consolidationSimulationOptions, candidatePrice float64, candidates []*Candidate) (Command, bool) {
 	opts := options.FromContext(ctx)
+	live := opts.ConsolidationSplitFallback && opts.MaxConsolidationReplacements >= 2
+	shadow := !live && opts.ConsolidationSplitShadow
 	candidate, ok := splitCandidate(opts, simOpts, candidatePrice, candidates)
-	if !ok {
+	if !ok || (!live && !shadow) {
 		return Command{}, false
 	}
-	// No budget on the context means this simulation is not part of a budgeted pass at all, which is
-	// a different condition from a pass that spent its cap and must not be reported as one.
+	if !acquireSplitAttempt(ctx, candidate, shadow) {
+		return Command{}, false
+	}
+	if shadow {
+		c.shadowSplit(ctx, opts, candidate, candidatePrice)
+		return Command{}, false
+	}
+	return c.liveSplit(ctx, opts, candidate, candidatePrice)
+}
+
+// acquireSplitAttempt draws one attempt from the pass's split budget and reports the exhaust condition on the
+// right counter. No budget on the context means this simulation is not part of a budgeted pass at all, which is
+// a different condition from a pass that spent its cap and must not be reported as one.
+func acquireSplitAttempt(ctx context.Context, candidate *Candidate, shadow bool) bool {
 	budget := SplitAttemptBudgetFromContext(ctx)
 	if budget == nil {
-		return Command{}, false
+		return false
 	}
-	if !budget.TryAcquire() {
+	if budget.TryAcquire() {
+		return true
+	}
+	if shadow {
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeAttemptCapExhausted)
+	} else {
 		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeAttemptCapExhausted)
 		// The pass's attempt budget, not the candidate, decided this no-op: a fresh pass would
 		// have run the split, so the verdict must not outlive the pass.
 		markNoOpInconclusive(ctx)
-		return Command{}, false
 	}
+	return false
+}
 
+// splitSimulation runs the 1->N simulation both the live fallback and the shadow path share.
+func (c *consolidation) splitSimulation(ctx context.Context, opts *options.Options, candidate *Candidate, candidatePrice float64, maxReplacements int) (Command, error) {
 	start := time.Now()
 	cmd, err := c.computeConsolidationWithOptions(ctx, consolidationSimulationOptions{
 		newCapacityPriceLimit: candidatePrice,
 		// The split margin guards against trading one node for several; the replace floor is the
 		// fleet-wide minimum any replacement must clear, so the stricter of the two applies.
-		minSavings: max(opts.ConsolidationSplitMinSavings, opts.ConsolidationReplaceMinSavings),
-		silent:     true,
+		minSavings:      max(opts.ConsolidationSplitMinSavings, opts.ConsolidationReplaceMinSavings),
+		maxReplacements: maxReplacements,
+		silent:          true,
 	}, candidate)
 	ObserveConsolidationSplitDuration(ctx, candidate.NodePool.Name, time.Since(start))
+	return cmd, err
+}
 
+func (c *consolidation) liveSplit(ctx context.Context, opts *options.Options, candidate *Candidate, candidatePrice float64) (Command, bool) {
+	cmd, err := c.splitSimulation(ctx, opts, candidate, candidatePrice, 0)
 	switch {
 	case err != nil:
 		ObserveConsolidationSplitAttempt(ctx, candidate.NodePool.Name, SplitOutcomeError)
@@ -126,6 +163,40 @@ func (c *consolidation) trySplitConsolidation(ctx context.Context, simOpts conso
 	}
 }
 
+func (c *consolidation) shadowSplit(ctx context.Context, opts *options.Options, candidate *Candidate, candidatePrice float64) {
+	cmd, err := c.splitSimulation(ctx, opts, candidate, candidatePrice, opts.ConsolidationSplitShadowMaxReplacements)
+	switch {
+	case err != nil:
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeError)
+	case cmd.Decision() != ReplaceDecision:
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeNoOp)
+	default:
+		ObserveConsolidationSplitShadowAttempt(ctx, candidate.NodePool.Name, SplitOutcomeWouldSplit)
+		logShadowSplit(ctx, candidate, candidatePrice, cmd)
+	}
+}
+
+// logShadowSplit reports the split the shadow simulation found: the candidate it would have replaced and the
+// cheapest shape each replacement NodeClaim would have launched at.
+func logShadowSplit(ctx context.Context, candidate *Candidate, candidatePrice float64, cmd Command) {
+	replacementTypes := lo.Map(cmd.Replacements, func(r *Replacement, _ int) string {
+		if len(r.InstanceTypeOptions) == 0 {
+			return "unknown"
+		}
+		return r.InstanceTypeOptions[0].Name
+	})
+	cheapestPrice := lo.SumBy(cmd.Replacements, func(r *Replacement) float64 { return cheapestLaunchPrice(r.NodeClaim) })
+	log.FromContext(ctx).WithValues(
+		"Node", klog.KObj(candidate.Node),
+		"instance-type", candidateInstanceTypeName(candidate),
+		"capacity-type", candidate.capacityType,
+		"candidatePricePerHour", fmt.Sprintf("$%.2f", candidatePrice),
+		"replacements", len(cmd.Replacements),
+		"replacementTypes", replacementTypes,
+		"cheapestReplacementPricePerHour", fmt.Sprintf("$%.2f", cheapestPrice),
+	).Info("split fallback would have replaced the candidate with several NodeClaims")
+}
+
 // splitCandidate returns the candidate a split retry may act on, filtering out every case the retry
 // cannot turn into a command before it costs an attempt of the pass budget or a simulation.
 func splitCandidate(opts *options.Options, simOpts consolidationSimulationOptions, candidatePrice float64, candidates []*Candidate) (*Candidate, bool) {
@@ -133,8 +204,10 @@ func splitCandidate(opts *options.Options, simOpts consolidationSimulationOption
 	if simOpts.newCapacityPriceLimit > 0 || len(candidates) != 1 {
 		return nil, false
 	}
-	// Without room for a second replacement NodeClaim a split can never be accepted.
-	if !opts.ConsolidationSplitFallback || opts.MaxConsolidationReplacements < 2 {
+	// The live fallback needs both its gate and room for a second replacement; shadow mode only needs the
+	// gate, since its cap comes from consolidation-split-shadow-max-replacements and is validated >= 2.
+	live := opts.ConsolidationSplitFallback && opts.MaxConsolidationReplacements >= 2
+	if !live && !opts.ConsolidationSplitShadow {
 		return nil, false
 	}
 	candidate := candidates[0]

@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
@@ -181,6 +182,10 @@ type consolidationSimulationOptions struct {
 	newCapacityPriceLimit float64
 	// minSavings is the fraction of the candidate price a replacement must save beyond being cheaper.
 	minSavings float64
+	// maxReplacements caps the replacements a single-candidate split may launch; 0 falls back to the
+	// configured MaxConsolidationReplacements. The shadow split simulation carries its own cap so the
+	// live limit and the measured one can differ.
+	maxReplacements int
 	// silent suppresses the per-candidate skip and replacement attempt metrics.
 	silent bool
 }
@@ -302,9 +307,13 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// consolidation remains N->1: it merges many nodes into one replacement.
 	maxReplacements := 1
 	if len(candidates) == 1 {
+		configured := options.FromContext(ctx).MaxConsolidationReplacements
+		if simOpts.maxReplacements > 0 {
+			configured = simOpts.maxReplacements
+		}
 		// CLI validation enforces >= 1, but clamp so a zero value from a directly-constructed
 		// options struct fails safe to the classic 1->1 behavior
-		maxReplacements = max(1, options.FromContext(ctx).MaxConsolidationReplacements)
+		maxReplacements = max(1, configured)
 	}
 	// record the required replacement count for every single-candidate simulation needing more than one
 	// replacement, whether or not it is within the configured limit
@@ -361,7 +370,8 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// The price filter can empty every replacement's options, so keep a copy to re-price against
 	// spot-only offerings if it does.
 	var spotRetrySnapshots [][]*cloudprovider.InstanceType
-	if c.odToSpotRetryApplies(ctx, candidates, results.NewNodeClaims) {
+	otSpotApplies, odToSpotShadowOnly := c.odToSpotRetryApplies(ctx, candidates, results.NewNodeClaims)
+	if otSpotApplies {
 		spotRetrySnapshots = lo.Map(results.NewNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []*cloudprovider.InstanceType {
 			return append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)
 		})
@@ -373,12 +383,15 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// causing churns and landing onto lower available spot instance ultimately resulting in higher interruptions.
 	// When the spot-only retry is armed, hold the "can't replace" event back until the retry also
 	// fails: it may still turn the candidate into a replace command.
-	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, budget, !simOpts.silent && spotRetrySnapshots == nil); !ok {
-		if spotRetrySnapshots != nil {
+	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, budget, !simOpts.silent && (spotRetrySnapshots == nil || odToSpotShadowOnly)); !ok {
+		if spotRetrySnapshots != nil && odToSpotShadowOnly {
+			c.shadowODToSpotRetry(ctx, consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget)
+		}
+		if spotRetrySnapshots != nil && !odToSpotShadowOnly {
 			if !simOpts.silent {
 				ObserveConsolidationODToSpotRetry(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
 			}
-			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes) {
+			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, nil) {
 				cmd := Command{
 					Candidates:            candidates,
 					Replacements:          replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -423,17 +436,23 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 }
 
 // odToSpotRetryApplies reports whether the spot-only re-pricing retry is enabled and applicable:
-// every candidate runs on-demand and every replacement claim may launch spot.
-func (c *consolidation) odToSpotRetryApplies(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim) bool {
-	if !options.FromContext(ctx).ODToSpotConsolidation {
-		return false
+// every candidate runs on-demand and every replacement claim may launch spot. shadowOnly is set when
+// the retry is armed by od-to-spot-consolidation-shadow while the feature itself is off - the retry
+// then runs silently and reports to consolidation_od_to_spot_shadow_total instead of acting.
+func (c *consolidation) odToSpotRetryApplies(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim) (applies, shadowOnly bool) {
+	opts := options.FromContext(ctx)
+	if !opts.ODToSpotConsolidation && !opts.ODToSpotConsolidationShadow {
+		return false, false
 	}
 	if lo.SomeBy(candidates, func(cd *Candidate) bool { return cd.capacityType != v1.CapacityTypeOnDemand }) {
-		return false
+		return false, false
 	}
-	return !lo.SomeBy(newNodeClaims, func(nc *pscheduling.NodeClaim) bool {
+	if lo.SomeBy(newNodeClaims, func(nc *pscheduling.NodeClaim) bool {
 		return !nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeSpot)
-	})
+	}) {
+		return false, false
+	}
+	return true, !opts.ODToSpotConsolidation
 }
 
 // satisfiesMinValues reports whether pinning a requirement down to n values would still satisfy
@@ -451,9 +470,38 @@ func satisfiesMinValues(r *scheduling.Requirement, n int) bool {
 // and insufficient spot capacity fails the launch rather than falling back to on-demand.
 // It reports whether every claim retained a viable option; claims are mutated only on success
 // being meaningful (callers discard them otherwise).
-func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, spotLaunchCap int) bool {
+// shadowODToSpotRetry runs the spot-only re-pricing retry a disabled feature would have run and counts its
+// verdict in consolidation_od_to_spot_shadow_total. The claims it mutates are simulation state the caller
+// discards - the original skip was already published as if no retry were armed, and nothing downstream reads
+// the replacements. The narrowing rejection outcomes are the live retry's, so a would_admit/admitted split
+// in the shadow metric predicts the real retry's admission rate.
+func (c *consolidation) shadowODToSpotRetry(ctx context.Context, consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget) {
+	ObserveConsolidationODToSpotShadow(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
+	silentOpts := simOpts
+	silentOpts.silent = true
+	if c.retrySpotOnlyReplacements(consolidationType, silentOpts, candidates, newNodeClaims, snapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, func(outcome string) {
+		ObserveConsolidationODToSpotShadow(consolidationType, candidates, lo.Ternary(outcome == ODToSpotRetryOutcomeAdmitted, ODToSpotShadowOutcomeWouldAdmit, outcome))
+	}) {
+		log.FromContext(ctx).WithValues(
+			"candidates", lo.Map(candidates, func(cd *Candidate, _ int) string { return cd.Node.Name }),
+			"instanceTypes", lo.Map(candidates, func(cd *Candidate, _ int) string { return candidateInstanceTypeName(cd) }),
+			"capacityTypes", lo.Uniq(lo.Map(candidates, func(cd *Candidate, _ int) string { return cd.capacityType })),
+			"replacements", lo.Map(newNodeClaims, func(nc *pscheduling.NodeClaim, _ int) map[string]any {
+				return map[string]any{
+					"types":                lo.Map(nc.InstanceTypeOptions, func(it *cloudprovider.InstanceType, _ int) string { return it.Name }),
+					"zones":                nc.Requirements.Get(corev1.LabelTopologyZone).Values(),
+					"cheapestPricePerHour": cheapestLaunchPrice(nc),
+				}
+			}),
+		).Info("od-to-spot retry would have admitted a spot replacement")
+	}
+}
+
+func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simOpts consolidationSimulationOptions, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, spotLaunchCap int, observe func(outcome string)) bool {
 	observeOutcome := func(outcome string) {
-		if !simOpts.silent {
+		if observe != nil {
+			observe(outcome)
+		} else if !simOpts.silent {
 			ObserveConsolidationODToSpotRetry(consolidationType, candidates, outcome)
 		}
 	}

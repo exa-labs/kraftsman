@@ -68,6 +68,10 @@ var _ = Describe("Options", func() {
 		"OD_TO_SPOT_CONSOLIDATION",
 		"SPOT_TO_SPOT_MIN_INSTANCE_TYPES",
 		"CONSOLIDATION_REPLACE_MIN_SAVINGS",
+		"CONSOLIDATION_SPLIT_SHADOW",
+		"CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS",
+		"OD_TO_SPOT_CONSOLIDATION_SHADOW",
+		"NODECLAIM_INITIALIZATION_TIMEOUT_SHADOW",
 	}
 
 	BeforeEach(func() {
@@ -332,6 +336,44 @@ var _ = Describe("Options", func() {
 		It("should opt out of od-to-spot-consolidation via the CLI flag", func() {
 			Expect(opts.Parse(fs, "--od-to-spot-consolidation=false")).To(Succeed())
 			Expect(opts.ODToSpotConsolidation).To(BeFalse())
+		})
+
+		It("should default the shadow modes off and the shadow replacement cap to 8", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationSplitShadow).To(BeFalse())
+			Expect(opts.ODToSpotConsolidationShadow).To(BeFalse())
+			Expect(opts.NodeClaimInitializationTimeoutShadow).To(BeFalse())
+			Expect(opts.ConsolidationSplitShadowMaxReplacements).To(Equal(8))
+		})
+		It("should set the shadow modes via environment variables", func() {
+			os.Setenv("CONSOLIDATION_SPLIT_SHADOW", "true")
+			os.Setenv("OD_TO_SPOT_CONSOLIDATION_SHADOW", "true")
+			os.Setenv("NODECLAIM_INITIALIZATION_TIMEOUT_SHADOW", "true")
+			os.Setenv("CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS", "4")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationSplitShadow).To(BeTrue())
+			Expect(opts.ODToSpotConsolidationShadow).To(BeTrue())
+			Expect(opts.NodeClaimInitializationTimeoutShadow).To(BeTrue())
+			Expect(opts.ConsolidationSplitShadowMaxReplacements).To(Equal(4))
+		})
+		It("should set the shadow modes via CLI flags", func() {
+			Expect(opts.Parse(fs,
+				"--consolidation-split-shadow=true",
+				"--od-to-spot-consolidation-shadow=true",
+				"--nodeclaim-initialization-timeout-shadow=true",
+				"--consolidation-split-shadow-max-replacements=5",
+			)).To(Succeed())
+			Expect(opts.ConsolidationSplitShadow).To(BeTrue())
+			Expect(opts.ODToSpotConsolidationShadow).To(BeTrue())
+			Expect(opts.NodeClaimInitializationTimeoutShadow).To(BeTrue())
+			Expect(opts.ConsolidationSplitShadowMaxReplacements).To(Equal(5))
+		})
+		It("should fail validation when consolidation-split-shadow-max-replacements is below 2", func() {
+			Expect(opts.Parse(fs, "--consolidation-split-shadow-max-replacements=1")).ToNot(Succeed())
 		})
 
 		It("should default spot-to-spot-min-instance-types to 15", func() {

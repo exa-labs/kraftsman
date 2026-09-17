@@ -186,6 +186,21 @@ func (l *Liveness) reconcileInitializationTimeout(ctx context.Context, nodeClaim
 	if timeUntilTimeout := initializationTimeout - l.clock.Since(registered.LastTransitionTime.Time); timeUntilTimeout > 0 {
 		return reconcile.Result{RequeueAfter: timeUntilTimeout}, nil
 	}
+	// Shadow mode keeps the NodeClaim: the would-be deletion is logged and counted once per timeout period,
+	// which is the evidence to collect before enabling the timeout for real.
+	if options.FromContext(ctx).NodeClaimInitializationTimeoutShadow {
+		log.FromContext(ctx).WithValues(
+			"timeout", initializationTimeout,
+			"reason", initializationTimeoutReason,
+			"NodePool", nodeClaim.Labels[v1.NodePoolLabelKey],
+			"capacity-type", nodeClaim.Labels[v1.CapacityTypeLabelKey],
+		).Info("would terminate due to initialization timeout")
+		metrics.NodeClaimsInitializationTimeoutShadowTotal.Inc(map[string]string{
+			metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
+			metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
+		})
+		return reconcile.Result{RequeueAfter: initializationTimeout}, nil
+	}
 	if err := l.deleteNodeClaimForTimeout(ctx, initializationTimeout, initializationTimeoutReason, nodeClaim); err != nil {
 		if client.IgnoreNotFound(err) != nil {
 			return reconcile.Result{}, err

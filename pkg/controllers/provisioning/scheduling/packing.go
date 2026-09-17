@@ -31,6 +31,16 @@ limitations under the License.
 // unchanged. Once any NodePool opts in, every pod is priced, but a NodeClaim of a binpack NodePool always has a
 // marginal price of zero, so it still absorbs any pod that fits (the first such NodeClaim in the usual
 // fewest-pods-first order, exactly as under binpack) and only marginal-cost NodeClaims compete on price.
+//
+// "marginal-cost-shadow" is the observe-only variant: a scheduler with no live marginal-cost NodePool but at
+// least one shadow one still runs the binpack path for every pod, but first computes the decision marginal-cost
+// would have made and counts the divergence in packing_shadow_decisions_total. Shadow NodeClaims price exactly
+// like marginal-cost ones during that computation, so a pool can be measured before it is opted in. When a live
+// marginal-cost NodePool exists alongside shadow ones, the live policy wins: every pod is placed by price and
+// shadow NodeClaims price at zero like binpack ones, so shadow pools behave as binpack until their annotation
+// changes. The shadow verdict is a per-pod counterfactual against the state binpack actually committed - it asks
+// "would this pod have gone somewhere else" - not a replay of the whole batch under marginal-cost, since pods
+// already committed to in-flight NodeClaims cannot be un-committed.
 
 package scheduling
 
@@ -56,8 +66,9 @@ import (
 type PackingPolicy string
 
 const (
-	PackingPolicyBinpack      PackingPolicy = "binpack"
-	PackingPolicyMarginalCost PackingPolicy = "marginal-cost"
+	PackingPolicyBinpack            PackingPolicy = "binpack"
+	PackingPolicyMarginalCost       PackingPolicy = "marginal-cost"
+	PackingPolicyMarginalCostShadow PackingPolicy = "marginal-cost-shadow"
 )
 
 // priceTieTolerance is the relative difference below which two launch prices count as equal, so that price ladders
@@ -73,8 +84,10 @@ func PackingPolicyForNodePool(np *v1.NodePool) (PackingPolicy, error) {
 		return PackingPolicyBinpack, nil
 	case PackingPolicyMarginalCost:
 		return PackingPolicyMarginalCost, nil
+	case PackingPolicyMarginalCostShadow:
+		return PackingPolicyMarginalCostShadow, nil
 	}
-	return PackingPolicyBinpack, fmt.Errorf("unrecognized %s annotation value %q, expected %q or %q", v1.NodePoolPackingPolicyAnnotationKey, value, PackingPolicyBinpack, PackingPolicyMarginalCost)
+	return PackingPolicyBinpack, fmt.Errorf("unrecognized %s annotation value %q, expected %q, %q or %q", v1.NodePoolPackingPolicyAnnotationKey, value, PackingPolicyBinpack, PackingPolicyMarginalCost, PackingPolicyMarginalCostShadow)
 }
 
 // resolvePackingPolicy is PackingPolicyForNodePool with the invalid-annotation fallback surfaced as a NodePool event

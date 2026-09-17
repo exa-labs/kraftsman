@@ -72,6 +72,19 @@ var (
 			CapacityTypeLabel,
 		},
 	)
+	NodeClaimsInitializationTimeoutShadowTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: NodeClaimSubsystem,
+			Name:      "initialization_timeout_shadow_total",
+			Help:      "Number of nodeclaims that exceeded nodeclaim-initialization-timeout while its shadow mode was enabled - each would have been deleted. Counted once per timeout period per claim, so a permanently uninitialized nodeclaim contributes one count per period. The evidence to collect before enabling the timeout.",
+		},
+		[]string{
+			NodePoolLabel,
+			CapacityTypeLabel,
+		},
+	)
 	NodesCreatedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{

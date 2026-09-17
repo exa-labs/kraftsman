@@ -567,6 +567,31 @@ var _ = Describe("Liveness", func() {
 				metrics.NodePoolLabel: nodePool.Name,
 			})
 		})
+		It("should count but not delete a timed-out NodeClaim under shadow mode", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				NodeClaimInitializationTimeout:       lo.ToPtr(time.Hour),
+				NodeClaimInitializationTimeoutShadow: lo.ToPtr(true),
+			}))
+			DeferCleanup(func() { ctx = options.ToContext(ctx, test.Options()) })
+			metrics.NodeClaimsInitializationTimeoutShadowTotal.Reset()
+			nodeClaim := registeredUninitializedNodeClaim()
+
+			env.Clock.Step(61 * time.Minute)
+			result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter).To(Equal(time.Hour))
+			ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectMetricCounterValue(metrics.NodeClaimsInitializationTimeoutShadowTotal, 1, map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			// one count per timeout period: the next reconcile counts again
+			env.Clock.Step(time.Hour)
+			result = ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+			Expect(result.RequeueAfter).To(Equal(time.Hour))
+			ExpectExists(ctx, env.Client, nodeClaim)
+			ExpectMetricCounterValue(metrics.NodeClaimsInitializationTimeoutShadowTotal, 2, map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+		})
 		It("shouldn't delete a registered NodeClaim that never initializes when the timeout is disabled", func() {
 			nodeClaim := registeredUninitializedNodeClaim()
 
