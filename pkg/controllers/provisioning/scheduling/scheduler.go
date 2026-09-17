@@ -799,7 +799,7 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 	// No in-flight NodeClaim fits: binpack and marginal-cost both open a new one.
 	if cheapest == nil {
 		nodePool := ""
-		if fresh, _, ok := s.evaluateFreshPlacement(ctx, pod); ok {
+		if fresh, _, _ := s.evaluateFreshPlacement(ctx, pod); fresh != nil {
 			nodePool = fresh.nodeClaim.NodePoolName
 		}
 		PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: nodePool, outcomeLabel: packingShadowOutcomeSameNew})
