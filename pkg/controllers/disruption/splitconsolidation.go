@@ -180,10 +180,10 @@ func (c *consolidation) shadowSplit(ctx context.Context, opts *options.Options, 
 // cheapest shape each replacement NodeClaim would have launched at.
 func logShadowSplit(ctx context.Context, candidate *Candidate, candidatePrice float64, cmd Command) {
 	replacementTypes := lo.Map(cmd.Replacements, func(r *Replacement, _ int) string {
-		if len(r.NodeClaim.InstanceTypeOptions) == 0 {
+		if len(r.InstanceTypeOptions) == 0 {
 			return "unknown"
 		}
-		return r.NodeClaim.InstanceTypeOptions[0].Name
+		return r.InstanceTypeOptions[0].Name
 	})
 	cheapestPrice := lo.SumBy(cmd.Replacements, func(r *Replacement) float64 { return cheapestLaunchPrice(r.NodeClaim) })
 	log.FromContext(ctx).WithValues(
