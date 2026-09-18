@@ -167,14 +167,35 @@ func GetCurrentlyReschedulablePods(ctx context.Context, kubeClient client.Client
 	}), nil
 }
 
-// GetProvisionablePods grabs all the pods from the passed nodes that satisfy the IsProvisionable criteria
+// GetProvisionablePods grabs all the pods from the passed nodes that satisfy the IsProvisionable criteria,
+// minus volcano-nominated pods whose nominated node is still draining preemption victims (see
+// pod.IsNominatedBehindEviction)
 func GetProvisionablePods(ctx context.Context, kubeClient client.Client) ([]*corev1.Pod, error) {
 	var podList corev1.PodList
 	if err := kubeClient.List(ctx, &podList, client.MatchingFields{"spec.nodeName": ""}); err != nil {
 		return nil, fmt.Errorf("listing pods, %w", err)
 	}
-	return lo.FilterMap(podList.Items, func(p corev1.Pod, _ int) (*corev1.Pod, bool) {
+	provisionable := lo.FilterMap(podList.Items, func(p corev1.Pod, _ int) (*corev1.Pod, bool) {
 		return &p, pod.IsProvisionable(&p)
+	})
+	terminatingOn := map[string]bool{}
+	for _, p := range provisionable {
+		if !pod.IsVolcanoNominated(p) {
+			continue
+		}
+		if _, ok := terminatingOn[p.Status.NominatedNodeName]; ok {
+			continue
+		}
+		var nodePods corev1.PodList
+		if err := kubeClient.List(ctx, &nodePods, client.MatchingFields{"spec.nodeName": p.Status.NominatedNodeName}); err != nil {
+			return nil, fmt.Errorf("listing pods on nominated node %q, %w", p.Status.NominatedNodeName, err)
+		}
+		terminatingOn[p.Status.NominatedNodeName] = lo.ContainsBy(nodePods.Items, func(q corev1.Pod) bool {
+			return pod.IsTerminating(&q)
+		})
+	}
+	return lo.Reject(provisionable, func(p *corev1.Pod, _ int) bool {
+		return pod.IsNominatedBehindEviction(p, func(nodeName string) bool { return terminatingOn[nodeName] })
 	}), nil
 }
 
