@@ -212,6 +212,22 @@ func (in *InstanceType) DeepCopyInto(out *InstanceType) {
 	}
 }
 
+// WithOfferings returns a shallow copy of the instance type carrying the given
+// offerings in place of its own. Every other field is shared with the receiver,
+// including the capacity overlay marker; the allocatable cache is recomputed
+// from the new offerings on first use.
+func (i *InstanceType) WithOfferings(offerings Offerings) *InstanceType {
+	return &InstanceType{
+		Name:                   i.Name,
+		Requirements:           i.Requirements,
+		Offerings:              offerings,
+		Capacity:               i.Capacity,
+		DynamicResources:       i.DynamicResources,
+		Overhead:               i.Overhead,
+		capacityOverlayApplied: i.capacityOverlayApplied,
+	}
+}
+
 // AllocatableOfferings pairs an allocatable resource set with the offerings that produce it.
 type AllocatableOfferings struct {
 	Allocatable corev1.ResourceList

@@ -18,9 +18,10 @@ limitations under the License.
 // providers that decide spot versus on-demand at launch time: a context flag
 // asking a provider to probe a capacity market past its own insufficient
 // capacity cooldowns, a deferral error that lets a provider hold a launch open
-// without the claim being deleted or exponentially backed off, and the drift
+// without the claim being deleted or exponentially backed off, the drift
 // reason a provider reports for on-demand capacity it launched as a temporary
-// fallback.
+// fallback, and an advisor consolidation consults before pinning a spot
+// replacement to a market.
 
 package cloudprovider
 
@@ -72,6 +73,22 @@ func AsLaunchDeferredError(err error) (*LaunchDeferredError, bool) {
 // correction, not a spec rollout, and waiting behind a fleet-wide template
 // change would leave the expensive capacity running for hours.
 const DriftReasonOnDemandLeaseExpired DriftReason = "OnDemandLeaseExpired"
+
+// SpotReplacementAdvisor is implemented by CloudProviders that hold capacity
+// market evidence beyond the offering availability they report to the
+// scheduler. Consolidation consults it before pinning a spot replacement to its
+// cheapest instance types, so the pin never lands on a market the provider
+// knows has no spot to give: a replacement is optional, and a launch that fails
+// leaves the node it would have replaced running and the next pass rebuilding
+// the same claim. Whether a dry market may be re-tested by a replacement, and
+// how often, is the provider's call.
+type SpotReplacementAdvisor interface {
+	// SpotReplacementLaunchable reports whether a spot replacement for the
+	// NodePool may target the offering of the instance type. Offerings it
+	// rejects leave the replacement's options and zones; the scheduling of
+	// pending pods is unaffected.
+	SpotReplacementLaunchable(nodePool string, instanceType *InstanceType, offering *Offering) bool
+}
 
 type ignoreUnavailableKey struct{}
 
