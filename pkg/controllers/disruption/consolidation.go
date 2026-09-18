@@ -26,6 +26,7 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -42,6 +43,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 type consolidationTypeContextKey struct{}
@@ -669,7 +671,7 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 		nc.InstanceTypeOptions = nc.InstanceTypeOptions.OrderByPrice(nc.Requirements)
 	}
 
-	if ok, skipReason := c.filterSpotReplacementsWithZoneRetry(ctx, candidates, results.NewNodeClaims, budget, publishEvents); !ok {
+	if ok, skipReason := c.narrowSpotReplacements(ctx, candidates, results.NewNodeClaims, budget, publishEvents); !ok {
 		return Command{}, skipReason, nil
 	}
 
@@ -730,6 +732,138 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	cmd.EmitCandidateEvents(c.recorder)
 
 	return cmd, "", nil
+}
+
+// narrowSpotReplacements reduces each spot replacement to the instance type options it can
+// launch and afford: first the claim is restricted to the markets the CloudProvider's
+// SpotReplacementAdvisor admits (restrictSpotReplacementsToLaunchableMarkets), then the survivors
+// are priced against the budget with the zone retry (filterSpotReplacementsWithZoneRetry). It
+// returns whether every replacement kept an option, and otherwise the skip reason for the
+// candidate.
+func (c *consolidation) narrowSpotReplacements(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, budget priceBudget, publishEvents bool) (bool, string) {
+	if ok, skipReason := c.restrictSpotReplacementsToLaunchableMarkets(candidates, newNodeClaims, publishEvents); !ok {
+		return false, skipReason
+	}
+	return c.filterSpotReplacementsWithZoneRetry(ctx, candidates, newNodeClaims, budget, publishEvents)
+}
+
+// restrictSpotReplacementsToLaunchableMarkets narrows each spot replacement whose offerings the
+// CloudProvider's SpotReplacementAdvisor rejects to instance types and zones the launch can only
+// combine into admitted offerings, so the price filter and the launch truncation that follow rank
+// only offerings the replacement can launch. The scheduler's view may keep a rejected offering
+// available so that pending pods can be the launch that re-probes its market; a replacement launch
+// that fails leaves the candidate running and the next pass rebuilding the same claim, so the
+// provider decides separately whether a replacement may be that launch.
+//
+// The restriction is written into the claim's requirements rather than into its offerings: the
+// launch reads the NodeClaim's instance type and zone requirements, not the offerings
+// consolidation priced, and it may combine any type with any zone the claim allows. See
+// launchableSpotReplacementMarkets for how the type and zone sets are chosen together. A claim
+// left without a market skips the candidate with CandidateSkipSpotMarketExhausted; one whose
+// launchable zones cannot satisfy the zone requirement's minValues skips it with
+// CandidateSkipReplacementFlexibility, since the API server would refuse the narrowed claim and
+// an unnarrowed one could launch into a rejected market. Without an advisor nothing changes.
+func (c *consolidation) restrictSpotReplacementsToLaunchableMarkets(candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, publishEvents bool) (bool, string) {
+	advisor, ok := c.cloudProvider.(cloudprovider.SpotReplacementAdvisor)
+	if !ok {
+		return true, ""
+	}
+	skip := func(reason, message string) (bool, string) {
+		if len(candidates) == 1 && publishEvents {
+			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, message)...)
+		}
+		return false, reason
+	}
+	for _, nc := range newNodeClaims {
+		markets, rejected := spotReplacementMarkets(advisor, nc)
+		if rejected == 0 {
+			continue
+		}
+		if publishEvents {
+			ObserveSpotReplacementOfferingsRejected(nc.NodePoolName, rejected)
+		}
+		types, zones := launchableSpotReplacementMarkets(nc.InstanceTypeOptions, markets)
+		if len(types) == 0 {
+			return skip(CandidateSkipSpotMarketExhausted, "Can't replace with spot: every spot market the replacement could launch in is exhausted")
+		}
+		if !satisfiesMinValues(nc.Requirements.Get(corev1.LabelTopologyZone), zones.Len()) {
+			return skip(CandidateSkipReplacementFlexibility, fmt.Sprintf("Can't replace with spot: the %d zone(s) with spot capacity cannot satisfy the zone requirement's minValues", zones.Len()))
+		}
+		nc.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, sets.List(zones)...))
+		nc.InstanceTypeOptions = types.OrderByPrice(nc.Requirements)
+	}
+	return true, ""
+}
+
+// spotReplacementMarket is the verdict on one instance type's available, compatible offerings:
+// the zones it may launch in and the zones it must not, with the price of its cheapest admitted
+// offering. A zone is rejected when the advisor turns the offering down or when the claim's
+// requests do not fit the allocatable that offering yields - the scheduler keeps a type as soon as
+// one of its offerings fits, so the others cannot be assumed to.
+type spotReplacementMarket struct {
+	admitted sets.Set[string]
+	rejected sets.Set[string]
+	price    float64
+}
+
+// spotReplacementMarkets consults the advisor for every available offering compatible with the
+// claim and returns the verdict per instance type along with how many offerings the advisor
+// rejected.
+func spotReplacementMarkets(advisor cloudprovider.SpotReplacementAdvisor, nc *pscheduling.NodeClaim) (map[*cloudprovider.InstanceType]spotReplacementMarket, int) {
+	rejected := 0
+	markets := make(map[*cloudprovider.InstanceType]spotReplacementMarket, len(nc.InstanceTypeOptions))
+	for _, it := range nc.InstanceTypeOptions {
+		market := spotReplacementMarket{admitted: sets.New[string](), rejected: sets.New[string](), price: math.MaxFloat64}
+		for _, group := range it.AllocatableOfferingsList() {
+			fits := resources.Fits(nc.Spec.Resources.Requests, group.Allocatable)
+			for _, of := range group.Offerings {
+				if !nc.Requirements.IsCompatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
+					continue
+				}
+				if !advisor.SpotReplacementLaunchable(nc.NodePoolName, it, of) {
+					rejected++
+					market.rejected.Insert(of.Zone())
+					continue
+				}
+				if !fits {
+					market.rejected.Insert(of.Zone())
+					continue
+				}
+				market.admitted.Insert(of.Zone())
+				market.price = math.Min(market.price, of.Price)
+			}
+		}
+		markets[it] = market
+	}
+	return markets, rejected
+}
+
+// launchableSpotReplacementMarkets chooses the instance types and zones a replacement may be
+// pinned to so that every combination of the two is an admitted offering. The zone set is
+// anchored on the cheapest type with an admitted offering: its admitted zones, less any it is
+// rejected in. Only types admitted somewhere in those zones and rejected nowhere in them are kept
+// - a type rejected in one anchor zone would be launchable there, since the claim carries one zone
+// set for every type. The anchor survives by construction; should its own zones admit nothing (an
+// offering without a zone label cannot be excluded by a zone requirement, so it rejects its type
+// outright), the next cheapest type anchors instead. It returns no types when no admitted offering
+// remains.
+func launchableSpotReplacementMarkets(options cloudprovider.InstanceTypes, markets map[*cloudprovider.InstanceType]spotReplacementMarket) (cloudprovider.InstanceTypes, sets.Set[string]) {
+	anchors := lo.Filter(options, func(it *cloudprovider.InstanceType, _ int) bool {
+		return markets[it].admitted.Len() > 0
+	})
+	sort.SliceStable(anchors, func(i, j int) bool { return markets[anchors[i]].price < markets[anchors[j]].price })
+	for _, anchor := range anchors {
+		zones := markets[anchor].admitted.Difference(markets[anchor].rejected).Delete("")
+		if zones.Len() == 0 {
+			continue
+		}
+		types := lo.Filter(options, func(it *cloudprovider.InstanceType, _ int) bool {
+			market := markets[it]
+			return market.admitted.Intersection(zones).Len() > 0 && market.rejected.Intersection(zones).Len() == 0 && !market.rejected.Has("")
+		})
+		return types, zones
+	}
+	return nil, sets.New[string]()
 }
 
 // filterReplacementsAndPublish price-filters the replacement NodeClaims against the budget and returns whether all

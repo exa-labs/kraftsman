@@ -175,6 +175,17 @@ func (d *decorator) InstanceTypeRevision(ctx context.Context, nodePool *v1.NodeP
 	return revisionProvider.InstanceTypeRevision(ctx, nodePool)
 }
 
+// SpotReplacementLaunchable forwards the optional SpotReplacementAdvisor interface. A lookup on
+// the underlying provider's market state is too cheap to be worth a duration sample, so it is
+// not measured. A provider that does not implement it admits every offering.
+func (d *decorator) SpotReplacementLaunchable(nodePool string, instanceType *cloudprovider.InstanceType, offering *cloudprovider.Offering) bool {
+	advisor, ok := d.CloudProvider.(cloudprovider.SpotReplacementAdvisor)
+	if !ok {
+		return true
+	}
+	return advisor.SpotReplacementLaunchable(nodePool, instanceType, offering)
+}
+
 func (d *decorator) IsDrifted(ctx context.Context, nodeClaim *v1.NodeClaim) (cloudprovider.DriftReason, error) {
 	method := "IsDrifted"
 	defer metrics.Measure(MethodDuration, getLabelsMapForDuration(ctx, d, method))()

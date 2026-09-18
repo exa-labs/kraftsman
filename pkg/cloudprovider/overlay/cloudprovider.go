@@ -77,6 +77,17 @@ func (d *decorator) GetInstanceTypesWithRevision(ctx context.Context, nodePool *
 	return its, revision, nil
 }
 
+// SpotReplacementLaunchable forwards the optional SpotReplacementAdvisor interface. Overlays
+// change prices and capacities, never which market an offering is in, so the inner provider's
+// answer stands. A provider that does not implement it admits every offering.
+func (d *decorator) SpotReplacementLaunchable(nodePool string, instanceType *cloudprovider.InstanceType, offering *cloudprovider.Offering) bool {
+	advisor, ok := d.CloudProvider.(cloudprovider.SpotReplacementAdvisor)
+	if !ok {
+		return true
+	}
+	return advisor.SpotReplacementLaunchable(nodePool, instanceType, offering)
+}
+
 // InstanceTypeRevision forwards the optional InstanceTypeRevisionProvider interface. When the
 // NodeOverlay feature gate is enabled the served content also depends on the overlay store, which
 // the inner provider's revision does not cover, so the revision is reported as 0 (unstable).

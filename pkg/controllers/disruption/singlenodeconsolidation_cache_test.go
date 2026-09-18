@@ -42,7 +42,7 @@ func TestSingleNodeConsolidationComputeCommandsStartsCachePass(t *testing.T) {
 	clusterClock := clock.RealClock{}
 	cluster := state.NewCluster(clusterClock, client, cloudProvider)
 	recorder := events.NewRecorder(&record.FakeRecorder{})
-	consolidation := MakeConsolidation(
+	c := MakeConsolidation(
 		clusterClock,
 		cluster,
 		client,
@@ -53,7 +53,7 @@ func TestSingleNodeConsolidationComputeCommandsStartsCachePass(t *testing.T) {
 	)
 
 	ctx := options.ToContext(context.Background(), &options.Options{})
-	if _, err := NewSingleNodeConsolidation(consolidation).ComputeCommands(ctx, nil); err != nil {
+	if _, err := NewSingleNodeConsolidation(c).ComputeCommands(ctx, nil); err != nil {
 		t.Fatalf("single-node consolidation pass failed: %v", err)
 	}
 }

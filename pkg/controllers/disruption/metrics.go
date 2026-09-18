@@ -126,6 +126,11 @@ const (
 	// MinInstanceTypesForSpotToSpotConsolidation cheaper instance types remain, which upstream
 	// requires to avoid consolidating the same node repeatedly.
 	CandidateSkipSpotToSpotFlexibility = "spot_to_spot_flexibility"
+	// CandidateSkipSpotMarketExhausted means a spot replacement had cheaper spot-compatible types,
+	// but the CloudProvider's SpotReplacementAdvisor rejected every offering they had: the markets
+	// the replacement could launch in hold no spot right now. This fleet is waiting on capacity, not
+	// on prices or requirements, and the skip lasts until the provider's market evidence expires.
+	CandidateSkipSpotMarketExhausted = "spot_market_exhausted"
 	// CandidateSkipNoOp remains for a no-op the branches above do not explain.
 	CandidateSkipNoOp                 = "noop_decision"
 	CandidateSkipComputeError         = "compute_error"
@@ -621,6 +626,20 @@ var (
 		},
 		[]string{metrics.NodePoolLabel},
 	)
+	// ConsolidationSpotReplacementOfferingsRejected counts the spot replacement offerings the
+	// CloudProvider's SpotReplacementAdvisor removed before the replacement was priced and pinned.
+	// A NodePool accumulating rejections is one whose cheapest spot markets are dry; compare with
+	// spot_market_exhausted skips to see how often nothing launchable was left.
+	ConsolidationSpotReplacementOfferingsRejected = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_spot_replacement_offerings_rejected_total",
+			Help:      "Number of spot replacement offerings the CloudProvider's market advisor removed from consolidation replacement NodeClaims before pricing, by NodePool.",
+		},
+		[]string{metrics.NodePoolLabel},
+	)
 	// ConsolidationExecutedSavingsFraction records how much of the disrupted capacity's hourly price
 	// each executed consolidation command is estimated to save. Mass near zero is churn for little
 	// return and is the population a minimum-savings floor would remove.
@@ -1100,6 +1119,14 @@ func ObserveRealizedSavings(ctx context.Context, kubeClient client.Reader, cmd C
 // single-node spot-to-spot replacement offered before the configured minimum vetoed or capped it.
 func ObserveSpotReplacementOptions(nodePoolName string, options int) {
 	ConsolidationSpotReplacementOptions.Observe(float64(options), map[string]string{
+		metrics.NodePoolLabel: nodePoolName,
+	})
+}
+
+// ObserveSpotReplacementOfferingsRejected records how many spot offerings the CloudProvider's
+// market advisor removed from one replacement NodeClaim.
+func ObserveSpotReplacementOfferingsRejected(nodePoolName string, rejected int) {
+	ConsolidationSpotReplacementOfferingsRejected.Add(float64(rejected), map[string]string{
 		metrics.NodePoolLabel: nodePoolName,
 	})
 }
