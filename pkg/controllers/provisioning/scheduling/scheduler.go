@@ -718,7 +718,13 @@ func (s *Scheduler) addByMarginalCost(ctx context.Context, pod *corev1.Pod) erro
 		if len(s.nodeClaimTemplates) == 0 {
 			return errNoNodeClaimTemplates
 		}
-		return s.addToNewNodeClaim(ctx, pod)
+		fresh, err := s.evaluateNewNodeClaim(ctx, pod)
+		if err != nil {
+			return err
+		}
+		s.commitNewNodeClaim(ctx, pod, fresh)
+		PackingDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingOutcomeNewNoInflight})
+		return nil
 	}
 	if inflight.delta > 0 {
 		if fresh, err := s.evaluateNewNodeClaim(ctx, pod); err == nil {

@@ -1906,6 +1906,17 @@ var _ = Context("Scheduling", func() {
 				Expect(nodeCountsByInstanceType(pods)).To(Equal(map[string]int{"one-device": 6}))
 				Expect(cloudProvider.CreateCalls).To(HaveLen(6))
 			})
+			It("should count the new_no_inflight outcome when a pod opens a NodeClaim with nothing in flight", func() {
+				scheduling.PackingDecisionsTotal.Reset()
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(1)
+				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
+				Expect(cloudProvider.CreateCalls).To(HaveLen(1))
+				ExpectMetricCounterValue(scheduling.PackingDecisionsTotal, 1, map[string]string{
+					"nodepool": nodePool.Name,
+					"outcome":  "new_no_inflight",
+				})
+			})
 			It("should keep packing while growing costs no more than a new NodeClaim", func() {
 				// linear pricing: each step up the ladder costs exactly one more one-device box, and the tie keeps the
 				// in-flight NodeClaim, so the pods still share a node as under binpack
