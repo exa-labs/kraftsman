@@ -78,6 +78,8 @@ func TestSpotToSpotMinSavingsForNodePool(t *testing.T) {
 		{name: "an unparseable value selects the default", value: new("five percent"), want: def, wantErr: `parsing karpenter.sh/spot-to-spot-min-savings annotation value "five percent"`},
 		{name: "a negative fraction selects the default", value: new("-0.1"), want: def, wantErr: "expected a fraction in [0, 1)"},
 		{name: "one selects the default", value: new("1"), want: def, wantErr: "expected a fraction in [0, 1)"},
+		{name: "NaN selects the default", value: new("NaN"), want: def, wantErr: "expected a fraction in [0, 1)"},
+		{name: "infinity selects the default", value: new("Inf"), want: def, wantErr: "expected a fraction in [0, 1)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var annotations map[string]string

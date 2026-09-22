@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -66,7 +67,7 @@ func SpotToSpotMinSavingsForNodePool(np *v1.NodePool, def float64) (float64, err
 	if err != nil {
 		return def, fmt.Errorf("using the default spot-to-spot min savings %g, parsing %s annotation value %q, %w", def, v1.NodePoolSpotToSpotMinSavingsAnnotationKey, value, err)
 	}
-	if savings < 0 || savings >= 1 {
+	if math.IsNaN(savings) || savings < 0 || savings >= 1 {
 		return def, fmt.Errorf("using the default spot-to-spot min savings %g, invalid %s annotation value %q, expected a fraction in [0, 1)", def, v1.NodePoolSpotToSpotMinSavingsAnnotationKey, value)
 	}
 	return savings, nil
@@ -75,10 +76,11 @@ func SpotToSpotMinSavingsForNodePool(np *v1.NodePool, def float64) (float64, err
 // spotToSpotStabilityFloor decides whether the candidates may be replaced with spot at all, before any
 // replacement is priced: the feature gate must be on and each candidate must be at least as old as its
 // NodePool's spot-to-spot age floor. It returns the strictest of the pools' savings floors, or the skip
-// reason to attribute the candidate to when it is held back. Spot prices move continuously, so the
-// cheapest node at launch is undercut within minutes; the age floor is what keeps a price move from
-// draining the same pods again before they have done any work. It is measured from the NodeClaim's
-// creation, unlike consolidateAfter, which restarts on every pod event.
+// reason to attribute the candidate to when it is held back. An age hold is a no-op that expires on its
+// own, so it is marked inconclusive and never stored in the negative result cache. Spot prices move
+// continuously, so the cheapest node at launch is undercut within minutes; the age floor is what keeps
+// a price move from draining the same pods again before they have done any work. It is measured from
+// the NodeClaim's creation, unlike consolidateAfter, which restarts on every pod event.
 func (c *consolidation) spotToSpotStabilityFloor(ctx context.Context, candidates []*Candidate, publishEvents bool) (float64, string) {
 	unconsolidatable := func(message string) {
 		if len(candidates) == 1 && publishEvents {
@@ -95,6 +97,7 @@ func (c *consolidation) spotToSpotStabilityFloor(ctx context.Context, candidates
 		if settings.minNodeAge > 0 {
 			if age := c.clock.Since(cn.NodeClaim.CreationTimestamp.Time); age < settings.minNodeAge {
 				unconsolidatable(fmt.Sprintf("SpotToSpotConsolidation requires the node to be at least %s old before replacing it with spot, it is %s old", settings.minNodeAge, age.Truncate(time.Second)))
+				markNoOpInconclusive(ctx)
 				return 0, CandidateSkipSpotToSpotMinNodeAge
 			}
 		}

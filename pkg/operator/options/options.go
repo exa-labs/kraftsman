@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -291,7 +292,7 @@ func (o *Options) validateSpotToSpot() error {
 	if o.SpotToSpotMinNodeAge < 0 {
 		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_NODE_AGE must be >= 0, got %s", o.SpotToSpotMinNodeAge)
 	}
-	if o.SpotToSpotMinSavings < 0 || o.SpotToSpotMinSavings >= 1 {
+	if math.IsNaN(o.SpotToSpotMinSavings) || o.SpotToSpotMinSavings < 0 || o.SpotToSpotMinSavings >= 1 {
 		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_SAVINGS must be in [0, 1), got %f", o.SpotToSpotMinSavings)
 	}
 	return nil

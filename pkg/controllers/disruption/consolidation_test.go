@@ -1355,6 +1355,37 @@ var _ = Describe("Consolidation", func() {
 				ExpectSingletonReconciled(ctx, disruptionController)
 				expectReplaced()
 			})
+			It("does not store an age hold as a negative verdict", func() {
+				// An age hold expires with the clock alone, with no cluster object changing, so a cached
+				// verdict would outlive the hold for the whole TTL.
+				setOptions(test.OptionsFields{
+					SpotToSpotMinNodeAge:                lo.ToPtr(10 * time.Minute),
+					ConsolidationSkipUnchangedNegatives: lo.ToPtr(true),
+					ConsolidationNegativeCacheTTL:       lo.ToPtr(time.Hour),
+				})
+				cloudProvider.InstanceTypesRevision = 1
+				DeferCleanup(func() { cloudProvider.InstanceTypesRevision = 0 })
+				hits := func() float64 {
+					metric, ok := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_negative_cache_lookups_total", map[string]string{
+						"consolidation_type": disruption.SingleNodeConsolidationType,
+						"outcome":            disruption.NegativeCacheLookupHit,
+					})
+					if !ok {
+						return 0
+					}
+					return metric.GetCounter().GetValue()
+				}
+				hitsBefore := hits()
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectHeld(disruption.CandidateSkipSpotToSpotMinNodeAge, "SpotToSpotConsolidation requires the node to be at least 10m0s old")
+
+				env.Clock.Step(11 * time.Minute)
+				cluster.MarkUnconsolidated()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				Expect(hits()).To(Equal(hitsBefore))
+				expectReplaced()
+			})
 			DescribeTable("applies the stricter of the spot-to-spot and global savings floors",
 				func(globalMinSavings, spotMinSavings float64, expectReplace bool) {
 					setOptions(test.OptionsFields{

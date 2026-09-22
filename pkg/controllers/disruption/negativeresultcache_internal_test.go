@@ -180,6 +180,17 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 			c.reschedulablePods[0].ResourceVersion = "rv-updated"
 			return c
 		}(),
+		// The spot-to-spot stability annotations change the verdict without bumping generation.
+		"spot-to-spot min node age annotation": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.NodePool.Annotations = map[string]string{v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey: "30m"}
+			return c
+		}(),
+		"spot-to-spot min savings annotation": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.NodePool.Annotations = map[string]string{v1.NodePoolSpotToSpotMinSavingsAnnotationKey: "0.05"}
+			return c
+		}(),
 	} {
 		if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(), provider).fingerprint(ctx, changed); got == baseFingerprint {
 			t.Fatalf("changing the %s did not change the fingerprint", name)

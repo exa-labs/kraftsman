@@ -471,6 +471,20 @@ var _ = Describe("Options", func() {
 			Expect(opts.Parse(fs, "--spot-to-spot-min-savings=-0.1")).ToNot(Succeed())
 		})
 
+		It("should fail validation when spot-to-spot-min-savings is NaN", func() {
+			// NaN parses as a float and compares false against every bound, so it needs its own check.
+			Expect(opts.Parse(fs, "--spot-to-spot-min-savings=NaN")).ToNot(Succeed())
+		})
+
+		It("should fail validation when SPOT_TO_SPOT_MIN_SAVINGS is NaN", func() {
+			os.Setenv("SPOT_TO_SPOT_MIN_SAVINGS", "NaN")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).ToNot(Succeed())
+		})
+
 		It("should default consolidation-replace-min-savings to 0", func() {
 			Expect(opts.Parse(fs)).To(Succeed())
 			Expect(opts.ConsolidationReplaceMinSavings).To(BeZero())
