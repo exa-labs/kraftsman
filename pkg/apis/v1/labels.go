@@ -78,6 +78,16 @@ const (
 	// relaunches forever and never adds a node. It lives on the NodePool object, not its template, so tuning it does
 	// not change the template hash or drift existing nodes.
 	NodePoolRegistrationTimeoutAnnotationKey = apis.Group + "/nodeclaim-registration-timeout"
+	// NodePoolSpotToSpotMinNodeAgeAnnotationKey overrides SPOT_TO_SPOT_MIN_NODE_AGE for this NodePool: a spot node
+	// younger than this Go duration (for example "30m", measured from its NodeClaim's creation) is not replaced by
+	// another spot node. Unset selects the controller default; "0" disables the floor for the pool. It lives on the
+	// NodePool object, not its template, so tuning it does not change the template hash or drift existing nodes.
+	NodePoolSpotToSpotMinNodeAgeAnnotationKey = apis.Group + "/spot-to-spot-min-node-age"
+	// NodePoolSpotToSpotMinSavingsAnnotationKey overrides SPOT_TO_SPOT_MIN_SAVINGS for this NodePool: a spot
+	// replacement of this pool's spot nodes must save at least this fraction in [0, 1) of the current price (for example
+	// "0.05"). Unset selects the controller default; "0" disables the pool-specific floor. It lives on the NodePool
+	// object, not its template, so tuning it does not change the template hash or drift existing nodes.
+	NodePoolSpotToSpotMinSavingsAnnotationKey = apis.Group + "/spot-to-spot-min-savings"
 )
 
 // NodeClaimTerminationCauseCloudInterrupted is the NodeClaimTerminationCauseAnnotationKey value for

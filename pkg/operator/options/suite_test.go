@@ -70,6 +70,8 @@ var _ = Describe("Options", func() {
 		"FEATURE_GATES",
 		"OD_TO_SPOT_CONSOLIDATION",
 		"SPOT_TO_SPOT_MIN_INSTANCE_TYPES",
+		"SPOT_TO_SPOT_MIN_NODE_AGE",
+		"SPOT_TO_SPOT_MIN_SAVINGS",
 		"CONSOLIDATION_REPLACE_MIN_SAVINGS",
 		"CONSOLIDATION_SPLIT_SHADOW",
 		"CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS",
@@ -434,6 +436,39 @@ var _ = Describe("Options", func() {
 
 		It("should fail validation when spot-to-spot-min-instance-types is below 1", func() {
 			Expect(opts.Parse(fs, "--spot-to-spot-min-instance-types=0")).ToNot(Succeed())
+		})
+
+		It("should default spot-to-spot-min-node-age and spot-to-spot-min-savings to 0", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.SpotToSpotMinNodeAge).To(BeZero())
+			Expect(opts.SpotToSpotMinSavings).To(BeZero())
+		})
+
+		It("should set spot-to-spot-min-node-age and spot-to-spot-min-savings via the environment variables", func() {
+			os.Setenv("SPOT_TO_SPOT_MIN_NODE_AGE", "30m")
+			os.Setenv("SPOT_TO_SPOT_MIN_SAVINGS", "0.05")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.SpotToSpotMinNodeAge).To(Equal(30 * time.Minute))
+			Expect(opts.SpotToSpotMinSavings).To(Equal(0.05))
+		})
+
+		It("should set spot-to-spot-min-node-age and spot-to-spot-min-savings via the CLI flags", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-min-node-age=1h", "--spot-to-spot-min-savings=0.2")).To(Succeed())
+			Expect(opts.SpotToSpotMinNodeAge).To(Equal(time.Hour))
+			Expect(opts.SpotToSpotMinSavings).To(Equal(0.2))
+		})
+
+		It("should fail validation when spot-to-spot-min-node-age is negative", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-min-node-age=-1m")).ToNot(Succeed())
+		})
+
+		It("should fail validation when spot-to-spot-min-savings is outside [0, 1)", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-min-savings=1")).ToNot(Succeed())
+			Expect(opts.Parse(fs, "--spot-to-spot-min-savings=-0.1")).ToNot(Succeed())
 		})
 
 		It("should default consolidation-replace-min-savings to 0", func() {

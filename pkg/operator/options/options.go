@@ -118,6 +118,8 @@ type Options struct {
 	ConsolidationSplitMinSavings            float64
 	ConsolidationReplaceMinSavings          float64
 	SpotToSpotMinInstanceTypes              int
+	SpotToSpotMinNodeAge                    time.Duration
+	SpotToSpotMinSavings                    float64
 	ConsolidationCandidateTimeout           time.Duration
 	ConsolidationAttributeReplacements      bool
 	ConsolidationSkipUnchangedNegatives     bool
@@ -181,6 +183,8 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.IntVar(&o.ConsolidationSplitShadowMaxReplacements, "consolidation-split-shadow-max-replacements", env.WithDefaultInt("CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS", 8), "The replacement cap the shadow split simulation evaluates, decoupled from max-consolidation-replacements so the live limit stays conservative while the shadow measures the intended one. Must be >= 2 since a split needs at least two replacements to exist.")
 	fs.IntVar(&o.ConsolidationSplitMaxAttempts, "consolidation-split-max-attempts", env.WithDefaultInt("CONSOLIDATION_SPLIT_MAX_ATTEMPTS", 50), "The maximum number of split fallback simulations a single consolidation pass may run. Each attempt costs an extra scheduling simulation, so this caps how much of the pass timeout the fallback can consume at the expense of candidate traversal depth. 0 disables the fallback.")
 	fs.IntVar(&o.SpotToSpotMinInstanceTypes, "spot-to-spot-min-instance-types", env.WithDefaultInt("SPOT_TO_SPOT_MIN_INSTANCE_TYPES", 15), "The minimum number of cheaper instance type options a replacement NodeClaim must have for spot-to-spot single-node consolidation to proceed. The upstream default of 15 assumes broad instance-type flexibility; a fleet whose pods pin a single small instance family can never present that many cheaper types and needs a lower minimum. Replacement launches are capped to this many cheapest options too (or the NodePool's minValues if greater), so the launched type is always within the priced set and cannot be immediately consolidated again.")
+	fs.DurationVar(&o.SpotToSpotMinNodeAge, "spot-to-spot-min-node-age", env.WithDefaultDuration("SPOT_TO_SPOT_MIN_NODE_AGE", 0), "The minimum age of a spot NodeClaim before spot-to-spot consolidation may replace it with another spot node. Spot prices move continuously, so a node that was the cheapest launchable option when it started is often undercut within minutes; without a floor the same pods are drained onto the new cheapest node on every price move, and workloads that take a while to start never finish. Only replacements of spot candidates by spot capacity are held back: deletes, on-demand candidates and on-demand replacements are unaffected, and so is consolidateAfter, which restarts on every pod event rather than counting from the node's creation. A NodePool overrides it with the karpenter.sh/spot-to-spot-min-node-age annotation. 0 disables the floor.")
+	fs.Float64Var(&o.SpotToSpotMinSavings, "spot-to-spot-min-savings", env.WithDefaultFloat64("SPOT_TO_SPOT_MIN_SAVINGS", 0), "The fraction of the disrupted spot nodes' price that a spot-to-spot consolidation replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. The larger of this and consolidation-replace-min-savings applies to spot-to-spot replacements (and to the split fallback of a spot candidate); other replace decisions keep consolidation-replace-min-savings alone. Replacement launches are also restricted to instance types that meet the margin. A NodePool overrides it with the karpenter.sh/spot-to-spot-min-savings annotation. 0 adds nothing to the global margin.")
 	fs.DurationVar(&o.ConsolidationCandidateTimeout, "consolidation-candidate-timeout", env.WithDefaultDuration("CONSOLIDATION_CANDIDATE_TIMEOUT", 10*time.Second), "The maximum time a single consolidation candidate's scheduling simulation may run before it is abandoned and the walk moves on. The pass timeout bounds discovery in aggregate; this bounds one candidate, so a pass degrades into finding fewer commands rather than none. 0 disables the per-candidate bound.")
 	fs.BoolVar(&o.ConsolidationAttributeReplacements, "consolidation-attribute-replacements", env.WithDefaultBool("CONSOLIDATION_ATTRIBUTE_REPLACEMENTS", true), "Count only the new NodeClaims that host a disrupted pod as a command's replacements, for every disruption method. A disruption simulation also schedules the cluster's pending pods, and the capacity it opens for them would otherwise be launched and waited on by the command, priced against a consolidation candidate, and counted against the replacement bound. Disable to restore the unattributed behavior.")
 	fs.BoolVarWithEnv(&o.ConsolidationSkipUnchangedNegatives, "consolidation-skip-unchanged-negatives", "CONSOLIDATION_SKIP_UNCHANGED_NEGATIVES", false, "When set, a single-node consolidation candidate whose previous simulation ended in a no-op is skipped while its fingerprint - Node and NodeClaim resourceVersions, NodePool generation, reschedulable pod set, and the NodePool's instance type revision - is unchanged and the verdict is younger than consolidation-negative-cache-ttl. Only no-op verdicts are cached, so a stale entry can only delay a node's consolidation, never disrupt one wrongly; the cache is dropped whenever a pass admits a command. Lookup outcomes are counted regardless of this flag, so the hit rate is measurable before skipping is enabled.")
@@ -268,8 +272,8 @@ func (o *Options) validateConsolidation() error {
 	if o.ConsolidationCandidateTimeout < 0 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_CANDIDATE_TIMEOUT must be >= 0, got %s", o.ConsolidationCandidateTimeout)
 	}
-	if o.SpotToSpotMinInstanceTypes < 1 {
-		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_INSTANCE_TYPES must be >= 1, got %d", o.SpotToSpotMinInstanceTypes)
+	if err := o.validateSpotToSpot(); err != nil {
+		return err
 	}
 	if o.ConsolidationSplitMinSavings < 0 || o.ConsolidationSplitMinSavings >= 1 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_SPLIT_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationSplitMinSavings)
@@ -278,6 +282,19 @@ func (o *Options) validateConsolidation() error {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationReplaceMinSavings)
 	}
 	return o.validateNegativeCache()
+}
+
+func (o *Options) validateSpotToSpot() error {
+	if o.SpotToSpotMinInstanceTypes < 1 {
+		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_INSTANCE_TYPES must be >= 1, got %d", o.SpotToSpotMinInstanceTypes)
+	}
+	if o.SpotToSpotMinNodeAge < 0 {
+		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_NODE_AGE must be >= 0, got %s", o.SpotToSpotMinNodeAge)
+	}
+	if o.SpotToSpotMinSavings < 0 || o.SpotToSpotMinSavings >= 1 {
+		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_SAVINGS must be in [0, 1), got %f", o.SpotToSpotMinSavings)
+	}
+	return nil
 }
 
 func (o *Options) validateNegativeCache() error {
