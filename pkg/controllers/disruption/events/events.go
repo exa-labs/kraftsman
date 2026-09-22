@@ -131,6 +131,19 @@ func NodePoolBlockedForDisruptionReason(nodePool *v1.NodePool, reason v1.Disrupt
 	}
 }
 
+// InvalidSpotToSpotSetting reports a NodePool spot-to-spot annotation that could not be parsed; the controller
+// default named in err's message is used in its place until the annotation is fixed.
+func InvalidSpotToSpotSetting(nodePool *v1.NodePool, err error) events.Event {
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeWarning,
+		Reason:         events.InvalidSpotToSpotSetting,
+		Message:        err.Error(),
+		DedupeValues:   []string{string(nodePool.UID), err.Error()},
+		DedupeTimeout:  1 * time.Minute,
+	}
+}
+
 func NodePoolBlocked(nodePool *v1.NodePool) events.Event {
 	return events.Event{
 		InvolvedObject: nodePool,

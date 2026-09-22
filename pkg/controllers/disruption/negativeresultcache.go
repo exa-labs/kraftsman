@@ -214,14 +214,18 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 	// are patched on every node join/leave, so resourceVersion churns continuously on a busy fleet
 	// while only spec changes can alter what the simulation would do with this candidate. The UID
 	// covers a delete/recreate under the same name, which resets generation and, per the
-	// InstanceTypesRevisionProvider contract, may reuse a revision for different content.
-	return fmt.Sprintf("%s|%s|%s:%d|%d|%s|%s",
+	// InstanceTypesRevisionProvider contract, may reuse a revision for different content. The
+	// spot-to-spot stability annotations steer the decision from metadata, which generation does
+	// not track, so their raw values are carried explicitly.
+	return fmt.Sprintf("%s|%s|%s:%d|%d|%s|%s|%s|%s",
 		candidate.Node.ResourceVersion,
 		candidate.NodeClaim.ResourceVersion,
 		candidate.NodePool.UID,
 		candidate.NodePool.Generation,
 		revision,
 		strings.Join(podUIDs, ","),
+		candidate.NodePool.Annotations[v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey],
+		candidate.NodePool.Annotations[v1.NodePoolSpotToSpotMinSavingsAnnotationKey],
 		fleet,
 	)
 }

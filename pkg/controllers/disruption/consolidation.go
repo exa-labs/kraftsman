@@ -361,8 +361,11 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 		}) {
 		cmd, skipReason, err := c.computeSpotToSpotConsolidation(ctx, candidates, results, budget, simOpts)
 		if err == nil && cmd.Decision() == NoOpDecision {
-			if splitCmd, ok := c.trySplitConsolidation(ctx, simOpts, candidatePrice, candidates); ok {
-				return splitCmd, nil
+			// A split of a spot candidate is spot-to-spot too and would be held by the same age floor.
+			if skipReason != CandidateSkipSpotToSpotMinNodeAge {
+				if splitCmd, ok := c.trySplitConsolidation(ctx, simOpts, candidatePrice, candidates); ok {
+					return splitCmd, nil
+				}
 			}
 			observeSingleNodeSkip(skipReason)
 		}
@@ -641,7 +644,9 @@ func consolidationSchedulerOptions(newCapacityPriceLimit float64) []pscheduling.
 
 // Compute command to execute spot-to-spot consolidation if:
 //  1. The SpotToSpotConsolidation feature flag is set to true.
-//  2. For single-node consolidation:
+//  2. Every candidate is at least SPOT_TO_SPOT_MIN_NODE_AGE old.
+//  3. The replacement saves at least the larger of SPOT_TO_SPOT_MIN_SAVINGS and the global replace margin.
+//  4. For single-node consolidation:
 //     a. There are at least 15 cheapest instance type replacement options to consolidate.
 //     b. The current candidate is NOT part of the first 15 cheapest instance types inorder to avoid repeated consolidation.
 //
@@ -652,13 +657,13 @@ func consolidationSchedulerOptions(newCapacityPriceLimit float64) []pscheduling.
 func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, candidates []*Candidate, results pscheduling.Results, budget priceBudget, simOpts consolidationSimulationOptions) (Command, string, error) {
 	publishEvents := !simOpts.silent
 
-	// Spot consolidation is turned off.
-	if !options.FromContext(ctx).FeatureGates.SpotToSpotConsolidation {
-		if len(candidates) == 1 && publishEvents {
-			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, "SpotToSpotConsolidation is disabled, can't replace a spot node with a spot node")...)
-		}
-		return Command{}, CandidateSkipSpotToSpotDisabled, nil
+	minSavings, skipReason := c.spotToSpotStabilityFloor(ctx, candidates, publishEvents)
+	if skipReason != "" {
+		return Command{}, skipReason, nil
 	}
+	// The spot-to-spot margin tightens the price budget the replacements are priced and launched against;
+	// the global replace margin still applies when it is the larger of the two.
+	budget.minSavings = max(budget.minSavings, minSavings)
 
 	// Since we are sure that the replacement nodeclaims considered for the spot candidates are spot, we will enforce it through the requirements.
 	for _, nc := range results.NewNodeClaims {

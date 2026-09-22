@@ -126,6 +126,10 @@ const (
 	// MinInstanceTypesForSpotToSpotConsolidation cheaper instance types remain, which upstream
 	// requires to avoid consolidating the same node repeatedly.
 	CandidateSkipSpotToSpotFlexibility = "spot_to_spot_flexibility"
+	// CandidateSkipSpotToSpotMinNodeAge means the candidate and its replacement are both spot and
+	// the candidate is younger than SPOT_TO_SPOT_MIN_NODE_AGE, so price was never consulted. This
+	// fleet is waiting on time, not on prices or offerings: the skip lasts until the node ages in.
+	CandidateSkipSpotToSpotMinNodeAge = "spot_to_spot_min_node_age"
 	// CandidateSkipSpotMarketExhausted means a spot replacement had cheaper spot-compatible types,
 	// but the CloudProvider's SpotReplacementAdvisor rejected every offering they had: the markets
 	// the replacement could launch in hold no spot right now. This fleet is waiting on capacity, not

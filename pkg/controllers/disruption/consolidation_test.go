@@ -1258,6 +1258,205 @@ var _ = Describe("Consolidation", func() {
 			Entry("admits an 8% saving under a 5% floor", 0.05, true),
 			Entry("vetoes an 8% saving under a 10% floor", 0.1, false),
 		)
+		Context("spot-to-spot stability", func() {
+			var current, cheaper *cloudprovider.InstanceType
+			// a single candidate of the given capacity type whose only cheaper replacement has the same capacity type
+			// and saves 8%
+			useCapacityType := func(capacityType string) {
+				offering := func(price float64) cloudprovider.Offering {
+					return cloudprovider.Offering{
+						Available:    true,
+						Price:        price,
+						Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: capacityType, corev1.LabelTopologyZone: "test-zone-1"}),
+					}
+				}
+				resources := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourcePods: resource.MustParse("100")}
+				current = fake.NewInstanceType("current", fake.WithResources(resources), fake.WithOfferings(offering(1.0)))
+				cheaper = fake.NewInstanceType("cheaper", fake.WithResources(resources), fake.WithOfferings(offering(0.92)))
+				cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{current, cheaper}
+				nodeClaim.Labels = lo.Assign(nodeClaim.Labels, map[string]string{
+					corev1.LabelInstanceTypeStable: current.Name,
+					v1.CapacityTypeLabelKey:        capacityType,
+					corev1.LabelTopologyZone:       "test-zone-1",
+				})
+				node.Labels = nodeClaim.Labels
+				ExpectSingletonReconciled(ctx, pricingController)
+			}
+			BeforeEach(func() {
+				useCapacityType(v1.CapacityTypeSpot)
+			})
+			setOptions := func(fields test.OptionsFields) {
+				fields.FeatureGates = test.FeatureGates{SpotToSpotConsolidation: new(true)}
+				fields.SpotToSpotMinInstanceTypes = lo.ToPtr(1)
+				ctx = options.ToContext(ctx, test.Options(fields))
+			}
+			applyCandidate := func() {
+				rs := test.ReplicaSet()
+				ExpectApplied(ctx, env.Client, rs)
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+				pod := test.Pod(test.PodOptions{
+					ObjectMeta: metav1.ObjectMeta{Labels: labels,
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion:         "apps/v1",
+								Kind:               "ReplicaSet",
+								Name:               rs.Name,
+								UID:                rs.UID,
+								Controller:         new(true),
+								BlockOwnerDeletion: new(true),
+							},
+						}}})
+				ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, nodePool)
+				ExpectManualBinding(ctx, env.Client, pod, node)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			}
+			skipped := func(reason string) bool {
+				_, ok := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_candidate_skips_total", map[string]string{
+					"consolidation_type":  "single",
+					metrics.NodePoolLabel: nodePool.Name,
+					"instance_type":       current.Name,
+					"reason":              reason,
+				})
+				return ok
+			}
+			eventContaining := func(substr string) bool {
+				_, ok := lo.Find(recorder.Events(), func(e events.Event) bool { return strings.Contains(e.Message, substr) })
+				return ok
+			}
+			expectHeld := func(reason, eventMessage string) {
+				Expect(queue.GetCommands()).To(BeEmpty())
+				Expect(skipped(reason)).To(BeTrue())
+				ExpectExists(ctx, env.Client, nodeClaim)
+				Expect(eventContaining(eventMessage)).To(BeTrue())
+			}
+			expectReplaced := func() {
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Replacements).To(HaveLen(1))
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaim))
+				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+				nodeClaims := ExpectNodeClaims(ctx, env.Client)
+				Expect(nodeClaims).To(HaveLen(1))
+				Expect(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).Has(cheaper.Name)).To(BeTrue())
+				ExpectNotFound(ctx, env.Client, nodeClaim, node)
+			}
+			It("holds a spot node younger than the controller-wide age floor without pricing it", func() {
+				setOptions(test.OptionsFields{SpotToSpotMinNodeAge: lo.ToPtr(10 * time.Minute)})
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectHeld(disruption.CandidateSkipSpotToSpotMinNodeAge, "SpotToSpotConsolidation requires the node to be at least 10m0s old")
+				Expect(skipped(disruption.CandidateSkipBelowMinSavings)).To(BeFalse())
+			})
+			It("replaces the spot node once it has aged past the floor", func() {
+				setOptions(test.OptionsFields{SpotToSpotMinNodeAge: lo.ToPtr(10 * time.Minute)})
+				applyCandidate()
+				env.Clock.Step(11 * time.Minute)
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectReplaced()
+			})
+			It("does not store an age hold as a negative verdict", func() {
+				// An age hold expires with the clock alone, with no cluster object changing, so a cached
+				// verdict would outlive the hold for the whole TTL.
+				setOptions(test.OptionsFields{
+					SpotToSpotMinNodeAge:                lo.ToPtr(10 * time.Minute),
+					ConsolidationSkipUnchangedNegatives: lo.ToPtr(true),
+					ConsolidationNegativeCacheTTL:       lo.ToPtr(time.Hour),
+				})
+				cloudProvider.InstanceTypesRevision = 1
+				DeferCleanup(func() { cloudProvider.InstanceTypesRevision = 0 })
+				hits := func() float64 {
+					metric, ok := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_negative_cache_lookups_total", map[string]string{
+						"consolidation_type": disruption.SingleNodeConsolidationType,
+						"outcome":            disruption.NegativeCacheLookupHit,
+					})
+					if !ok {
+						return 0
+					}
+					return metric.GetCounter().GetValue()
+				}
+				hitsBefore := hits()
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectHeld(disruption.CandidateSkipSpotToSpotMinNodeAge, "SpotToSpotConsolidation requires the node to be at least 10m0s old")
+
+				env.Clock.Step(11 * time.Minute)
+				cluster.MarkUnconsolidated()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				Expect(hits()).To(Equal(hitsBefore))
+				expectReplaced()
+			})
+			DescribeTable("applies the stricter of the spot-to-spot and global savings floors",
+				func(globalMinSavings, spotMinSavings float64, expectReplace bool) {
+					setOptions(test.OptionsFields{
+						ConsolidationReplaceMinSavings: lo.ToPtr(globalMinSavings),
+						SpotToSpotMinSavings:           lo.ToPtr(spotMinSavings),
+					})
+					applyCandidate()
+					ExpectSingletonReconciled(ctx, disruptionController)
+					if expectReplace {
+						expectReplaced()
+						return
+					}
+					expectHeld(disruption.CandidateSkipBelowMinSavings, "minimum savings")
+				},
+				Entry("admits an 8% saving under a 5% spot-to-spot floor", 0.0, 0.05, true),
+				Entry("vetoes an 8% saving under a 10% spot-to-spot floor", 0.0, 0.1, false),
+				Entry("keeps a 10% global floor over a 5% spot-to-spot floor", 0.1, 0.05, false),
+			)
+			It("holds a young spot node under a NodePool age floor when the controller default is off", func() {
+				setOptions(test.OptionsFields{})
+				nodePool.Annotations = map[string]string{v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey: "10m"}
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectHeld(disruption.CandidateSkipSpotToSpotMinNodeAge, "SpotToSpotConsolidation requires the node to be at least 10m0s old")
+			})
+			It("lets a NodePool turn the controller-wide age floor off", func() {
+				setOptions(test.OptionsFields{SpotToSpotMinNodeAge: lo.ToPtr(10 * time.Minute)})
+				nodePool.Annotations = map[string]string{v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey: "0"}
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectReplaced()
+			})
+			It("vetoes a saving below a NodePool savings floor when the controller default is off", func() {
+				setOptions(test.OptionsFields{})
+				nodePool.Annotations = map[string]string{v1.NodePoolSpotToSpotMinSavingsAnnotationKey: "0.1"}
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectHeld(disruption.CandidateSkipBelowMinSavings, "minimum savings")
+			})
+			It("falls back to the controller defaults and warns when a NodePool annotation is invalid", func() {
+				setOptions(test.OptionsFields{})
+				nodePool.Annotations = map[string]string{
+					v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey: "soon",
+					v1.NodePoolSpotToSpotMinSavingsAnnotationKey: "1.5",
+				}
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				Expect(recorder.Calls(events.InvalidSpotToSpotSetting)).To(BeNumerically(">=", 2))
+				Expect(eventContaining(fmt.Sprintf("using the default spot-to-spot min node age 0s, parsing %s annotation value \"soon\"", v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey))).To(BeTrue())
+				Expect(eventContaining(fmt.Sprintf("using the default spot-to-spot min savings 0, invalid %s annotation value \"1.5\", expected a fraction in [0, 1)", v1.NodePoolSpotToSpotMinSavingsAnnotationKey))).To(BeTrue())
+				expectReplaced()
+			})
+			It("leaves an on-demand candidate alone under both floors", func() {
+				setOptions(test.OptionsFields{
+					SpotToSpotMinNodeAge: lo.ToPtr(10 * time.Minute),
+					SpotToSpotMinSavings: lo.ToPtr(0.1),
+				})
+				nodePool.Annotations = map[string]string{
+					v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey: "10m",
+					v1.NodePoolSpotToSpotMinSavingsAnnotationKey: "0.1",
+				}
+				useCapacityType(v1.CapacityTypeOnDemand)
+				// the pool must not admit spot, or the replacement would be pinned to a capacity type these types never offer
+				nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, v1.NodeSelectorRequirementWithMinValues{
+					Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{v1.CapacityTypeOnDemand},
+				})
+				applyCandidate()
+				ExpectSingletonReconciled(ctx, disruptionController)
+				expectReplaced()
+			})
+		})
 		It("cannot replace spot with spot if less than minimum InstanceTypes flexibility", func() {
 			// Forcefully shrink the possible instanceTypes to be lower than 15 to replace a nodeclaim
 			cloudProvider.InstanceTypes = lo.Slice(fake.InstanceTypesAssorted(), 0, 5)
@@ -3516,6 +3715,54 @@ var _ = Describe("Consolidation", func() {
 				Expect(reqs.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeFalse())
 			}
 			ExpectNotFound(ctx, env.Client, nodeClaim, node)
+		})
+		It("does not split a spot node younger than its NodePool's spot-to-spot age floor", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+				MaxConsolidationReplacements: lo.ToPtr(3),
+				ConsolidationSplitFallback:   lo.ToPtr(true),
+				SpotToSpotMinInstanceTypes:   lo.ToPtr(1),
+				FeatureGates:                 test.FeatureGates{SpotToSpotConsolidation: new(true)},
+			}))
+			// the same spot candidate the previous case splits, held only by the age floor
+			currentInstance.Offerings = cloudprovider.Offerings{{
+				Available:    true,
+				Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1a"}),
+				Price:        1.0,
+			}}
+			mediumInstance.Offerings = cloudprovider.Offerings{{
+				Available:    true,
+				Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1a"}),
+				Price:        0.4,
+			}}
+			ExpectSingletonReconciled(ctx, pricingController)
+			nodeClaim.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeSpot
+			node.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeSpot
+			nodePool.Annotations = map[string]string{v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey: "10m"}
+			applyTwoPodNode()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			ExpectExists(ctx, env.Client, nodeClaim)
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_split_attempts_total", map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			Expect(found).To(BeFalse())
+			_, skipped := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_candidate_skips_total", map[string]string{
+				"consolidation_type":  "single",
+				metrics.NodePoolLabel: nodePool.Name,
+				"instance_type":       currentInstance.Name,
+				"reason":              disruption.CandidateSkipSpotToSpotMinNodeAge,
+			})
+			Expect(skipped).To(BeTrue())
+
+			// once aged in, the same node splits
+			env.Clock.Step(11 * time.Minute)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectSingletonReconciled(ctx, disruptionController)
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Replacements).To(HaveLen(2))
 		})
 		It("splits a node through the real validator", func() {
 			// revalidation re-simulates the command, and only reproduces the split if it applies the same price
