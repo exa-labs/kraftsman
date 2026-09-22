@@ -50,6 +50,7 @@ const (
 	packingOutcomeInflight         = "inflight"
 	packingOutcomeInflightUnpriced = "inflight_unpriced"
 	packingOutcomeNew              = "new"
+	packingOutcomeNewNoInflight    = "new_no_inflight"
 
 	packingShadowOutcomeSameNew                = "same_new"
 	packingShadowOutcomeWouldOpenNew           = "would_open_new"
@@ -250,7 +251,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: schedulerSubsystem,
 			Name:      "packing_decisions_total",
-			Help:      "Number of pods placed by the marginal-cost packing policy by outcome (inflight: joined an in-flight NodeClaim, new: opened a new NodeClaim because that was cheaper, inflight_unpriced: joined an in-flight NodeClaim because a launch price was unavailable).",
+			Help:      "Number of pods placed by the marginal-cost packing policy by outcome (inflight: joined an in-flight NodeClaim, new: opened a new NodeClaim because that was cheaper than growing an in-flight one, new_no_inflight: opened a new NodeClaim because no in-flight NodeClaim fit, inflight_unpriced: joined an in-flight NodeClaim because a launch price was unavailable).",
 		},
 		[]string{
 			metrics.NodePoolLabel,
