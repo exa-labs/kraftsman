@@ -1334,21 +1334,29 @@ func buildDaemonOverheadGroups(ctx context.Context, cache *DaemonOverheadCache, 
 			DaemonOverheadGroupCacheEventsTotal.Inc(map[string]string{outcomeLabel: cacheOutcomeHit})
 			return nct, groups
 		}
+		if cache.groupStore != nil {
+			if groups, ok := cache.groupStore.overheadGroups(nct); ok {
+				DaemonOverheadGroupCacheEventsTotal.Inc(map[string]string{outcomeLabel: cacheOutcomeHitCrossPass})
+				cache.setOverheadGroups(nct.NodePoolName, nct.cacheFingerprint, groups)
+				return nct, groups
+			}
+		}
 		DaemonOverheadGroupCacheEventsTotal.Inc(map[string]string{outcomeLabel: cacheOutcomeMiss})
 		groups := buildDaemonOverheadGroupsForTemplate(ctx, nct, daemonSetPods)
 		cache.setOverheadGroups(nct.NodePoolName, nct.cacheFingerprint, groups)
+		if cache.groupStore != nil {
+			cache.groupStore.setOverheadGroups(nct, groups)
+		}
 		return nct, groups
 	})
 }
 
 func buildDaemonOverheadGroupsForTemplate(ctx context.Context, nct *NodeClaimTemplate, daemonSetPods []*corev1.Pod) []DaemonOverheadGroup {
 	groups := map[string]*DaemonOverheadGroup{}
+	candidates := daemonPodTemplateCandidates(ctx, nct, daemonSetPods)
 	for _, it := range nct.InstanceTypeOptions {
-		compatible := lo.Filter(daemonSetPods, func(p *corev1.Pod, _ int) bool {
-			if pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests {
-				return false
-			}
-			return isDaemonPodCompatible(nct, it, p)
+		compatible := lo.FilterMap(candidates, func(c daemonPodCandidate, _ int) (*corev1.Pod, bool) {
+			return c.pod, c.fits(it)
 		})
 		// Instance types with the same compatible daemon pods can still differ in overhead when they permit
 		// different label values (see daemonoverhead.go), so the overhead is part of the grouping key.
@@ -1388,31 +1396,66 @@ func podSetKey(pods []*corev1.Pod) string {
 	return strings.Join(keys, ",")
 }
 
-// isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling.
-// The relaxation below rewrites the pod's tolerations and required node affinity terms; the daemon pods are shared
-// across instance types and templates, and computeDaemonOverhead reads every required term, so it runs on a copy.
-func isDaemonPodCompatible(nodeClaimTemplate *NodeClaimTemplate, it *cloudprovider.InstanceType, pod *corev1.Pod) bool {
+// daemonPodCandidate is a daemon pod that passed every instance-type-independent check against a
+// NodeClaimTemplate, together with the requirement sets of the required node affinity relaxation steps
+// that are compatible with the template. The pod fits an instance type when any of those steps
+// intersects the instance type's requirements.
+type daemonPodCandidate struct {
+	pod          *corev1.Pod
+	requirements []scheduling.Requirements
+}
+
+// fits reports whether the daemon pod schedules to a node of the given instance type from the template.
+// We use Intersects instead of IsCompatible for instance type requirements since we want to ignore any
+// custom keys on the daemonset pod since they will not be available on the instance type requirements.
+func (c daemonPodCandidate) fits(it *cloudprovider.InstanceType) bool {
+	return lo.ContainsBy(c.requirements, func(r scheduling.Requirements) bool {
+		return it.Requirements.Intersects(r) == nil
+	})
+}
+
+// daemonPodTemplateCandidates returns, in input order, the daemon pods that can schedule to some node
+// from the NodeClaimTemplate: they tolerate the template's taints and at least one relaxation step of
+// their required node affinity is compatible with the template's requirements. None of this depends on
+// the instance type, so it runs once per template rather than once per instance type.
+func daemonPodTemplateCandidates(ctx context.Context, nct *NodeClaimTemplate, daemonSetPods []*corev1.Pod) []daemonPodCandidate {
+	var candidates []daemonPodCandidate
+	for _, p := range daemonSetPods {
+		if pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests {
+			continue
+		}
+		if reqs := daemonPodTemplateRequirements(nct, p); len(reqs) != 0 {
+			candidates = append(candidates, daemonPodCandidate{pod: p, requirements: reqs})
+		}
+	}
+	return candidates
+}
+
+// daemonPodTemplateRequirements returns the strict pod requirements of every required node affinity
+// relaxation step of the daemon pod that is compatible with the NodeClaimTemplate, or nil when the pod
+// does not tolerate the template's taints. The relaxation rewrites the pod's tolerations and required
+// node affinity terms; the daemon pods are shared across templates, and computeDaemonOverhead reads
+// every required term, so it runs on a copy.
+func daemonPodTemplateRequirements(nodeClaimTemplate *NodeClaimTemplate, pod *corev1.Pod) []scheduling.Requirements {
 	pod = pod.DeepCopy()
 	preferences := &Preferences{}
 	// Add a toleration for PreferNoSchedule since a daemon pod shouldn't respect the preference
 	_ = preferences.toleratePreferNoScheduleTaints(pod)
 	if err := scheduling.Taints(nodeClaimTemplate.Spec.Taints).ToleratesPod(pod); err != nil {
-		return false
+		return nil
 	}
+	var compatible []scheduling.Requirements
 	for {
 		podRequirements := scheduling.NewStrictPodRequirements(pod)
 		// We don't consider pod preferences for scheduling requirements since we know that pod preferences won't matter with Daemonset scheduling
-		if nodeClaimTemplate.Requirements.IsCompatible(podRequirements, scheduling.AllowUndefinedWellKnownLabels) &&
-			// We use Intersects instead of IsCompatible for instance type requirements since we want to ignore any custom keys on the daemonset pod since they
-			// will not be available on the instance type requirements.
-			it.Requirements.Intersects(podRequirements) == nil {
-			return true
+		if nodeClaimTemplate.Requirements.IsCompatible(podRequirements, scheduling.AllowUndefinedWellKnownLabels) {
+			compatible = append(compatible, podRequirements)
 		}
-		// If relaxing the Node Affinity term didn't succeed, then this DaemonSet can't schedule to this NodePool
+		// Once no required Node Affinity term is left to relax, no further step can make the DaemonSet schedule to this NodePool.
 		// We don't consider other forms of relaxation here since we don't consider pod affinities/anti-affinities
 		// when considering DaemonSet schedulability
 		if preferences.removeRequiredNodeAffinityTerm(pod) == nil {
-			return false
+			return compatible
 		}
 	}
 }

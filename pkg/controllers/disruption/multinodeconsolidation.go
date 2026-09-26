@@ -54,7 +54,7 @@ func NewMultiNodeConsolidation(c consolidation, opts ...option.Function[MethodOp
 // nolint:gocyclo
 func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	ctx = withConsolidationType(ctx, m.ConsolidationType())
-	ctx = scheduling.WithDaemonOverheadCache(ctx, scheduling.NewDaemonOverheadCache())
+	ctx = scheduling.WithDaemonOverheadCache(ctx, scheduling.NewDaemonOverheadCacheWithGroupStore(m.daemonOverheadGroups))
 	ctx = scheduling.WithDomainGroupCache(ctx, scheduling.NewDomainGroupCache())
 	ctx = scheduling.WithNodeRequirementsCache(ctx, scheduling.NewNodeRequirementsCache())
 	ctx = scheduling.WithReservationCapacityCache(ctx, scheduling.NewReservationCapacityCache())

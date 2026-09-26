@@ -90,7 +90,7 @@ func (c *CensusController) Reconcile(ctx context.Context) (reconciler.Result, er
 	}
 
 	ctx = withConsolidationType(ctx, CensusConsolidationType)
-	ctx = scheduling.WithDaemonOverheadCache(ctx, scheduling.NewDaemonOverheadCache())
+	ctx = scheduling.WithDaemonOverheadCache(ctx, scheduling.NewDaemonOverheadCacheWithGroupStore(c.method.daemonOverheadGroups))
 	ctx = scheduling.WithDomainGroupCache(ctx, scheduling.NewDomainGroupCache())
 	ctx = scheduling.WithNodeRequirementsCache(ctx, scheduling.NewNodeRequirementsCache())
 	ctx = scheduling.WithReservationCapacityCache(ctx, scheduling.NewReservationCapacityCache())
