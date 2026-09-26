@@ -22,6 +22,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
@@ -30,6 +31,7 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
@@ -92,5 +94,63 @@ var _ = Describe("NodeUtils", func() {
 		nodeClaims, err := nodeutils.GetNodeClaims(ctx, env.Client, testNode)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(nodeClaims).To(HaveLen(0))
+	})
+})
+
+var _ = Describe("GetProvisionablePods", func() {
+	const nominatedNode = "reserved-node"
+	var pending *corev1.Pod
+	var victim *corev1.Pod
+
+	volcanoNominated := func() *corev1.Pod {
+		p := test.UnschedulablePod()
+		p.Spec.SchedulerName = podutils.VolcanoSchedulerName
+		p.Status.NominatedNodeName = nominatedNode
+		return p
+	}
+	provisionableNames := func() []string {
+		pods, err := nodeutils.GetProvisionablePods(ctx, env.Client)
+		Expect(err).NotTo(HaveOccurred())
+		return lo.Map(pods, func(p *corev1.Pod, _ int) string { return p.Name })
+	}
+
+	BeforeEach(func() {
+		victim = test.Pod(test.PodOptions{NodeName: nominatedNode})
+	})
+
+	It("should hold back a volcano pod nominated to a node whose victims are still terminating", func() {
+		pending = volcanoNominated()
+		ExpectApplied(ctx, env.Client, pending, victim)
+		Expect(pending.Status.NominatedNodeName).To(Equal(nominatedNode))
+		Expect(provisionableNames()).To(ConsistOf(pending.Name))
+
+		ExpectDeletionTimestampSet(ctx, env.Client, victim)
+		Expect(provisionableNames()).To(BeEmpty())
+	})
+
+	It("should release the volcano pod once nothing on the nominated node is terminating", func() {
+		pending = volcanoNominated()
+		bystander := test.Pod(test.PodOptions{NodeName: nominatedNode})
+		ExpectApplied(ctx, env.Client, pending, bystander)
+		Expect(provisionableNames()).To(ConsistOf(pending.Name))
+	})
+
+	It("should only hold back pods nominated to the draining node", func() {
+		pending = volcanoNominated()
+		elsewhere := volcanoNominated()
+		elsewhere.Status.NominatedNodeName = "other-node"
+		plain := test.UnschedulablePod()
+		plain.Spec.SchedulerName = podutils.VolcanoSchedulerName
+		ExpectApplied(ctx, env.Client, pending, elsewhere, plain, victim)
+		ExpectDeletionTimestampSet(ctx, env.Client, victim)
+		Expect(provisionableNames()).To(ConsistOf(elsewhere.Name, plain.Name))
+	})
+
+	It("should keep excluding kube-scheduler nominations regardless of the nominated node", func() {
+		pending = test.UnschedulablePod()
+		pending.Spec.SchedulerName = "default-scheduler"
+		pending.Status.NominatedNodeName = nominatedNode
+		ExpectApplied(ctx, env.Client, pending)
+		Expect(provisionableNames()).To(BeEmpty())
 	})
 })
