@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -122,5 +123,106 @@ func TestDaemonOverheadGroupCacheKeepsInterleavedFingerprints(t *testing.T) {
 	}
 	if &firstUnlimited[0] == &firstLimited[0] {
 		t.Fatalf("expected distinct groups per fingerprint")
+	}
+}
+
+// storeTestPass starts a pass-scoped cache over store that observed daemons.
+func storeTestPass(store *DaemonOverheadGroupStore, daemons []*corev1.Pod) *DaemonOverheadCache {
+	c := NewDaemonOverheadCacheWithGroupStore(store)
+	c.updateDaemonSetGeneration(daemons)
+	return c
+}
+
+func TestDaemonOverheadGroupStoreServesLaterPasses(t *testing.T) {
+	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
+	store := NewDaemonOverheadGroupStore()
+	daemons := []*corev1.Pod{daemonPod("ds-pod", "100m")}
+
+	firstTemplate := overheadGroupTestTemplate(1, true)
+	first := buildDaemonOverheadGroups(ctx, storeTestPass(store, daemons), []*NodeClaimTemplate{firstTemplate}, daemons)[firstTemplate]
+
+	// A later pass resolves its own instance type objects; the stored groups must bind to those.
+	secondPass := storeTestPass(store, daemons)
+	secondTemplate := overheadGroupTestTemplate(1, true)
+	groups, outcome, ok := secondPass.overheadGroups(secondTemplate)
+	if !ok || outcome != cacheOutcomeHitCrossPass {
+		t.Fatalf("expected a cross-pass hit, got ok=%v outcome=%q", ok, outcome)
+	}
+	if len(groups) != 1 || groups[0].InstanceTypes[0] != secondTemplate.InstanceTypeOptions[0] {
+		t.Fatalf("expected stored groups rebound to the later pass's instance types, got %+v", groups)
+	}
+	if !equality.Semantic.DeepEqual(groups[0].DaemonOverhead, first[0].DaemonOverhead) {
+		t.Fatalf("overhead changed across passes: %v vs %v", groups[0].DaemonOverhead, first[0].DaemonOverhead)
+	}
+	if _, outcome, _ := secondPass.overheadGroups(secondTemplate); outcome != cacheOutcomeHit {
+		t.Fatalf("expected a cross-pass hit to populate the pass cache, got %q", outcome)
+	}
+
+	// A DaemonSet change in a later pass must flush the store.
+	updated := []*corev1.Pod{daemonPod("ds-pod", "200m")}
+	thirdTemplate := overheadGroupTestTemplate(1, true)
+	third := buildDaemonOverheadGroups(ctx, storeTestPass(store, updated), []*NodeClaimTemplate{thirdTemplate}, updated)[thirdTemplate]
+	if third[0].DaemonOverhead.Cpu().MilliValue() != 200 {
+		t.Fatalf("expected recomputed overhead after daemonset change, got %v", third[0].DaemonOverhead)
+	}
+}
+
+// A pass that observed an older DaemonSet set must not publish its groups once another pass moved the store on, or
+// every later pass at the new generation would be served the old overhead.
+func TestDaemonOverheadGroupStoreIgnoresWritesFromOtherGenerations(t *testing.T) {
+	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
+	store := NewDaemonOverheadGroupStore()
+	oldDaemons := []*corev1.Pod{daemonPod("ds-pod", "100m")}
+	newDaemons := []*corev1.Pod{daemonPod("ds-pod", "200m")}
+
+	stalePass := storeTestPass(store, oldDaemons)
+	storeTestPass(store, newDaemons)
+	staleTemplate := overheadGroupTestTemplate(1, true)
+	buildDaemonOverheadGroups(ctx, stalePass, []*NodeClaimTemplate{staleTemplate}, oldDaemons)
+
+	nct := overheadGroupTestTemplate(1, true)
+	if _, outcome, _ := storeTestPass(store, newDaemons).overheadGroups(nct); outcome != cacheOutcomeMiss {
+		t.Fatalf("expected the stale pass's groups to be dropped, got %q", outcome)
+	}
+}
+
+func TestDaemonOverheadGroupStoreMissesUnlessGroupsCoverTheOptionsExactly(t *testing.T) {
+	store := NewDaemonOverheadGroupStore()
+	store.updateDaemonSetGeneration("g", true)
+	nct := overheadGroupTestTemplate(1, true)
+	key := overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint)
+	store.setOverheadGroups("g", key, []DaemonOverheadGroup{{InstanceTypes: nct.InstanceTypeOptions}})
+
+	replaced := overheadGroupTestTemplate(1, true)
+	replaced.InstanceTypeOptions = []*cloudprovider.InstanceType{fake.NewInstanceType("another-instance-type")}
+	extended := overheadGroupTestTemplate(1, true)
+	extended.InstanceTypeOptions = append(extended.InstanceTypeOptions, fake.NewInstanceType("another-instance-type"))
+	for name, template := range map[string]*NodeClaimTemplate{"stored type missing": replaced, "option in no group": extended} {
+		if _, ok := store.overheadGroups("g", key, template); ok {
+			t.Errorf("%s: expected a miss", name)
+		}
+	}
+	if _, ok := store.overheadGroups("g", key, overheadGroupTestTemplate(1, true)); !ok {
+		t.Errorf("expected a hit for the same options")
+	}
+}
+
+func TestDaemonOverheadGroupStoreStartsOverWhenFull(t *testing.T) {
+	store := NewDaemonOverheadGroupStore()
+	store.updateDaemonSetGeneration("g", true)
+	templates := make([]*NodeClaimTemplate, daemonOverheadGroupStoreMaxEntries+1)
+	for i := range templates {
+		templates[i] = overheadGroupTestTemplate(uint64(i), true) //nolint:gosec
+		store.setOverheadGroups("g", overheadGroupsCacheKey(templates[i].NodePoolName, templates[i].cacheFingerprint), []DaemonOverheadGroup{{InstanceTypes: templates[i].InstanceTypeOptions}})
+	}
+	lookup := func(nct *NodeClaimTemplate) bool {
+		_, ok := store.overheadGroups("g", overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint), nct)
+		return ok
+	}
+	if !lookup(templates[len(templates)-1]) {
+		t.Fatalf("expected the entry written after the reset to be kept")
+	}
+	if lookup(templates[0]) {
+		t.Fatalf("expected entries written before the reset to be dropped")
 	}
 }

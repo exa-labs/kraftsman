@@ -99,7 +99,7 @@ func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodO
 // nolint:gocyclo
 func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	ctx = withConsolidationType(ctx, s.ConsolidationType())
-	ctx = scheduling.WithDaemonOverheadCache(ctx, scheduling.NewDaemonOverheadCache())
+	ctx = scheduling.WithDaemonOverheadCache(ctx, scheduling.NewDaemonOverheadCacheWithGroupStore(s.daemonOverheadGroups))
 	ctx = scheduling.WithDomainGroupCache(ctx, scheduling.NewDomainGroupCache())
 	ctx = scheduling.WithNodeRequirementsCache(ctx, scheduling.NewNodeRequirementsCache())
 	ctx = scheduling.WithReservationCapacityCache(ctx, scheduling.NewReservationCapacityCache())

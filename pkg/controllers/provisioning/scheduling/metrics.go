@@ -41,6 +41,8 @@ const (
 	cacheOutcomeHit    = "hit"
 	cacheOutcomeMiss   = "miss"
 	cacheOutcomeBypass = "bypass"
+	// cacheOutcomeHitCrossPass is a pass-scoped miss served by a store that outlives the pass.
+	cacheOutcomeHitCrossPass = "hit_cross_pass"
 
 	cacheOutcomeShadowMatch    = "shadow_match"
 	cacheOutcomeShadowMismatch = "shadow_mismatch"
@@ -191,7 +193,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: schedulerSubsystem,
 			Name:      "daemon_overhead_group_cache_events_total",
-			Help:      "Number of pass-scoped daemon overhead group cache lookups by outcome (hit, miss, bypass).",
+			Help:      "Number of daemon overhead group cache lookups by outcome (hit, hit_cross_pass, miss, bypass).",
 		},
 		[]string{
 			outcomeLabel,

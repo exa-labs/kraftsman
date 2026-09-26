@@ -83,6 +83,8 @@ type consolidation struct {
 	// evaluator is initialized non-nil at construction. SetNodePoolTotals
 	// replaces it with a balancedEvaluator carrying the new totals.
 	evaluator Evaluator
+	// daemonOverheadGroups carries daemon overhead groups from one pass to the next.
+	daemonOverheadGroups *pscheduling.DaemonOverheadGroupStore
 }
 
 // NodePoolTotalsSetter is implemented by disruption methods that use balanced scoring.
@@ -105,6 +107,8 @@ func MakeConsolidation(clock clock.Clock, cluster *state.Cluster, kubeClient cli
 		cloudProvider: cloudProvider,
 		recorder:      recorder,
 		evaluator:     noopEvaluator{},
+
+		daemonOverheadGroups: pscheduling.NewDaemonOverheadGroupStore(),
 	}
 }
 

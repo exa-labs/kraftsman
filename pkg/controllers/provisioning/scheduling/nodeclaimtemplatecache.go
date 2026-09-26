@@ -56,8 +56,12 @@ type nodeClaimTemplateCacheEntry struct {
 	template    *NodeClaimTemplate // nil records a NodePool whose requirements filtered out all instance types
 }
 
+// nodeClaimTemplateFingerprintSeed is shared by every NodeClaimTemplateCache in the process so a template
+// fingerprint identifies the same inputs across passes, which DaemonOverheadGroupStore relies on.
+var nodeClaimTemplateFingerprintSeed = maphash.MakeSeed()
+
 func NewNodeClaimTemplateCache() *NodeClaimTemplateCache {
-	return &NodeClaimTemplateCache{seed: maphash.MakeSeed(), entries: map[string]nodeClaimTemplateCacheEntry{}}
+	return &NodeClaimTemplateCache{seed: nodeClaimTemplateFingerprintSeed, entries: map[string]nodeClaimTemplateCacheEntry{}}
 }
 
 func WithNodeClaimTemplateCache(ctx context.Context, cache *NodeClaimTemplateCache) context.Context {
