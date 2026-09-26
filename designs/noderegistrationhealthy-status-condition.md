@@ -64,7 +64,7 @@ Evaluation conditions -
 4. If Karpenter restarts then we flush the buffer but don't change the existing state of `NodeRegistrationHealthy` status condition.
 5. If there is an update to a Nodepool/Nodeclass, flush the buffer and set `NodeRegistrationHealthy: Unknown`.
 6. Since the buffer is FIFO, we remove the oldest launch result when the max buffer size is reached.
-7. If no new launches/registrations happen for 2 consecutive registration ttl cycles (currently 15 minutes), expire/remove the oldest entry in the buffer and revaluate the status condition if it was previously set to False. This ensures that a NodePool's unhealthy status does not persist indefinitely when no new launch attempts have occurred within 30 minutes.
+7. If no new launches/registrations happen for 2 consecutive registration ttl cycles (currently 15 minutes), expire/remove the oldest entry in the buffer and re-evaluate the status condition if it was previously set to False. This ensures that a NodePool's unhealthy status does not persist indefinitely when no new launch attempts have occurred within 30 minutes.
 
 See below for example evaluations:
 
