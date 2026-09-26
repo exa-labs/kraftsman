@@ -1319,9 +1319,9 @@ type DaemonOverheadGroup struct {
 //
 // The per-template result is a pure function of the template (NodePool spec plus its instance type
 // set, covered by the template's cache fingerprint) and the daemonset pods (covered by the cache's
-// daemonset generation), so it is memoized per pass. Cached groups are shared across schedulers
-// and treated as read-only; the only mutable member (HostPortUsage) is deep copied per NodeClaim
-// by NewNodeClaim before any mutation.
+// daemonset generation), so it is memoized per pass and, when the cache has a group store, across
+// passes. Cached groups are shared across schedulers and treated as read-only; the only mutable
+// member (HostPortUsage) is deep copied per NodeClaim by NewNodeClaim before any mutation.
 func buildDaemonOverheadGroups(ctx context.Context, cache *DaemonOverheadCache, nodeClaimTemplates []*NodeClaimTemplate, daemonSetPods []*corev1.Pod) map[*NodeClaimTemplate][]DaemonOverheadGroup {
 	return lo.SliceToMap(nodeClaimTemplates, func(nct *NodeClaimTemplate) (*NodeClaimTemplate, []DaemonOverheadGroup) {
 		if cache == nil || !nct.cacheFingerprintValid {
@@ -1330,23 +1330,13 @@ func buildDaemonOverheadGroups(ctx context.Context, cache *DaemonOverheadCache, 
 			}
 			return nct, buildDaemonOverheadGroupsForTemplate(ctx, nct, daemonSetPods)
 		}
-		if groups, ok := cache.overheadGroups(nct.NodePoolName, nct.cacheFingerprint); ok {
-			DaemonOverheadGroupCacheEventsTotal.Inc(map[string]string{outcomeLabel: cacheOutcomeHit})
+		if groups, outcome, ok := cache.overheadGroups(nct); ok {
+			DaemonOverheadGroupCacheEventsTotal.Inc(map[string]string{outcomeLabel: outcome})
 			return nct, groups
-		}
-		if cache.groupStore != nil {
-			if groups, ok := cache.groupStore.overheadGroups(nct); ok {
-				DaemonOverheadGroupCacheEventsTotal.Inc(map[string]string{outcomeLabel: cacheOutcomeHitCrossPass})
-				cache.setOverheadGroups(nct.NodePoolName, nct.cacheFingerprint, groups)
-				return nct, groups
-			}
 		}
 		DaemonOverheadGroupCacheEventsTotal.Inc(map[string]string{outcomeLabel: cacheOutcomeMiss})
 		groups := buildDaemonOverheadGroupsForTemplate(ctx, nct, daemonSetPods)
-		cache.setOverheadGroups(nct.NodePoolName, nct.cacheFingerprint, groups)
-		if cache.groupStore != nil {
-			cache.groupStore.setOverheadGroups(nct, groups)
-		}
+		cache.setOverheadGroups(nct, groups)
 		return nct, groups
 	})
 }

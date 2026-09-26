@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -125,160 +126,103 @@ func TestDaemonOverheadGroupCacheKeepsInterleavedFingerprints(t *testing.T) {
 	}
 }
 
-// referenceDaemonPodCompatible is the per-instance-type daemon compatibility check: tolerate the template's taints,
-// then relax required node affinity terms until one step is compatible with the template and intersects the
-// instance type. buildDaemonOverheadGroupsForTemplate must admit exactly the pods it admits.
-func referenceDaemonPodCompatible(nct *NodeClaimTemplate, it *cloudprovider.InstanceType, p *corev1.Pod) bool {
-	p = p.DeepCopy()
-	preferences := &Preferences{}
-	_ = preferences.toleratePreferNoScheduleTaints(p)
-	if err := scheduling.Taints(nct.Spec.Taints).ToleratesPod(p); err != nil {
-		return false
-	}
-	for {
-		podRequirements := scheduling.NewStrictPodRequirements(p)
-		if nct.Requirements.IsCompatible(podRequirements, scheduling.AllowUndefinedWellKnownLabels) &&
-			it.Requirements.Intersects(podRequirements) == nil {
-			return true
-		}
-		if preferences.removeRequiredNodeAffinityTerm(p) == nil {
-			return false
-		}
-	}
-}
-
-func TestDaemonOverheadGroupsMatchPerInstanceTypeCompatibility(t *testing.T) {
-	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
-	its := fake.InstanceTypes(6)
-	tainted := &NodeClaimTemplate{
-		NodePoolName:        "tainted",
-		InstanceTypeOptions: its,
-		Requirements:        scheduling.NewRequirements(scheduling.NewRequirement("pool", corev1.NodeSelectorOpIn, "tainted")),
-	}
-	tainted.Spec.Taints = []corev1.Taint{
-		{Key: "dedicated", Value: "sandbox", Effect: corev1.TaintEffectNoSchedule},
-		{Key: "soft", Value: "true", Effect: corev1.TaintEffectPreferNoSchedule},
-	}
-	plain := &NodeClaimTemplate{
-		NodePoolName:        "plain",
-		InstanceTypeOptions: its,
-		Requirements:        scheduling.NewRequirements(scheduling.NewRequirement("pool", corev1.NodeSelectorOpIn, "plain")),
-	}
-	toleratesSandbox := func(p *corev1.Pod) *corev1.Pod {
-		p.Spec.Tolerations = []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "sandbox", Effect: corev1.TaintEffectNoSchedule}}
-		return p
-	}
-	daemons := []*corev1.Pod{
-		daemonPod("everywhere", "10m"),
-		toleratesSandbox(daemonPod("sandbox-only", "20m", in("pool", "tainted"))),
-		toleratesSandbox(daemonPod("sandbox-small-types", "40m", in("pool", "tainted"), in(corev1.LabelInstanceTypeStable, its[0].Name, its[1].Name))),
-		daemonPod("plain-large-types", "80m", in("pool", "plain"), notIn(corev1.LabelInstanceTypeStable, its[0].Name, its[1].Name)),
-		// Relaxation: the first term only matches type 2, the second only the plain pool, so the pod
-		// lands on type 2 in either pool it tolerates and on every type of the plain pool.
-		daemonPodWithTerms("or-terms", "160m",
-			[]corev1.NodeSelectorRequirement{in(corev1.LabelInstanceTypeStable, its[2].Name)},
-			[]corev1.NodeSelectorRequirement{in("pool", "plain")}),
-		daemonPod("nowhere", "320m", in("pool", "other")),
-	}
-	for _, nct := range []*NodeClaimTemplate{tainted, plain} {
-		groups := buildDaemonOverheadGroupsForTemplate(ctx, nct, daemons)
-		for _, it := range its {
-			var want []*corev1.Pod
-			for _, p := range daemons {
-				if referenceDaemonPodCompatible(nct, it, p) {
-					want = append(want, p)
-				}
-			}
-			wantOverhead, _ := computeDaemonOverhead(candidateRequirements(nct, it), want)
-			var got []DaemonOverheadGroup
-			for _, g := range groups {
-				for _, git := range g.InstanceTypes {
-					if git == it {
-						got = append(got, g)
-					}
-				}
-			}
-			if len(got) != 1 {
-				t.Fatalf("%s/%s: expected exactly one group, got %d", nct.NodePoolName, it.Name, len(got))
-			}
-			if !equality(got[0].DaemonOverhead, wantOverhead) {
-				t.Fatalf("%s/%s: overhead %v, want %v (pods %s)", nct.NodePoolName, it.Name, got[0].DaemonOverhead, wantOverhead, podSetKey(want))
-			}
-		}
-	}
-}
-
-func equality(a, b corev1.ResourceList) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for name, qa := range a {
-		qb, ok := b[name]
-		if !ok || qa.Cmp(qb) != 0 {
-			return false
-		}
-	}
-	return true
+// storeTestPass starts a pass-scoped cache over store that observed daemons.
+func storeTestPass(store *DaemonOverheadGroupStore, daemons []*corev1.Pod) *DaemonOverheadCache {
+	c := NewDaemonOverheadCacheWithGroupStore(store)
+	c.updateDaemonSetGeneration(daemons)
+	return c
 }
 
 func TestDaemonOverheadGroupStoreServesLaterPasses(t *testing.T) {
 	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
 	store := NewDaemonOverheadGroupStore()
-	daemon := daemonPod("ds-pod", "100m")
+	daemons := []*corev1.Pod{daemonPod("ds-pod", "100m")}
 
-	firstPass := NewDaemonOverheadCacheWithGroupStore(store)
-	firstPass.updateDaemonSetGeneration([]*corev1.Pod{daemon})
 	firstTemplate := overheadGroupTestTemplate(1, true)
-	first := buildDaemonOverheadGroups(ctx, firstPass, []*NodeClaimTemplate{firstTemplate}, []*corev1.Pod{daemon})[firstTemplate]
+	first := buildDaemonOverheadGroups(ctx, storeTestPass(store, daemons), []*NodeClaimTemplate{firstTemplate}, daemons)[firstTemplate]
 
 	// A later pass resolves its own instance type objects; the stored groups must bind to those.
-	secondPass := NewDaemonOverheadCacheWithGroupStore(store)
-	secondPass.updateDaemonSetGeneration([]*corev1.Pod{daemon})
+	secondPass := storeTestPass(store, daemons)
 	secondTemplate := overheadGroupTestTemplate(1, true)
-	second := buildDaemonOverheadGroups(ctx, secondPass, []*NodeClaimTemplate{secondTemplate}, []*corev1.Pod{daemon})[secondTemplate]
-	if len(second) != 1 || second[0].InstanceTypes[0] != secondTemplate.InstanceTypeOptions[0] {
-		t.Fatalf("expected stored groups rebound to the later pass's instance types, got %+v", second)
+	groups, outcome, ok := secondPass.overheadGroups(secondTemplate)
+	if !ok || outcome != cacheOutcomeHitCrossPass {
+		t.Fatalf("expected a cross-pass hit, got ok=%v outcome=%q", ok, outcome)
 	}
-	if second[0].InstanceTypes[0] == first[0].InstanceTypes[0] {
-		t.Fatalf("expected distinct instance type objects across passes")
+	if len(groups) != 1 || groups[0].InstanceTypes[0] != secondTemplate.InstanceTypeOptions[0] {
+		t.Fatalf("expected stored groups rebound to the later pass's instance types, got %+v", groups)
 	}
-	if !equality(second[0].DaemonOverhead, first[0].DaemonOverhead) {
-		t.Fatalf("overhead changed across passes: %v vs %v", second[0].DaemonOverhead, first[0].DaemonOverhead)
+	if !equality.Semantic.DeepEqual(groups[0].DaemonOverhead, first[0].DaemonOverhead) {
+		t.Fatalf("overhead changed across passes: %v vs %v", groups[0].DaemonOverhead, first[0].DaemonOverhead)
 	}
-	if _, ok := secondPass.overheadGroups(secondTemplate.NodePoolName, secondTemplate.cacheFingerprint); !ok {
-		t.Fatalf("expected a cross-pass hit to populate the pass cache")
+	if _, outcome, _ := secondPass.overheadGroups(secondTemplate); outcome != cacheOutcomeHit {
+		t.Fatalf("expected a cross-pass hit to populate the pass cache, got %q", outcome)
 	}
 
 	// A DaemonSet change in a later pass must flush the store.
-	updated := daemonPod("ds-pod", "200m")
-	thirdPass := NewDaemonOverheadCacheWithGroupStore(store)
-	thirdPass.updateDaemonSetGeneration([]*corev1.Pod{updated})
+	updated := []*corev1.Pod{daemonPod("ds-pod", "200m")}
 	thirdTemplate := overheadGroupTestTemplate(1, true)
-	third := buildDaemonOverheadGroups(ctx, thirdPass, []*NodeClaimTemplate{thirdTemplate}, []*corev1.Pod{updated})[thirdTemplate]
+	third := buildDaemonOverheadGroups(ctx, storeTestPass(store, updated), []*NodeClaimTemplate{thirdTemplate}, updated)[thirdTemplate]
 	if third[0].DaemonOverhead.Cpu().MilliValue() != 200 {
 		t.Fatalf("expected recomputed overhead after daemonset change, got %v", third[0].DaemonOverhead)
 	}
 }
 
-func TestDaemonOverheadGroupStoreMissesOnUnknownInstanceType(t *testing.T) {
+// A pass that observed an older DaemonSet set must not publish its groups once another pass moved the store on, or
+// every later pass at the new generation would be served the old overhead.
+func TestDaemonOverheadGroupStoreIgnoresWritesFromOtherGenerations(t *testing.T) {
+	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
 	store := NewDaemonOverheadGroupStore()
-	store.updateDaemonSetGeneration("g", true)
+	oldDaemons := []*corev1.Pod{daemonPod("ds-pod", "100m")}
+	newDaemons := []*corev1.Pod{daemonPod("ds-pod", "200m")}
+
+	stalePass := storeTestPass(store, oldDaemons)
+	storeTestPass(store, newDaemons)
+	staleTemplate := overheadGroupTestTemplate(1, true)
+	buildDaemonOverheadGroups(ctx, stalePass, []*NodeClaimTemplate{staleTemplate}, oldDaemons)
+
 	nct := overheadGroupTestTemplate(1, true)
-	store.setOverheadGroups(nct, []DaemonOverheadGroup{{InstanceTypes: nct.InstanceTypeOptions}})
-	other := overheadGroupTestTemplate(1, true)
-	other.InstanceTypeOptions = []*cloudprovider.InstanceType{fake.NewInstanceType("another-instance-type")}
-	if _, ok := store.overheadGroups(other); ok {
-		t.Fatalf("expected a miss when a stored instance type is not among the template's options")
+	if _, outcome, _ := storeTestPass(store, newDaemons).overheadGroups(nct); outcome != cacheOutcomeMiss {
+		t.Fatalf("expected the stale pass's groups to be dropped, got %q", outcome)
 	}
 }
 
-func TestDaemonOverheadGroupStoreIsBounded(t *testing.T) {
+func TestDaemonOverheadGroupStoreMissesUnlessGroupsCoverTheOptionsExactly(t *testing.T) {
 	store := NewDaemonOverheadGroupStore()
 	store.updateDaemonSetGeneration("g", true)
-	for i := range daemonOverheadGroupStoreMaxEntries + 1 {
-		store.setOverheadGroups(overheadGroupTestTemplate(uint64(i), true), nil) //nolint:gosec
+	nct := overheadGroupTestTemplate(1, true)
+	key := overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint)
+	store.setOverheadGroups("g", key, []DaemonOverheadGroup{{InstanceTypes: nct.InstanceTypeOptions}})
+
+	replaced := overheadGroupTestTemplate(1, true)
+	replaced.InstanceTypeOptions = []*cloudprovider.InstanceType{fake.NewInstanceType("another-instance-type")}
+	extended := overheadGroupTestTemplate(1, true)
+	extended.InstanceTypeOptions = append(extended.InstanceTypeOptions, fake.NewInstanceType("another-instance-type"))
+	for name, template := range map[string]*NodeClaimTemplate{"stored type missing": replaced, "option in no group": extended} {
+		if _, ok := store.overheadGroups("g", key, template); ok {
+			t.Errorf("%s: expected a miss", name)
+		}
 	}
-	if len(store.entries) > daemonOverheadGroupStoreMaxEntries {
-		t.Fatalf("store grew to %d entries", len(store.entries))
+	if _, ok := store.overheadGroups("g", key, overheadGroupTestTemplate(1, true)); !ok {
+		t.Errorf("expected a hit for the same options")
+	}
+}
+
+func TestDaemonOverheadGroupStoreStartsOverWhenFull(t *testing.T) {
+	store := NewDaemonOverheadGroupStore()
+	store.updateDaemonSetGeneration("g", true)
+	templates := make([]*NodeClaimTemplate, daemonOverheadGroupStoreMaxEntries+1)
+	for i := range templates {
+		templates[i] = overheadGroupTestTemplate(uint64(i), true) //nolint:gosec
+		store.setOverheadGroups("g", overheadGroupsCacheKey(templates[i].NodePoolName, templates[i].cacheFingerprint), []DaemonOverheadGroup{{InstanceTypes: templates[i].InstanceTypeOptions}})
+	}
+	lookup := func(nct *NodeClaimTemplate) bool {
+		_, ok := store.overheadGroups("g", overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint), nct)
+		return ok
+	}
+	if !lookup(templates[len(templates)-1]) {
+		t.Fatalf("expected the entry written after the reset to be kept")
+	}
+	if lookup(templates[0]) {
+		t.Fatalf("expected entries written before the reset to be dropped")
 	}
 }

@@ -40,11 +40,14 @@ type daemonOverheadCacheContextKey struct{}
 // DaemonOverheadCache memoizes candidate-invariant existing-node scheduling data for one scheduling pass.
 // The cache must not be shared across passes because node labels and taints can change.
 type DaemonOverheadCache struct {
-	mu                       sync.RWMutex
-	daemonPodsByKey          map[string][]*corev1.Pod
-	daemonRequestsByKey      map[string]corev1.ResourceList
-	ingredientsByKey         map[string]existingNodeIngredients
-	overheadGroupsByTemplate map[string]overheadGroupsCacheEntry
+	mu                  sync.RWMutex
+	daemonPodsByKey     map[string][]*corev1.Pod
+	daemonRequestsByKey map[string]corev1.ResourceList
+	ingredientsByKey    map[string]existingNodeIngredients
+	// overheadGroupsByTemplate is keyed by NodePool name and template fingerprint rather than by NodePool alone: a
+	// consolidation pass interleaves a NodePool's unlimited template with the price-limited ones its split retries
+	// build, and one entry per NodePool would make those overwrite each other on every candidate.
+	overheadGroupsByTemplate map[string][]DaemonOverheadGroup
 	daemonSetGeneration      string
 	daemonSetGenerationValid bool
 	// groupStore, when set, backs overhead group misses with entries from earlier passes.
@@ -62,24 +65,12 @@ type existingNodeIngredients struct {
 	remainingBase corev1.ResourceList
 }
 
-// overheadGroupsCacheEntry stores the daemon overhead groups computed for one NodeClaimTemplate,
-// keyed by the template's cache fingerprint so any change to the NodePool spec or its instance
-// type set invalidates the entry. DaemonSet changes invalidate the whole cache via
-// updateDaemonSetGeneration. The fingerprint is part of the map key rather than a value checked
-// against a single per-NodePool entry: a consolidation pass interleaves a NodePool's unlimited
-// template with the price-limited ones its split retries build, and one entry per NodePool would
-// make those two overwrite each other on every candidate.
-type overheadGroupsCacheEntry struct {
-	fingerprint uint64
-	groups      []DaemonOverheadGroup
-}
-
 func NewDaemonOverheadCache() *DaemonOverheadCache {
 	return &DaemonOverheadCache{
 		daemonPodsByKey:          map[string][]*corev1.Pod{},
 		daemonRequestsByKey:      map[string]corev1.ResourceList{},
 		ingredientsByKey:         map[string]existingNodeIngredients{},
-		overheadGroupsByTemplate: map[string]overheadGroupsCacheEntry{},
+		overheadGroupsByTemplate: map[string][]DaemonOverheadGroup{},
 	}
 }
 
@@ -102,7 +93,7 @@ func (c *DaemonOverheadCache) updateDaemonSetGeneration(daemonSetPods []*corev1.
 		c.daemonPodsByKey = map[string][]*corev1.Pod{}
 		c.daemonRequestsByKey = map[string]corev1.ResourceList{}
 		c.ingredientsByKey = map[string]existingNodeIngredients{}
-		c.overheadGroupsByTemplate = map[string]overheadGroupsCacheEntry{}
+		c.overheadGroupsByTemplate = map[string][]DaemonOverheadGroup{}
 		c.daemonSetGeneration = generation
 		c.daemonSetGenerationValid = ok
 	}
@@ -233,24 +224,41 @@ func (c *DaemonOverheadCache) setDaemonRequests(key string, requests corev1.Reso
 	c.daemonRequestsByKey[key] = requests.DeepCopy()
 }
 
-// overheadGroups returns the cached daemon overhead groups for a NodePool when the template
-// fingerprint matches. The returned slice and its contents are shared across schedulers and MUST
-// be treated as read-only; NewNodeClaim already deep copies the per-NodeClaim mutable piece
-// (HostPortUsage) before any mutation.
-func (c *DaemonOverheadCache) overheadGroups(nodePoolName string, fingerprint uint64) ([]DaemonOverheadGroup, bool) {
+// overheadGroups returns the daemon overhead groups for a fingerprinted template from this pass or, failing that,
+// from the group store, together with the lookup outcome. The returned slice and its contents are shared across
+// schedulers (and, through the store, across passes) and MUST be treated as read-only; NewNodeClaim deep copies the
+// per-NodeClaim mutable piece (HostPortUsage) before any mutation.
+func (c *DaemonOverheadCache) overheadGroups(nct *NodeClaimTemplate) ([]DaemonOverheadGroup, string, bool) {
+	key := overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint)
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	entry, ok := c.overheadGroupsByTemplate[overheadGroupsCacheKey(nodePoolName, fingerprint)]
-	if !ok || entry.fingerprint != fingerprint {
-		return nil, false
+	groups, ok := c.overheadGroupsByTemplate[key]
+	generation, generationValid := c.daemonSetGeneration, c.daemonSetGenerationValid
+	c.mu.RUnlock()
+	if ok {
+		return groups, cacheOutcomeHit, true
 	}
-	return entry.groups, true
+	if c.groupStore == nil || !generationValid {
+		return nil, cacheOutcomeMiss, false
+	}
+	if groups, ok = c.groupStore.overheadGroups(generation, key, nct); !ok {
+		return nil, cacheOutcomeMiss, false
+	}
+	c.mu.Lock()
+	c.overheadGroupsByTemplate[key] = groups
+	c.mu.Unlock()
+	return groups, cacheOutcomeHitCrossPass, true
 }
 
-func (c *DaemonOverheadCache) setOverheadGroups(nodePoolName string, fingerprint uint64, groups []DaemonOverheadGroup) {
+// setOverheadGroups records the groups computed for a fingerprinted template in this pass and in the group store.
+func (c *DaemonOverheadCache) setOverheadGroups(nct *NodeClaimTemplate, groups []DaemonOverheadGroup) {
+	key := overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.overheadGroupsByTemplate[overheadGroupsCacheKey(nodePoolName, fingerprint)] = overheadGroupsCacheEntry{fingerprint: fingerprint, groups: groups}
+	c.overheadGroupsByTemplate[key] = groups
+	generation, generationValid := c.daemonSetGeneration, c.daemonSetGenerationValid
+	c.mu.Unlock()
+	if c.groupStore != nil && generationValid {
+		c.groupStore.setOverheadGroups(generation, key, groups)
+	}
 }
 
 func overheadGroupsCacheKey(nodePoolName string, fingerprint uint64) string {
@@ -265,18 +273,26 @@ const daemonOverheadGroupStoreMaxEntries = 1024
 // DaemonOverheadGroupStore keeps daemon overhead groups across scheduling passes. Groups are a pure
 // function of the NodeClaimTemplate's candidate-invariant inputs (covered by its cache fingerprint:
 // NodePool UID and generation, provider instance type revision, instance type count, minValues policy
-// and price limit) and the DaemonSet pod set (covered by the DaemonSet generation, which flushes the
-// store on change). Entries hold instance type names rather than pointers because each pass resolves
-// its own *InstanceType objects and the scheduler matches groups to a template's options by identity.
+// and price limit), the DaemonSet pod set (covered by the DaemonSet generation) and the process-wide
+// IgnoreDRARequests option. The store holds entries for a single DaemonSet generation: moving to another
+// flushes it, and reads and writes made under any other generation are ignored, so a pass that
+// observed an older DaemonSet set can neither read nor publish groups for the current one.
+// Entries hold instance type names rather than pointers because each pass resolves its own
+// *InstanceType objects and the scheduler matches groups to a template's options by identity.
 type DaemonOverheadGroupStore struct {
 	mu                       sync.Mutex
-	entries                  map[string][]storedDaemonOverheadGroup
+	entries                  map[string]storedDaemonOverheadGroups
 	daemonSetGeneration      string
 	daemonSetGenerationValid bool
 }
 
-// storedDaemonOverheadGroup is a DaemonOverheadGroup with its instance types recorded by name. The
-// overhead and host port usage are shared read-only, as they are between schedulers within a pass.
+// storedDaemonOverheadGroups is one template's groups with instance types recorded by name. The overhead
+// and host port usage are shared read-only, as they are between schedulers within a pass.
+type storedDaemonOverheadGroups struct {
+	groups        []storedDaemonOverheadGroup
+	instanceTypes int
+}
+
 type storedDaemonOverheadGroup struct {
 	instanceTypeNames []string
 	daemonOverhead    corev1.ResourceList
@@ -284,35 +300,40 @@ type storedDaemonOverheadGroup struct {
 }
 
 func NewDaemonOverheadGroupStore() *DaemonOverheadGroupStore {
-	return &DaemonOverheadGroupStore{entries: map[string][]storedDaemonOverheadGroup{}}
+	return &DaemonOverheadGroupStore{entries: map[string]storedDaemonOverheadGroups{}}
 }
 
 func (s *DaemonOverheadGroupStore) updateDaemonSetGeneration(generation string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !ok || !s.daemonSetGenerationValid || s.daemonSetGeneration != generation {
-		s.entries = map[string][]storedDaemonOverheadGroup{}
+		s.entries = map[string]storedDaemonOverheadGroups{}
 		s.daemonSetGeneration = generation
 		s.daemonSetGenerationValid = ok
 	}
 }
 
-// overheadGroups returns the stored groups for the template, rebound to the template's own instance
-// type objects. It misses when any stored instance type name is absent from the template's options,
-// which the fingerprint rules out but which would otherwise silently drop instance types.
-func (s *DaemonOverheadGroupStore) overheadGroups(nct *NodeClaimTemplate) ([]DaemonOverheadGroup, bool) {
+func (s *DaemonOverheadGroupStore) generationMatches(generation string) bool {
+	return s.daemonSetGenerationValid && s.daemonSetGeneration == generation
+}
+
+// overheadGroups returns the stored groups for the template, rebound to the template's own instance type
+// objects. It misses unless the stored groups cover exactly the template's options, which the fingerprint
+// implies but which would otherwise silently drop instance types or leave some in no group.
+func (s *DaemonOverheadGroupStore) overheadGroups(generation, key string, nct *NodeClaimTemplate) ([]DaemonOverheadGroup, bool) {
 	s.mu.Lock()
-	stored, ok := s.entries[overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint)]
+	stored, ok := s.entries[key]
+	ok = ok && s.generationMatches(generation)
 	s.mu.Unlock()
-	if !ok {
+	if !ok || stored.instanceTypes != len(nct.InstanceTypeOptions) {
 		return nil, false
 	}
 	byName := make(map[string]*cloudprovider.InstanceType, len(nct.InstanceTypeOptions))
 	for _, it := range nct.InstanceTypeOptions {
 		byName[it.Name] = it
 	}
-	groups := make([]DaemonOverheadGroup, len(stored))
-	for i, g := range stored {
+	groups := make([]DaemonOverheadGroup, len(stored.groups))
+	for i, g := range stored.groups {
 		its := make([]*cloudprovider.InstanceType, len(g.instanceTypeNames))
 		for j, name := range g.instanceTypeNames {
 			it, found := byName[name]
@@ -326,19 +347,23 @@ func (s *DaemonOverheadGroupStore) overheadGroups(nct *NodeClaimTemplate) ([]Dae
 	return groups, true
 }
 
-func (s *DaemonOverheadGroupStore) setOverheadGroups(nct *NodeClaimTemplate, groups []DaemonOverheadGroup) {
-	stored := make([]storedDaemonOverheadGroup, len(groups))
+func (s *DaemonOverheadGroupStore) setOverheadGroups(generation, key string, groups []DaemonOverheadGroup) {
+	stored := storedDaemonOverheadGroups{groups: make([]storedDaemonOverheadGroup, len(groups))}
 	for i, g := range groups {
-		stored[i] = storedDaemonOverheadGroup{
+		stored.groups[i] = storedDaemonOverheadGroup{
 			instanceTypeNames: lo.Map(g.InstanceTypes, func(it *cloudprovider.InstanceType, _ int) string { return it.Name }),
 			daemonOverhead:    g.DaemonOverhead,
 			hostPortUsage:     g.HostPortUsage,
 		}
+		stored.instanceTypes += len(g.InstanceTypes)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.entries) >= daemonOverheadGroupStoreMaxEntries {
-		s.entries = map[string][]storedDaemonOverheadGroup{}
+	if !s.generationMatches(generation) {
+		return
 	}
-	s.entries[overheadGroupsCacheKey(nct.NodePoolName, nct.cacheFingerprint)] = stored
+	if len(s.entries) >= daemonOverheadGroupStoreMaxEntries {
+		s.entries = map[string]storedDaemonOverheadGroups{}
+	}
+	s.entries[key] = stored
 }

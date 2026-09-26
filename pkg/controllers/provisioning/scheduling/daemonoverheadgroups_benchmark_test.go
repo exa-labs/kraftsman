@@ -64,9 +64,38 @@ func daemonOverheadBenchmarkFleet(pools, instanceTypes, generalDaemons, scopedDa
 
 func BenchmarkBuildDaemonOverheadGroups(b *testing.B) {
 	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
-	templates, daemons := daemonOverheadBenchmarkFleet(36, 200, 36, 124)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buildDaemonOverheadGroups(ctx, nil, templates, daemons)
+	for _, bc := range []struct {
+		name                   string
+		general, scopedDaemons int
+	}{
+		// Most daemons rejected on the taint alone: the case the template-level pre-filter targets.
+		{name: "taint-scoped", general: 36, scopedDaemons: 124},
+		// Every daemon tolerated everywhere: the pre-filter prunes nothing.
+		{name: "unscoped", general: 160},
+	} {
+		templates, daemons := daemonOverheadBenchmarkFleet(36, 200, bc.general, bc.scopedDaemons)
+		b.Run(bc.name+"/uncached", func(b *testing.B) {
+			for b.Loop() {
+				buildDaemonOverheadGroups(ctx, nil, templates, daemons)
+			}
+		})
+		// A later pass served from the group store: only the rebinding to the pass's instance types remains.
+		b.Run(bc.name+"/cross-pass-hit", func(b *testing.B) {
+			for i, nct := range templates {
+				nct.cacheFingerprint, nct.cacheFingerprintValid = uint64(i), true //nolint:gosec
+			}
+			store := NewDaemonOverheadGroupStore()
+			warm := NewDaemonOverheadCacheWithGroupStore(store)
+			warm.updateDaemonSetGeneration(daemons)
+			buildDaemonOverheadGroups(ctx, warm, templates, daemons)
+			for b.Loop() {
+				pass := NewDaemonOverheadCacheWithGroupStore(store)
+				pass.updateDaemonSetGeneration(daemons)
+				buildDaemonOverheadGroups(ctx, pass, templates, daemons)
+			}
+			for _, nct := range templates {
+				nct.cacheFingerprintValid = false
+			}
+		})
 	}
 }
