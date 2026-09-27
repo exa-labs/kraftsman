@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
@@ -98,7 +100,35 @@ func (i *Initialization) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim)
 	}
 	log.FromContext(ctx).WithValues("allocatable", node.Status.Allocatable).Info("initialized nodeclaim")
 	nodeClaim.StatusConditions(status.WithClock(i.clock)).SetTrue(v1.ConditionTypeInitialized)
+	i.observeInitializationDurations(nodeClaim)
 	return reconcile.Result{}, nil
+}
+
+// observeInitializationDurations emits one sample per bootstrap stage for a NodeClaim that just became Initialized.
+// Stage boundaries come from the status condition transition times; a stage whose boundary is missing (e.g. a
+// NodeClaim hydrated from an existing instance that never recorded Launched) is skipped rather than reported as zero.
+func (i *Initialization) observeInitializationDurations(nodeClaim *v1.NodeClaim) {
+	labels := func(stage string) map[string]string {
+		return map[string]string{
+			StageLabel:                stage,
+			metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
+			metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
+		}
+	}
+	now := i.clock.Now()
+	created := nodeClaim.CreationTimestamp.Time
+	launched := nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched).LastTransitionTime.Time
+	registered := nodeClaim.StatusConditions().Get(v1.ConditionTypeRegistered).LastTransitionTime.Time
+	observe := func(stage string, from, to time.Time) {
+		if from.IsZero() || to.IsZero() || to.Before(from) {
+			return
+		}
+		NodeClaimInitializationDurationSeconds.Observe(to.Sub(from).Seconds(), labels(stage))
+	}
+	observe(StageLaunch, created, launched)
+	observe(StageRegistration, launched, registered)
+	observe(StageInitialization, registered, now)
+	observe(StageTotal, created, now)
 }
 
 // KnownEphemeralTaintsRemoved validates whether all the ephemeral taints are removed
