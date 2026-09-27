@@ -18,6 +18,7 @@ package scheduling
 
 import (
 	"fmt"
+	"hash/maphash"
 	"math"
 
 	"github.com/awslabs/operatorpkg/option"
@@ -191,15 +192,46 @@ func (t *TopologyGroup) Hash() uint64 {
 		Type         TopologyType
 		Namespaces   sets.Set[string]
 		MaxSkew      int32
-		NodeFilter   TopologyNodeFilter
+		NodeFilter   uint64
 		SelectorHash uint64
 	}{
 		TopologyKey:  t.Key,
 		Type:         t.Type,
 		Namespaces:   t.namespaces,
 		MaxSkew:      t.maxSkew,
-		NodeFilter:   t.nodeFilter,
+		NodeFilter:   hashNodeFilter(t.nodeFilter),
 		SelectorHash: hashSelector(t.rawSelector),
+	}, hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true}))
+}
+
+// topologyNodeFilterHashSeed is shared by every TopologyGroup in the process so equal node filters
+// hash equally across schedulers and passes.
+var topologyNodeFilterHashSeed = maphash.MakeSeed()
+
+// hashNodeFilter hashes everything TopologyNodeFilter.Matches reads. hashstructure only sees
+// exported fields, and scheduling.Requirement keeps its operator, values and bounds unexported, so
+// hashing the filter struct directly would make node filters that differ only in requirement
+// values (nodeSelector family=a vs family=b) collide. Each term's requirements are combined
+// order-insensitively from their content hashes, and the terms, which are OR'd, are hashed as a set.
+func hashNodeFilter(f TopologyNodeFilter) uint64 {
+	terms := make([]uint64, 0, len(f.Requirements))
+	for _, requirements := range f.Requirements {
+		var combined uint64
+		for _, requirement := range requirements {
+			combined ^= requirement.ContentHash64(topologyNodeFilterHashSeed)
+		}
+		terms = append(terms, maphash.Comparable(topologyNodeFilterHashSeed, [2]uint64{combined, uint64(len(requirements))}))
+	}
+	return lo.Must(hashstructure.Hash(struct {
+		Terms          []uint64
+		TaintPolicy    corev1.NodeInclusionPolicy
+		AffinityPolicy corev1.NodeInclusionPolicy
+		Tolerations    []corev1.Toleration
+	}{
+		Terms:          terms,
+		TaintPolicy:    f.TaintPolicy,
+		AffinityPolicy: f.AffinityPolicy,
+		Tolerations:    f.Tolerations,
 	}, hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true}))
 }
 
