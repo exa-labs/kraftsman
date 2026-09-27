@@ -27,12 +27,14 @@ import (
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -120,5 +122,9 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 				return bound || terminal || terminating
 			},
 		}).
+		// Pod bind/terminate events arrive at the rate pods churn cluster-wide, so a single worker falls minutes behind
+		// on a busy cluster and consolidation's pod-event freshness check lags with it. Each reconcile is a cached Get
+		// plus at most one status patch per NodeClaim per dedupeTimeout, so parallel workers cost little on the API server.
+		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 100)}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
