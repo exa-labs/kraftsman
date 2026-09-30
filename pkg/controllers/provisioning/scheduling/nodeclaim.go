@@ -264,7 +264,8 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	// affinity.
 	// NOTE: Topology requirements should come last since they can result in a single domain from a set of compatible
 	// domains. This can result in unnecessary failures from subsequent checks that narrow requirements.
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
+	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, n.domainPrices(nodeClaimRequirements, requests), scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -274,7 +275,6 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	nodeClaimRequirements.Add(topologyRequirements.Values()...)
 
 	// Check instance type combinations
-	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 
 	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
 	if relaxMinValues {
@@ -308,6 +308,56 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 		return nil, nil, nil, nil, err
 	}
 	return nodeClaimRequirements, remaining, ofs, allocationResult, nil
+}
+
+// domainPrices prices the domains this NodeClaim could launch in, given its requirements and the resource requests it
+// must fit. Reserved offerings only count while this NodeClaim could still reserve them.
+func (n *NodeClaim) domainPrices(requirements scheduling.Requirements, requests corev1.ResourceList) DomainPriceFunc {
+	return func(topologyKey string) map[string]float64 {
+		return cheapestPriceByDomain(n.InstanceTypeOptions, requirements, requests, topologyKey, func(o *cloudprovider.Offering) bool {
+			return o.CapacityType() != v1.CapacityTypeReserved || n.reservationManager == nil || n.reservationManager.CanReserve(n.hostname, o)
+		})
+	}
+}
+
+// cheapestPriceByDomain returns, for each value of topologyKey that offerings carry, the lowest price among the available
+// offerings in that domain that are compatible with requirements, belong to an instance type compatible with
+// requirements, fit requests and pass usable. Offering prices are the ones the scheduler sees, so they include any
+// price overlays. Domains without such an offering are absent, as is every domain of a key offerings do not carry.
+func cheapestPriceByDomain(
+	instanceTypes []*cloudprovider.InstanceType,
+	requirements scheduling.Requirements,
+	requests corev1.ResourceList,
+	topologyKey string,
+	usable func(*cloudprovider.Offering) bool,
+) map[string]float64 {
+	prices := map[string]float64{}
+	for _, it := range instanceTypes {
+		if !compatible(it, requirements) {
+			continue
+		}
+		for _, group := range it.AllocatableOfferingsList() {
+			if !resources.Fits(requests, group.Allocatable) {
+				continue
+			}
+			for _, o := range group.Offerings {
+				if !o.Available || !o.Requirements.Has(topologyKey) {
+					continue
+				}
+				domain := o.Requirements.Get(topologyKey)
+				if domain.Operator() != corev1.NodeSelectorOpIn || domain.Len() != 1 {
+					continue
+				}
+				if !requirements.IsCompatible(o.Requirements, scheduling.AllowUndefinedWellKnownLabels) || !usable(o) {
+					continue
+				}
+				if price, ok := prices[domain.Any()]; !ok || o.Price < price {
+					prices[domain.Any()] = o.Price
+				}
+			}
+		}
+	}
+	return prices
 }
 
 // instanceTypeFilterFailureIsInvariant reports whether a failed instance type filter for pod rules the pod out of this

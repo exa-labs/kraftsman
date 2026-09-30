@@ -245,8 +245,8 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 // AddRequirements tightens the input requirements by adding additional requirements that are being enforced by topology spreads
 // affinities, anti-affinities or inverse anti-affinities.  The nodeHostname is the hostname that we are currently considering
 // placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
-// cannot be satisfied.
-func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
+// cannot be satisfied. domainPrices, which may be nil, ranks the domains a self-selecting pod affinity can bootstrap in.
+func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, domainPrices DomainPriceFunc, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
 	for _, topology := range t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...) {
 		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
@@ -257,7 +257,7 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 		if nodeRequirements.Has(topology.Key) {
 			nodeDomains = nodeRequirements.Get(topology.Key)
 		}
-		domains, _ := topology.Get(p, podDomains, nodeDomains)
+		domains, _ := topology.Get(p, podDomains, nodeDomains, domainPrices)
 		if domains.Len() == 0 {
 			return nil, topologyError{
 				topology:    topology,
@@ -285,7 +285,7 @@ func (t *Topology) GetTopologyZoneConstraints(p *corev1.Pod, podRequirements sch
 			podDomains = podRequirements.Get(topology.Key)
 		}
 		nodeDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
-		_, validDomains := topology.Get(p, podDomains, nodeDomains)
+		_, validDomains := topology.Get(p, podDomains, nodeDomains, nil)
 
 		if validDomains.Len() == 0 {
 			return nil, false
