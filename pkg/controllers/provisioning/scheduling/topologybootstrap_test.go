@@ -22,10 +22,12 @@ package scheduling
 import (
 	"slices"
 	"testing"
+	"unique"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -33,6 +35,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 )
 
 var bootstrapZones = []string{"zone-a", "zone-b", "zone-c", "zone-d"}
@@ -232,14 +235,45 @@ func TestCheapestPriceByDomain(t *testing.T) {
 	instanceTypes := []*cloudprovider.InstanceType{small, large, larger}
 	requests := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")}
 	always := func(*cloudprovider.Offering) bool { return true }
+	noDaemons := []DaemonOverheadGroup{{InstanceTypes: instanceTypes, HostPortUsage: scheduling.NewHostPortUsage()}}
+
+	hostPortPod := gangPod()
+	hostPortPod.Spec.Containers = []corev1.Container{{Ports: []corev1.ContainerPort{{HostPort: 8080, ContainerPort: 8080, Protocol: corev1.ProtocolTCP}}}}
+	daemonPort := scheduling.NewHostPortUsage()
+	daemonPort.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "daemon"}}, scheduling.GetHostPorts(hostPortPod))
 
 	for _, tc := range []struct {
 		name         string
+		groups       []DaemonOverheadGroup
+		pod          *corev1.Pod
 		requirements scheduling.Requirements
 		key          string
 		usable       func(*cloudprovider.Offering) bool
 		expected     map[string]float64
 	}{
+		{
+			name: "daemon overhead",
+			groups: []DaemonOverheadGroup{
+				{InstanceTypes: []*cloudprovider.InstanceType{small, large}, DaemonOverhead: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10")}, HostPortUsage: scheduling.NewHostPortUsage()},
+				{InstanceTypes: []*cloudprovider.InstanceType{larger}, HostPortUsage: scheduling.NewHostPortUsage()},
+			},
+			requirements: scheduling.NewRequirements(),
+			key:          corev1.LabelTopologyZone,
+			usable:       always,
+			expected:     map[string]float64{"zone-c": 2.2},
+		},
+		{
+			name: "daemon host port conflicts",
+			groups: []DaemonOverheadGroup{
+				{InstanceTypes: []*cloudprovider.InstanceType{small, large}, HostPortUsage: daemonPort},
+				{InstanceTypes: []*cloudprovider.InstanceType{larger}, HostPortUsage: scheduling.NewHostPortUsage()},
+			},
+			pod:          hostPortPod,
+			requirements: scheduling.NewRequirements(),
+			key:          corev1.LabelTopologyZone,
+			usable:       always,
+			expected:     map[string]float64{"zone-c": 2.2},
+		},
 		{
 			name:         "cheapest available offering that fits, per zone",
 			requirements: scheduling.NewRequirements(),
@@ -291,7 +325,15 @@ func TestCheapestPriceByDomain(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := cheapestPriceByDomain(instanceTypes, tc.requirements, requests, tc.key, tc.usable)
+			groups := tc.groups
+			if groups == nil {
+				groups = noDaemons
+			}
+			pod := tc.pod
+			if pod == nil {
+				pod = gangPod()
+			}
+			got := cheapestPriceByDomain(instanceTypes, groups, pod, tc.requirements, requests, tc.key, tc.usable)
 			if len(got) != len(tc.expected) {
 				t.Fatalf("expected %v, got %v", tc.expected, got)
 			}
@@ -325,14 +367,48 @@ func TestNodeClaimBootstrapsAffinityInCheapestZone(t *testing.T) {
 	))
 	instanceTypes := []*cloudprovider.InstanceType{it}
 	nodeClaim := &NodeClaim{
-		NodeClaimTemplate:  NodeClaimTemplate{InstanceTypeOptions: instanceTypes},
-		reservationManager: NewReservationManager(map[string][]*cloudprovider.InstanceType{"default": instanceTypes}),
-		hostname:           "hostname-placeholder-0001",
+		NodeClaimTemplate:    NodeClaimTemplate{InstanceTypeOptions: instanceTypes},
+		daemonOverheadGroups: []DaemonOverheadGroup{{InstanceTypes: instanceTypes, HostPortUsage: scheduling.NewHostPortUsage()}},
+		reservationManager:   NewReservationManager(map[string][]*cloudprovider.InstanceType{"default": instanceTypes}),
+		hostname:             "hostname-placeholder-0001",
 	}
 	pod := gangPod()
 	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
-	prices := nodeClaim.domainPrices(scheduling.NewRequirements(), corev1.ResourceList{})
+	prices := nodeClaim.domainPrices(pod, scheduling.NewRequirements(), corev1.ResourceList{}, instanceTypes)
 	if got := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), prices); !slices.Equal(got, []string{"zone-b"}) {
 		t.Fatalf("expected zone-b, got %v", got)
+	}
+}
+
+// Only instance types whose device allocation succeeded are priced.
+func TestAllocatableInstanceTypes(t *testing.T) {
+	a, b := fake.NewInstanceType("a"), fake.NewInstanceType("b")
+	instanceTypes := []*cloudprovider.InstanceType{a, b}
+	if got := allocatableInstanceTypes(instanceTypes, nil); !slices.Equal(got, instanceTypes) {
+		t.Fatalf("expected every instance type without an allocation, got %v", instanceTypeNames(got))
+	}
+	result := &dynamicresources.AllocationResult{InstanceTypes: []dynamicresources.InstanceTypeID{unique.Make("b")}}
+	if got := allocatableInstanceTypes(instanceTypes, result); !slices.Equal(got, []*cloudprovider.InstanceType{b}) {
+		t.Fatalf("expected only b, got %v", instanceTypeNames(got))
+	}
+}
+
+// A bootstrapping affinity chooses among the domains the pod's other topologies allow, so a cheaper domain that its
+// anti-affinity rules out does not strand it.
+func TestAffinityBootstrapRespectsOtherTopologies(t *testing.T) {
+	pod := gangPod()
+	affinity := newZoneTopologyGroup(TopologyTypePodAffinity, pod)
+	antiAffinity := newZoneTopologyGroup(TopologyTypePodAntiAffinity, pod)
+	antiAffinity.selector = labels.SelectorFromSet(labels.Set{"app": "other"})
+	antiAffinity.rawSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "other"}}
+	antiAffinity.Record("zone-b")
+	affinity.AddOwner(pod.UID)
+	antiAffinity.AddOwner(pod.UID)
+	topology := &Topology{topologyGroups: map[uint64]*TopologyGroup{affinity.Hash(): affinity, antiAffinity.Hash(): antiAffinity}}
+	prices := staticPrices(map[string]float64{"zone-a": 3, "zone-b": 1, "zone-c": 2, "zone-d": 1.5})
+	for range 20 {
+		if got := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), prices); !slices.Equal(got, []string{"zone-d"}) {
+			t.Fatalf("expected the cheapest zone the anti-affinity allows, got %v", got)
+		}
 	}
 }

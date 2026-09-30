@@ -17,9 +17,11 @@ limitations under the License.
 package scheduling
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -248,14 +250,21 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 // cannot be satisfied. domainPrices, which may be nil, ranks the domains a self-selecting pod affinity can bootstrap in.
 func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, domainPrices DomainPriceFunc, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
-	for _, topology := range t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...) {
+	matchingTopologies := t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...)
+	// Pod affinities go last and choose among the domains the other topologies left, so that a bootstrapping affinity
+	// never settles on a domain another topology rules out. The other topologies see the node's own domains.
+	slices.SortStableFunc(matchingTopologies, func(a, b *TopologyGroup) int {
+		return cmp.Compare(lo.Ternary(a.Type == TopologyTypePodAffinity, 1, 0), lo.Ternary(b.Type == TopologyTypePodAffinity, 1, 0))
+	})
+	for _, topology := range matchingTopologies {
 		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
 		if podRequirements.Has(topology.Key) {
 			podDomains = podRequirements.Get(topology.Key)
 		}
+		nodeDomainSource := lo.Ternary(topology.Type == TopologyTypePodAffinity, requirements, nodeRequirements)
 		nodeDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
-		if nodeRequirements.Has(topology.Key) {
-			nodeDomains = nodeRequirements.Get(topology.Key)
+		if nodeDomainSource.Has(topology.Key) {
+			nodeDomains = nodeDomainSource.Get(topology.Key)
 		}
 		domains, _ := topology.Get(p, podDomains, nodeDomains, domainPrices)
 		if domains.Len() == 0 {

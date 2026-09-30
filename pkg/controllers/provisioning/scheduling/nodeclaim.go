@@ -265,7 +265,7 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	// NOTE: Topology requirements should come last since they can result in a single domain from a set of compatible
 	// domains. This can result in unnecessary failures from subsequent checks that narrow requirements.
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, n.domainPrices(nodeClaimRequirements, requests), scheduling.AllowUndefinedWellKnownLabels)
+	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, n.domainPrices(pod, nodeClaimRequirements, requests, allocatableInstanceTypes(n.InstanceTypeOptions, allocationResult)), scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -275,7 +275,6 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	nodeClaimRequirements.Add(topologyRequirements.Values()...)
 
 	// Check instance type combinations
-
 	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
 	if relaxMinValues {
 		// Update min values on the requirements if they are relaxed
@@ -293,12 +292,7 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	}
 	// Apply the DRA-specific instance type filter: only instance types whose device allocation succeeded survive.
 	if allocationResult != nil {
-		supported := sets.New(lo.Map(allocationResult.InstanceTypes, func(it dynamicresources.InstanceTypeID, _ int) string {
-			return it.Value()
-		})...)
-		remaining = lo.Filter(remaining, func(it *cloudprovider.InstanceType, _ int) bool {
-			return supported.Has(it.Name)
-		})
+		remaining = allocatableInstanceTypes(remaining, allocationResult)
 		if len(remaining) == 0 {
 			return nil, nil, nil, nil, fmt.Errorf("no instance type satisfies both scheduling and dynamic resource requirements")
 		}
@@ -310,54 +304,103 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	return nodeClaimRequirements, remaining, ofs, allocationResult, nil
 }
 
-// domainPrices prices the domains this NodeClaim could launch in, given its requirements and the resource requests it
-// must fit. Reserved offerings only count while this NodeClaim could still reserve them.
-func (n *NodeClaim) domainPrices(requirements scheduling.Requirements, requests corev1.ResourceList) DomainPriceFunc {
+// domainPrices prices the domains this NodeClaim could launch pod in, given its requirements, the resource requests it
+// must fit and the instance types still eligible for it. Reserved offerings only count while this NodeClaim could still
+// reserve them.
+func (n *NodeClaim) domainPrices(pod *corev1.Pod, requirements scheduling.Requirements, requests corev1.ResourceList, instanceTypes []*cloudprovider.InstanceType) DomainPriceFunc {
 	return func(topologyKey string) map[string]float64 {
-		return cheapestPriceByDomain(n.InstanceTypeOptions, requirements, requests, topologyKey, func(o *cloudprovider.Offering) bool {
+		return cheapestPriceByDomain(instanceTypes, n.daemonOverheadGroups, pod, requirements, requests, topologyKey, func(o *cloudprovider.Offering) bool {
 			return o.CapacityType() != v1.CapacityTypeReserved || n.reservationManager == nil || n.reservationManager.CanReserve(n.hostname, o)
 		})
 	}
 }
 
-// cheapestPriceByDomain returns, for each value of topologyKey that offerings carry, the lowest price among the available
-// offerings in that domain that are compatible with requirements, belong to an instance type compatible with
-// requirements, fit requests and pass usable. Offering prices are the ones the scheduler sees, so they include any
-// price overlays. Domains without such an offering are absent, as is every domain of a key offerings do not carry.
+// cheapestPriceByDomain returns, for each value of topologyKey that offerings carry, the lowest price among the offerings
+// in that domain that pod could launch on. It applies the same per-instance-type checks as
+// filterInstanceTypesByRequirements (requirements, daemon host ports, requests plus daemon overhead) and then keeps the
+// available offerings compatible with requirements that pass usable. Offering prices are the ones the scheduler sees, so
+// they include any price overlays. Domains without such an offering are absent, as is every domain of a key offerings
+// do not carry.
 func cheapestPriceByDomain(
 	instanceTypes []*cloudprovider.InstanceType,
+	daemonOverheadGroups []DaemonOverheadGroup,
+	pod *corev1.Pod,
 	requirements scheduling.Requirements,
 	requests corev1.ResourceList,
 	topologyKey string,
 	usable func(*cloudprovider.Offering) bool,
 ) map[string]float64 {
 	prices := map[string]float64{}
-	for _, it := range instanceTypes {
-		if !compatible(it, requirements) {
+	hostPorts := scheduling.GetHostPorts(pod)
+	eligible := sets.New(instanceTypes...)
+	for _, group := range daemonOverheadGroups {
+		if group.HostPortUsage.Conflicts(pod, hostPorts) != nil {
 			continue
 		}
-		for _, group := range it.AllocatableOfferingsList() {
-			if !resources.Fits(requests, group.Allocatable) {
-				continue
-			}
-			for _, o := range group.Offerings {
-				if !o.Available || !o.Requirements.Has(topologyKey) {
-					continue
-				}
-				domain := o.Requirements.Get(topologyKey)
-				if domain.Operator() != corev1.NodeSelectorOpIn || domain.Len() != 1 {
-					continue
-				}
-				if !requirements.IsCompatible(o.Requirements, scheduling.AllowUndefinedWellKnownLabels) || !usable(o) {
-					continue
-				}
-				if price, ok := prices[domain.Any()]; !ok || o.Price < price {
-					prices[domain.Any()] = o.Price
-				}
+		total := resources.Merge(requests, group.DaemonOverhead)
+		for _, it := range group.InstanceTypes {
+			if eligible.Has(it) && compatible(it, requirements) {
+				recordCheapestOfferings(prices, it, requirements, total, topologyKey, usable)
 			}
 		}
 	}
 	return prices
+}
+
+// recordCheapestOfferings lowers prices[domain] to the price of each of the instance type's offerings in that domain
+// that fits requests, is available, is compatible with requirements and passes usable.
+func recordCheapestOfferings(
+	prices map[string]float64,
+	it *cloudprovider.InstanceType,
+	requirements scheduling.Requirements,
+	requests corev1.ResourceList,
+	topologyKey string,
+	usable func(*cloudprovider.Offering) bool,
+) {
+	for _, group := range it.AllocatableOfferingsList() {
+		if !resources.Fits(requests, group.Allocatable) {
+			continue
+		}
+		for _, o := range group.Offerings {
+			domain, ok := usableOfferingDomain(o, topologyKey, requirements, usable)
+			if !ok {
+				continue
+			}
+			if price, ok := prices[domain]; !ok || o.Price < price {
+				prices[domain] = o.Price
+			}
+		}
+	}
+}
+
+// usableOfferingDomain returns the single value an offering requires for topologyKey, if it requires exactly one and the
+// offering is available, compatible with requirements and usable.
+func usableOfferingDomain(o *cloudprovider.Offering, topologyKey string, requirements scheduling.Requirements, usable func(*cloudprovider.Offering) bool) (string, bool) {
+	if !o.Available || !o.Requirements.Has(topologyKey) {
+		return "", false
+	}
+	domain := o.Requirements.Get(topologyKey)
+	if domain.Operator() != corev1.NodeSelectorOpIn || domain.Len() != 1 {
+		return "", false
+	}
+	if !requirements.IsCompatible(o.Requirements, scheduling.AllowUndefinedWellKnownLabels) || !usable(o) {
+		return "", false
+	}
+	return domain.Any(), true
+}
+
+// allocatableInstanceTypes returns the instance types whose dynamic resource allocation succeeded, or instanceTypes
+// unchanged when nothing was allocated.
+func allocatableInstanceTypes(instanceTypes []*cloudprovider.InstanceType, allocationResult *dynamicresources.AllocationResult) []*cloudprovider.InstanceType {
+	if allocationResult == nil {
+		return instanceTypes
+	}
+	supported := sets.New(lo.Map(allocationResult.InstanceTypes, func(it dynamicresources.InstanceTypeID, _ int) string {
+		return it.Value()
+	})...)
+	return lo.Filter(instanceTypes, func(it *cloudprovider.InstanceType, _ int) bool {
+		return supported.Has(it.Name)
+	})
 }
 
 // instanceTypeFilterFailureIsInvariant reports whether a failed instance type filter for pod rules the pod out of this
