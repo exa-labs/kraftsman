@@ -247,8 +247,8 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 // AddRequirements tightens the input requirements by adding additional requirements that are being enforced by topology spreads
 // affinities, anti-affinities or inverse anti-affinities.  The nodeHostname is the hostname that we are currently considering
 // placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
-// cannot be satisfied. domainPrices, which may be nil, ranks the domains a self-selecting pod affinity can bootstrap in.
-func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, domainPrices DomainPriceFunc, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
+// cannot be satisfied. preference, which may be nil, steers the domain a self-selecting pod affinity bootstraps in.
+func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, preference *BootstrapPreference, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
 	matchingTopologies := t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...)
 	// Pod affinities go last and choose among the domains the other topologies left, so that a bootstrapping affinity
@@ -266,7 +266,7 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 		if nodeDomainSource.Has(topology.Key) {
 			nodeDomains = nodeDomainSource.Get(topology.Key)
 		}
-		domains, _ := topology.Get(p, podDomains, nodeDomains, domainPrices)
+		domains, _ := topology.Get(p, podDomains, nodeDomains, preference)
 		if domains.Len() == 0 {
 			return nil, topologyError{
 				topology:    topology,

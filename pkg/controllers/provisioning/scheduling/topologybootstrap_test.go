@@ -20,6 +20,7 @@ limitations under the License.
 package scheduling
 
 import (
+	"context"
 	"slices"
 	"testing"
 	"unique"
@@ -34,6 +35,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 )
@@ -88,7 +90,7 @@ func zoneRequirements(op corev1.NodeSelectorOperator, zones ...string) schedulin
 // bootstrappedZones returns the zone values AddRequirements settles on for a node with nodeRequirements.
 func bootstrappedZones(t *testing.T, topology *Topology, pod *corev1.Pod, nodeRequirements scheduling.Requirements, prices DomainPriceFunc) []string {
 	t.Helper()
-	requirements, err := topology.AddRequirements(pod, nil, scheduling.NewRequirements(), nodeRequirements, prices)
+	requirements, err := topology.AddRequirements(pod, nil, scheduling.NewRequirements(), nodeRequirements, NewBootstrapPreference(prices))
 	if err != nil {
 		t.Fatalf("AddRequirements: %v", err)
 	}
@@ -133,7 +135,7 @@ func TestAffinityBootstrapHonoursPodDomains(t *testing.T) {
 	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
 	prices := staticPrices(map[string]float64{"zone-a": 3, "zone-b": 1, "zone-c": 2, "zone-d": 1.5})
 	podRequirements := scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "zone-a", "zone-c"))
-	requirements, err := topology.AddRequirements(pod, nil, podRequirements, zoneRequirements(corev1.NodeSelectorOpExists), prices)
+	requirements, err := topology.AddRequirements(pod, nil, podRequirements, zoneRequirements(corev1.NodeSelectorOpExists), NewBootstrapPreference(prices))
 	if err != nil {
 		t.Fatalf("AddRequirements: %v", err)
 	}
@@ -142,26 +144,83 @@ func TestAffinityBootstrapHonoursPodDomains(t *testing.T) {
 	}
 }
 
-func TestAffinityBootstrapFallsBackToDomainName(t *testing.T) {
+func TestAffinityBootstrapPrefersPricedDomains(t *testing.T) {
 	pod := gangPod()
 	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
-	for _, tc := range []struct {
-		name     string
-		prices   DomainPriceFunc
-		expected string
-	}{
-		{"no price function", nil, "zone-a"},
-		{"no prices", staticPrices(map[string]float64{}), "zone-a"},
-		{"priced domains first", staticPrices(map[string]float64{"zone-d": 9}), "zone-d"},
-		{"ties by name", staticPrices(map[string]float64{"zone-d": 1, "zone-c": 1, "zone-a": 2}), "zone-c"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for range 20 {
-				if got := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), tc.prices); !slices.Equal(got, []string{tc.expected}) {
-					t.Fatalf("expected %s, got %v", tc.expected, got)
-				}
+	for range 20 {
+		if got := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), staticPrices(map[string]float64{"zone-c": 9})); !slices.Equal(got, []string{"zone-c"}) {
+			t.Fatalf("expected the only priced zone, got %v", got)
+		}
+	}
+}
+
+// Without prices, or with equal prices, the bootstrap is deterministic for a group.
+func TestAffinityBootstrapIsDeterministicWithoutPrices(t *testing.T) {
+	pod := gangPod()
+	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
+	for _, prices := range []DomainPriceFunc{nil, staticPrices(map[string]float64{}), staticPrices(map[string]float64{"zone-a": 1, "zone-b": 1, "zone-c": 1, "zone-d": 1})} {
+		first := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), prices)
+		if len(first) != 1 {
+			t.Fatalf("expected one zone, got %v", first)
+		}
+		for range 20 {
+			if got := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), prices); !slices.Equal(got, first) {
+				t.Fatalf("expected %v every time, got %v", first, got)
 			}
-		})
+		}
+	}
+}
+
+func TestOrderBootstrapCandidates(t *testing.T) {
+	prices := map[string]float64{"zone-a": 2, "zone-b": 1, "zone-c": 2, "zone-d": 2}
+	domains := []string{"zone-e", "zone-d", "zone-c", "zone-b", "zone-a"}
+	orderBootstrapCandidates(domains, prices, 42)
+	if domains[0] != "zone-b" || domains[4] != "zone-e" {
+		t.Fatalf("expected the cheapest zone first and the unpriced zone last, got %v", domains)
+	}
+	again := []string{"zone-a", "zone-b", "zone-c", "zone-d", "zone-e"}
+	orderBootstrapCandidates(again, prices, 42)
+	if !slices.Equal(domains, again) {
+		t.Fatalf("expected the same order regardless of input order, got %v and %v", domains, again)
+	}
+
+	// Groups with different seeds spread across equally priced domains.
+	firsts := sets.New[string]()
+	for seed := range uint64(16) {
+		uniform := []string{"zone-a", "zone-b", "zone-c", "zone-d"}
+		orderBootstrapCandidates(uniform, map[string]float64{"zone-a": 1, "zone-b": 1, "zone-c": 1, "zone-d": 1}, seed)
+		firsts.Insert(uniform[0])
+	}
+	if firsts.Len() < 3 {
+		t.Fatalf("expected equally priced zones to spread across groups, got %v", sets.List(firsts))
+	}
+}
+
+// Excluding a bootstrapped domain moves the next evaluation to the next-cheapest one, until none are left.
+func TestBootstrapPreferenceExcludesChosenDomains(t *testing.T) {
+	pod := gangPod()
+	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
+	preference := NewBootstrapPreference(staticPrices(map[string]float64{"zone-a": 3, "zone-b": 1, "zone-c": 2, "zone-d": 1.5}))
+	for _, expected := range []string{"zone-b", "zone-d", "zone-c", "zone-a"} {
+		preference.ResetChosen()
+		requirements, err := topology.AddRequirements(pod, nil, scheduling.NewRequirements(), zoneRequirements(corev1.NodeSelectorOpExists), preference)
+		if err != nil {
+			t.Fatalf("AddRequirements: %v", err)
+		}
+		if got := requirements.Get(corev1.LabelTopologyZone).Values(); !slices.Equal(got, []string{expected}) {
+			t.Fatalf("expected %s, got %v", expected, got)
+		}
+		if !preference.Chosen() {
+			t.Fatalf("expected the choice of %s to be recorded", expected)
+		}
+		preference.ExcludeChosen()
+	}
+	preference.ResetChosen()
+	if _, err := topology.AddRequirements(pod, nil, scheduling.NewRequirements(), zoneRequirements(corev1.NodeSelectorOpExists), preference); err == nil {
+		t.Fatalf("expected no domain once every candidate is excluded")
+	}
+	if preference.Chosen() {
+		t.Fatalf("expected no choice once every candidate is excluded")
 	}
 }
 
@@ -195,7 +254,7 @@ func TestAntiAffinityAndSpreadIgnorePrices(t *testing.T) {
 			nodeDomains := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpExists)
 			podDomains := scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpExists)
 			withoutPrices, validWithout := tg.Get(pod, podDomains, nodeDomains, nil)
-			withPrices, validWith := tg.Get(pod, podDomains, nodeDomains, forbiddenPrices(t))
+			withPrices, validWith := tg.Get(pod, podDomains, nodeDomains, NewBootstrapPreference(forbiddenPrices(t)))
 			if topologyType == TopologyTypePodAntiAffinity {
 				// Anti-affinity returns every empty domain, so the result is deterministic and comparable.
 				if !withoutPrices.Has("zone-a") || withoutPrices.Has("zone-b") || withoutPrices.Len() != 3 {
@@ -374,7 +433,8 @@ func TestNodeClaimBootstrapsAffinityInCheapestZone(t *testing.T) {
 	}
 	pod := gangPod()
 	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
-	prices := nodeClaim.domainPrices(pod, scheduling.NewRequirements(), corev1.ResourceList{}, instanceTypes)
+	ctx := karpopts.ToContext(context.Background(), &karpopts.Options{FeatureGates: karpopts.FeatureGates{ReservedCapacity: true}})
+	prices := nodeClaim.domainPrices(ctx, pod, scheduling.NewRequirements(), corev1.ResourceList{}, instanceTypes)
 	if got := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), prices); !slices.Equal(got, []string{"zone-b"}) {
 		t.Fatalf("expected zone-b, got %v", got)
 	}

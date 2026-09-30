@@ -17,12 +17,9 @@ limitations under the License.
 package scheduling
 
 import (
-	"cmp"
 	"fmt"
 	"hash/maphash"
 	"math"
-	"slices"
-	"strings"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/mitchellh/hashstructure/v2"
@@ -55,11 +52,6 @@ func (t TopologyType) String() string {
 	}
 	return ""
 }
-
-// DomainPriceFunc returns, for a topology key, the cheapest price at which a new node could launch in each domain of
-// that key. Domains it omits have no known price. It is resolved lazily because only the bootstrap of a self-selecting
-// pod affinity consults it. A nil DomainPriceFunc knows no prices.
-type DomainPriceFunc func(topologyKey string) map[string]float64
 
 // TopologyGroup is used to track pod counts that match a selector by the topology domain (e.g. SELECT COUNT(*) FROM pods GROUP BY(topology_ke
 type TopologyGroup struct {
@@ -135,13 +127,13 @@ func NewTopologyGroup(
 }
 
 // Get returns the domains a pod may schedule to on a node with nodeDomains, along with the set of valid domains.
-// domainPrices only influences which domain bootstraps a self-selecting pod affinity; it may be nil.
-func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement, domainPrices DomainPriceFunc) (*scheduling.Requirement, sets.Set[string]) {
+// preference only steers which domain bootstraps a self-selecting pod affinity; it may be nil.
+func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement, preference *BootstrapPreference) (*scheduling.Requirement, sets.Set[string]) {
 	switch t.Type {
 	case TopologyTypeSpread:
 		return t.nextDomainTopologySpread(pod, podDomains, nodeDomains)
 	case TopologyTypePodAffinity:
-		req := t.nextDomainAffinity(pod, podDomains, nodeDomains, domainPrices)
+		req := t.nextDomainAffinity(pod, podDomains, nodeDomains, preference)
 		return req, sets.New[string](req.Values()...)
 	case TopologyTypePodAntiAffinity:
 		req := t.nextDomainAntiAffinity(podDomains, nodeDomains)
@@ -363,7 +355,7 @@ func (t *TopologyGroup) domainMinCount(domains *scheduling.Requirement) int32 {
 }
 
 // nolint:gocyclo
-func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduling.Requirement, nodeDomains *scheduling.Requirement, domainPrices DomainPriceFunc) *scheduling.Requirement {
+func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduling.Requirement, nodeDomains *scheduling.Requirement, preference *BootstrapPreference) *scheduling.Requirement {
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
@@ -407,11 +399,11 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 	// If pod is self-selecting and no pod has been scheduled yet OR the pods that have scheduled are
 	// incompatible with our podDomains, we pick a domain to bootstrap scheduling: the cheapest one to launch in.
 	if t.selects(pod) && (len(t.domains) == len(t.emptyDomains) || !t.anyCompatiblePodDomain(podDomains)) {
-		// A node pinned to one domain can only bootstrap there, so prices cannot change the outcome.
+		// A node pinned to one domain can only bootstrap there, so there is no choice to steer.
 		if nodeDomains.Operator() == corev1.NodeSelectorOpIn && nodeDomains.Len() == 1 {
-			domainPrices = nil
+			preference = nil
 		}
-		candidates := t.bootstrapCandidates(podDomains, domainPrices)
+		candidates := t.bootstrapCandidates(podDomains, preference)
 
 		// First try to find a domain that is within the intersection of pod/node domains. In the case of an in-flight or
 		// existing node this causes us to pick the domain that the node is already in if possible instead of picking
@@ -420,6 +412,7 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 		for _, domain := range candidates {
 			if intersected.Has(domain) {
 				options.Insert(domain)
+				preference.record(t.Key, domain)
 				break
 			}
 		}
@@ -432,33 +425,18 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 	return options
 }
 
-// bootstrapCandidates returns the known domains the pod may schedule to, cheapest first. Priced domains come before
-// unpriced ones, and ties are broken by domain name so the choice is deterministic. Prices are only resolved when there
-// is more than one candidate to choose from.
-func (t *TopologyGroup) bootstrapCandidates(podDomains *scheduling.Requirement, domainPrices DomainPriceFunc) []string {
+// bootstrapCandidates returns the known domains the pod may schedule to that preference has not excluded, cheapest
+// first (see orderBootstrapCandidates). Prices are only resolved when there is more than one candidate to choose from.
+func (t *TopologyGroup) bootstrapCandidates(podDomains *scheduling.Requirement, preference *BootstrapPreference) []string {
 	candidates := make([]string, 0, len(t.domains))
 	for domain := range t.domains {
-		if podDomains.Has(domain) {
+		if podDomains.Has(domain) && !preference.excludes(t.Key, domain) {
 			candidates = append(candidates, domain)
 		}
 	}
-	var prices map[string]float64
-	if len(candidates) > 1 && domainPrices != nil {
-		prices = domainPrices(t.Key)
+	if len(candidates) > 1 {
+		orderBootstrapCandidates(candidates, preference.pricesFor(t.Key), t.Hash())
 	}
-	slices.SortFunc(candidates, func(a, b string) int {
-		priceA, pricedA := prices[a]
-		priceB, pricedB := prices[b]
-		switch {
-		case pricedA && !pricedB:
-			return -1
-		case !pricedA && pricedB:
-			return 1
-		case pricedA && priceA != priceB:
-			return cmp.Compare(priceA, priceB)
-		}
-		return strings.Compare(a, b)
-	})
 	return candidates
 }
 

@@ -265,12 +265,79 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	// NOTE: Topology requirements should come last since they can result in a single domain from a set of compatible
 	// domains. This can result in unnecessary failures from subsequent checks that narrow requirements.
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, n.domainPrices(pod, nodeClaimRequirements, requests, allocatableInstanceTypes(n.InstanceTypeOptions, allocationResult)), scheduling.AllowUndefinedWellKnownLabels)
+	preference := NewBootstrapPreference(n.domainPrices(ctx, pod, nodeClaimRequirements, requests, allocatableInstanceTypes(n.InstanceTypeOptions, allocationResult)))
+	p, err := n.placeWithBootstrapFallback(ctx, pod, podData, nodeClaimRequirements, requests, allocationResult, relaxMinValues, preference)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	return p.requirements, p.instanceTypes, p.offeringsToReserve, allocationResult, nil
+}
+
+// topologyPlacement is where a pod fits on a NodeClaim once topology has narrowed its requirements.
+type topologyPlacement struct {
+	requirements       scheduling.Requirements
+	instanceTypes      []*cloudprovider.InstanceType
+	offeringsToReserve []*cloudprovider.Offering
+	// relaxedMinValues is set when the instance types only satisfy minValues after relaxing them.
+	relaxedMinValues bool
+}
+
+// placeWithBootstrapFallback places the pod and, when a self-selecting pod affinity bootstrapped a domain that leaves
+// nothing to launch (or, with relaxMinValues, only launches by relaxing minValues), tries the next-ranked domain. Each
+// attempt excludes the domains the previous one chose, so the number of attempts is bounded by the number of candidate
+// domains. It returns the first placement that needs no relaxation, else the first relaxed one, else the first error.
+func (n *NodeClaim) placeWithBootstrapFallback(
+	ctx context.Context,
+	pod *corev1.Pod,
+	podData *PodData,
+	nodeClaimRequirements scheduling.Requirements,
+	requests corev1.ResourceList,
+	allocationResult *dynamicresources.AllocationResult,
+	relaxMinValues bool,
+	preference *BootstrapPreference,
+) (*topologyPlacement, error) {
+	var firstErr error
+	var relaxed *topologyPlacement
+	for {
+		preference.ResetChosen()
+		p, err := n.place(ctx, pod, podData, scheduling.NewRequirements(nodeClaimRequirements.Values()...), requests, allocationResult, relaxMinValues, preference)
+		switch {
+		case err == nil && !p.relaxedMinValues:
+			return p, nil
+		case err == nil && relaxed == nil:
+			relaxed = p
+		case err != nil && firstErr == nil:
+			firstErr = err
+		}
+		if !preference.Chosen() {
+			break
+		}
+		preference.ExcludeChosen()
+	}
+	if relaxed != nil {
+		return relaxed, nil
+	}
+	return nil, firstErr
+}
+
+// place narrows nodeClaimRequirements, which it takes ownership of, by the pod's topology and then filters the
+// NodeClaim's instance types and reserved offerings against them.
+func (n *NodeClaim) place(
+	ctx context.Context,
+	pod *corev1.Pod,
+	podData *PodData,
+	nodeClaimRequirements scheduling.Requirements,
+	requests corev1.ResourceList,
+	allocationResult *dynamicresources.AllocationResult,
+	relaxMinValues bool,
+	preference *BootstrapPreference,
+) (*topologyPlacement, error) {
+	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, preference, scheduling.AllowUndefinedWellKnownLabels)
+	if err != nil {
+		return nil, err
+	}
 	if err = nodeClaimRequirements.Compatible(topologyRequirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
 	nodeClaimRequirements.Add(topologyRequirements.Values()...)
 
@@ -286,31 +353,40 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 		// We avoid wrapping this err with fmt.Errorf because calling String() on InstanceTypeFilterError is an expensive
 		// operation due to calls to resources.Merge and stringifying the nodeClaimRequirements.
 		if n.instanceTypeFilterFailureIsInvariant(pod, podData, relaxMinValues) {
-			return nil, nil, nil, nil, NewNodePoolIncompatibleError(err)
+			return nil, NewNodePoolIncompatibleError(err)
 		}
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
 	// Apply the DRA-specific instance type filter: only instance types whose device allocation succeeded survive.
 	if allocationResult != nil {
 		remaining = allocatableInstanceTypes(remaining, allocationResult)
 		if len(remaining) == 0 {
-			return nil, nil, nil, nil, fmt.Errorf("no instance type satisfies both scheduling and dynamic resource requirements")
+			return nil, fmt.Errorf("no instance type satisfies both scheduling and dynamic resource requirements")
 		}
 	}
 	ofs, err := n.offeringsToReserve(ctx, remaining, nodeClaimRequirements)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
-	return nodeClaimRequirements, remaining, ofs, allocationResult, nil
+	return &topologyPlacement{
+		requirements:       nodeClaimRequirements,
+		instanceTypes:      remaining,
+		offeringsToReserve: ofs,
+		relaxedMinValues:   relaxMinValues && len(unsatisfiableKeys) != 0,
+	}, nil
 }
 
 // domainPrices prices the domains this NodeClaim could launch pod in, given its requirements, the resource requests it
-// must fit and the instance types still eligible for it. Reserved offerings only count while this NodeClaim could still
-// reserve them.
-func (n *NodeClaim) domainPrices(pod *corev1.Pod, requirements scheduling.Requirements, requests corev1.ResourceList, instanceTypes []*cloudprovider.InstanceType) DomainPriceFunc {
+// must fit and the instance types still eligible for it. Reserved offerings only count when the ReservedCapacity feature
+// gate is on and this NodeClaim could still reserve them.
+func (n *NodeClaim) domainPrices(ctx context.Context, pod *corev1.Pod, requirements scheduling.Requirements, requests corev1.ResourceList, instanceTypes []*cloudprovider.InstanceType) DomainPriceFunc {
+	reservedCapacity := opts.FromContext(ctx).FeatureGates.ReservedCapacity
 	return func(topologyKey string) map[string]float64 {
 		return cheapestPriceByDomain(instanceTypes, n.daemonOverheadGroups, pod, requirements, requests, topologyKey, func(o *cloudprovider.Offering) bool {
-			return o.CapacityType() != v1.CapacityTypeReserved || n.reservationManager == nil || n.reservationManager.CanReserve(n.hostname, o)
+			if o.CapacityType() != v1.CapacityTypeReserved {
+				return true
+			}
+			return reservedCapacity && (n.reservationManager == nil || n.reservationManager.CanReserve(n.hostname, o))
 		})
 	}
 }
@@ -331,6 +407,7 @@ func cheapestPriceByDomain(
 	usable func(*cloudprovider.Offering) bool,
 ) map[string]float64 {
 	prices := map[string]float64{}
+	domains := newDomainMatcher(requirements, topologyKey)
 	hostPorts := scheduling.GetHostPorts(pod)
 	eligible := sets.New(instanceTypes...)
 	for _, group := range daemonOverheadGroups {
@@ -340,7 +417,7 @@ func cheapestPriceByDomain(
 		total := resources.Merge(requests, group.DaemonOverhead)
 		for _, it := range group.InstanceTypes {
 			if eligible.Has(it) && compatible(it, requirements) {
-				recordCheapestOfferings(prices, it, requirements, total, topologyKey, usable)
+				recordCheapestOfferings(prices, it, requirements, total, domains, usable)
 			}
 		}
 	}
@@ -354,7 +431,7 @@ func recordCheapestOfferings(
 	it *cloudprovider.InstanceType,
 	requirements scheduling.Requirements,
 	requests corev1.ResourceList,
-	topologyKey string,
+	domains domainMatcher,
 	usable func(*cloudprovider.Offering) bool,
 ) {
 	for _, group := range it.AllocatableOfferingsList() {
@@ -362,31 +439,56 @@ func recordCheapestOfferings(
 			continue
 		}
 		for _, o := range group.Offerings {
-			domain, ok := usableOfferingDomain(o, topologyKey, requirements, usable)
+			domain, ok := domains.of(o)
 			if !ok {
 				continue
 			}
-			if price, ok := prices[domain]; !ok || o.Price < price {
+			// Only offerings that would lower the domain's price need the full compatibility check.
+			if price, priced := prices[domain]; priced && price <= o.Price {
+				continue
+			}
+			if requirements.IsCompatible(o.Requirements, scheduling.AllowUndefinedWellKnownLabels) && usable(o) {
 				prices[domain] = o.Price
 			}
 		}
 	}
 }
 
-// usableOfferingDomain returns the single value an offering requires for topologyKey, if it requires exactly one and the
-// offering is available, compatible with requirements and usable.
-func usableOfferingDomain(o *cloudprovider.Offering, topologyKey string, requirements scheduling.Requirements, usable func(*cloudprovider.Offering) bool) (string, bool) {
-	if !o.Available || !o.Requirements.Has(topologyKey) {
+// domainMatcher finds the domain of topologyKey an offering is in, among the domains requirements allow.
+type domainMatcher struct {
+	topologyKey string
+	// allowed lists the domains requirements allow, when they restrict topologyKey to a finite set; nil otherwise.
+	allowed []string
+}
+
+func newDomainMatcher(requirements scheduling.Requirements, topologyKey string) domainMatcher {
+	m := domainMatcher{topologyKey: topologyKey}
+	if allowed, ok := requirements[topologyKey]; ok && allowed.Operator() == corev1.NodeSelectorOpIn {
+		m.allowed = allowed.Values()
+	}
+	return m
+}
+
+// of returns the single value an available offering requires for the topology key, if it requires exactly one and the
+// requirements allow it. It is a cheap filter ahead of the full compatibility check: with a finite set of allowed
+// domains it probes the offering for each of them instead of materializing the offering's value.
+func (m domainMatcher) of(o *cloudprovider.Offering) (string, bool) {
+	if !o.Available {
 		return "", false
 	}
-	domain := o.Requirements.Get(topologyKey)
-	if domain.Operator() != corev1.NodeSelectorOpIn || domain.Len() != 1 {
+	domain, ok := o.Requirements[m.topologyKey]
+	if !ok || domain.Operator() != corev1.NodeSelectorOpIn || domain.Len() != 1 {
 		return "", false
 	}
-	if !requirements.IsCompatible(o.Requirements, scheduling.AllowUndefinedWellKnownLabels) || !usable(o) {
-		return "", false
+	if m.allowed == nil {
+		return domain.Any(), true
 	}
-	return domain.Any(), true
+	for _, allowed := range m.allowed {
+		if domain.Has(allowed) {
+			return allowed, true
+		}
+	}
+	return "", false
 }
 
 // allocatableInstanceTypes returns the instance types whose dynamic resource allocation succeeded, or instanceTypes
