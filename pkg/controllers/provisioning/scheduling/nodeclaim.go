@@ -17,6 +17,7 @@ limitations under the License.
 package scheduling
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -304,42 +305,67 @@ func (n *NodeClaim) placeWithBootstrapFallback(
 	relaxMinValues bool,
 	preference *BootstrapPreference,
 ) (*topologyPlacement, error) {
-	var firstErr error
-	var relaxed *topologyPlacement
+	var attempts placementAttempts
 	fallback := true
 	// withoutDomain runs between the first attempt's topology narrowing and its instance type filter.
 	withoutDomain := func() error {
-		if !preference.Chosen() {
-			return nil
-		}
-		_, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
-		if err != nil {
-			fallback = false
-			return n.instanceTypeFilterError(pod, podData, relaxMinValues, err)
-		}
-		fallback = !relaxMinValues || len(unsatisfiableKeys) == 0
-		return nil
+		var err error
+		fallback, err = n.checkWithoutDomain(pod, podData, nodeClaimRequirements, requests, relaxMinValues, preference)
+		return err
 	}
 	for attempt := 1; ; attempt++ {
 		preference.ResetChosen()
 		p, err := n.place(ctx, pod, podData, scheduling.NewRequirements(nodeClaimRequirements.Values()...), requests, allocationResult, relaxMinValues, preference, lo.Ternary(attempt == 1, withoutDomain, nil))
-		switch {
-		case err == nil && !p.relaxedMinValues:
-			return p, nil
-		case err == nil && relaxed == nil:
-			relaxed = p
-		case err != nil && firstErr == nil:
-			firstErr = err
+		if final := attempts.record(p, err); final != nil {
+			return final, nil
 		}
 		if !fallback || !preference.Chosen() || attempt >= maxBootstrapDomains {
 			break
 		}
 		preference.ExcludeChosen()
 	}
-	if relaxed != nil {
-		return relaxed, nil
+	return attempts.result()
+}
+
+// checkWithoutDomain checks the NodeClaim's instance types against nodeClaimRequirements as they stand before topology
+// pins a domain, when the evaluation that just ran bootstrapped one. It returns the filter's error when they reject the
+// pod, and whether falling back to another domain can still help.
+func (n *NodeClaim) checkWithoutDomain(pod *corev1.Pod, podData *PodData, nodeClaimRequirements scheduling.Requirements, requests corev1.ResourceList, relaxMinValues bool, preference *BootstrapPreference) (bool, error) {
+	if !preference.Chosen() {
+		return true, nil
 	}
-	return nil, firstErr
+	_, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
+	if err != nil {
+		return false, n.instanceTypeFilterError(pod, podData, relaxMinValues, err)
+	}
+	return !relaxMinValues || len(unsatisfiableKeys) == 0, nil
+}
+
+// placementAttempts accumulates the outcomes of placeWithBootstrapFallback's attempts.
+type placementAttempts struct {
+	firstErr error
+	relaxed  *topologyPlacement
+}
+
+// record notes an attempt's outcome and returns its placement when it needs no relaxation, ending the search.
+func (a *placementAttempts) record(p *topologyPlacement, err error) *topologyPlacement {
+	switch {
+	case err != nil:
+		a.firstErr = cmp.Or(a.firstErr, err)
+	case !p.relaxedMinValues:
+		return p
+	case a.relaxed == nil:
+		a.relaxed = p
+	}
+	return nil
+}
+
+// result returns the first relaxed placement, else the first error.
+func (a *placementAttempts) result() (*topologyPlacement, error) {
+	if a.relaxed != nil {
+		return a.relaxed, nil
+	}
+	return nil, a.firstErr
 }
 
 // place narrows nodeClaimRequirements, which it takes ownership of, by the pod's topology and then filters the
@@ -369,7 +395,20 @@ func (n *NodeClaim) place(
 			return nil, err
 		}
 	}
+	return n.filterPlacement(ctx, pod, podData, nodeClaimRequirements, requests, allocationResult, relaxMinValues)
+}
 
+// filterPlacement filters the NodeClaim's instance types and reserved offerings against nodeClaimRequirements, which it
+// takes ownership of.
+func (n *NodeClaim) filterPlacement(
+	ctx context.Context,
+	pod *corev1.Pod,
+	podData *PodData,
+	nodeClaimRequirements scheduling.Requirements,
+	requests corev1.ResourceList,
+	allocationResult *dynamicresources.AllocationResult,
+	relaxMinValues bool,
+) (*topologyPlacement, error) {
 	// Check instance type combinations
 	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
 	if relaxMinValues {
