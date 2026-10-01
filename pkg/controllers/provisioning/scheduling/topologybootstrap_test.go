@@ -14,13 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Tests for how a self-selecting pod affinity picks the domain it bootstraps in: the cheapest domain a new NodeClaim
-// could launch in, with existing and in-flight nodes, anti-affinity and topology spread left as they were.
+// Tests for how a self-selecting pod affinity picks the domain it bootstraps in: which pods can bootstrap at all, that
+// they take the cheapest domain a new NodeClaim could launch in and fall back to the next one when it cannot launch
+// there, with existing and in-flight nodes, anti-affinity and topology spread left as they were.
 
 package scheduling
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"unique"
@@ -31,13 +33,20 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
+	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 var bootstrapZones = []string{"zone-a", "zone-b", "zone-c", "zone-d"}
@@ -468,5 +477,143 @@ func TestAffinityBootstrapRespectsOtherTopologies(t *testing.T) {
 		if got := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), prices); !slices.Equal(got, []string{"zone-d"}) {
 			t.Fatalf("expected the cheapest zone the anti-affinity allows, got %v", got)
 		}
+	}
+}
+
+// Only a pod owning a pod affinity that selects itself can bootstrap a domain; every other pod, including one with an
+// affinity to other pods or with anti-affinity only, takes the placement path that never prices domains.
+func TestTopologyTracksSelfSelectingAffinity(t *testing.T) {
+	ctx := karpopts.ToContext(injection.WithControllerName(context.Background(), "provisioner"), test.Options())
+	selfLabels := map[string]string{"gang": "self"}
+	zoneTerm := func(labels map[string]string) []corev1.PodAffinityTerm {
+		return []corev1.PodAffinityTerm{{LabelSelector: &metav1.LabelSelector{MatchLabels: labels}, TopologyKey: corev1.LabelTopologyZone}}
+	}
+	pod := func(uid string, options test.PodOptions) *corev1.Pod {
+		options.UID = types.UID(uid)
+		return test.UnschedulablePod(options)
+	}
+	self := pod("self", test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: selfLabels}, PodRequirements: zoneTerm(selfLabels)})
+	other := pod("other", test.PodOptions{PodRequirements: zoneTerm(map[string]string{"app": "elsewhere"})})
+	anti := pod("anti", test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: selfLabels}, PodAntiRequirements: zoneTerm(selfLabels)})
+	plain := pod("plain", test.PodOptions{})
+	pods := []*corev1.Pod{self, other, anti, plain}
+
+	instanceTypes := []*cloudprovider.InstanceType{fake.NewInstanceType("default")}
+	nodePool := test.NodePool()
+	kubeClient := fakecr.NewFakeClient()
+	cluster := state.NewCluster(&clock.RealClock{}, kubeClient, fake.NewCloudProvider())
+	topology, err := NewTopology(ctx, kubeClient, cluster, nil, []*v1.NodePool{nodePool}, map[string][]*cloudprovider.InstanceType{nodePool.Name: instanceTypes}, pods)
+	if err != nil {
+		t.Fatalf("creating topology: %v", err)
+	}
+	for _, tc := range []struct {
+		pod  *corev1.Pod
+		want bool
+	}{{self, true}, {other, false}, {anti, false}, {plain, false}} {
+		if got := topology.HasSelfSelectingAffinity(tc.pod); got != tc.want {
+			t.Errorf("HasSelfSelectingAffinity(%s) = %v, want %v", tc.pod.UID, got, tc.want)
+		}
+	}
+
+	// Relaxing the pod's affinity away re-registers it without one.
+	self.Spec.Affinity = nil
+	if err := topology.Update(ctx, self); err != nil {
+		t.Fatalf("updating topology: %v", err)
+	}
+	if topology.HasSelfSelectingAffinity(self) {
+		t.Errorf("HasSelfSelectingAffinity(self) after dropping its affinity = true, want false")
+	}
+}
+
+// A NodeClaim whose cheapest bootstrap domain leaves nothing to launch tries the next-cheapest one, for at most
+// maxBootstrapDomains domains, and prefers a domain that satisfies minValues over one that only launches by relaxing
+// them. Every instance type here is offered in one zone, and the NodePool requires two distinct instance types, which
+// domain prices do not account for.
+func TestBootstrapFallsBackToTheNextCheapestDomain(t *testing.T) {
+	// zone lists the prices of the instance types offered only in that zone.
+	type zone map[string][]float64
+	for _, tc := range []struct {
+		name     string
+		zones    zone
+		policy   karpopts.MinValuesPolicy
+		expected string
+	}{
+		{
+			name:     "past domains that cannot launch",
+			zones:    zone{"zone-a": {0.1}, "zone-b": {0.2}, "zone-c": {1, 1.1}},
+			policy:   karpopts.MinValuesPolicyStrict,
+			expected: "zone-c",
+		},
+		{
+			name:     "for at most maxBootstrapDomains domains",
+			zones:    zone{"zone-a": {0.1}, "zone-b": {0.2}, "zone-c": {0.3}, "zone-d": {1, 1.1}},
+			policy:   karpopts.MinValuesPolicyStrict,
+			expected: "",
+		},
+		{
+			name:     "to a domain that needs no minValues relaxation",
+			zones:    zone{"zone-a": {0.1}, "zone-b": {1, 1.1}},
+			policy:   karpopts.MinValuesPolicyBestEffort,
+			expected: "zone-b",
+		},
+		{
+			name:     "keeping the cheapest domain when every domain needs minValues relaxed",
+			zones:    zone{"zone-a": {0.1}, "zone-b": {0.2}},
+			policy:   karpopts.MinValuesPolicyBestEffort,
+			expected: "zone-a",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := karpopts.ToContext(injection.WithControllerName(context.Background(), "provisioner"), test.Options())
+			var instanceTypes []*cloudprovider.InstanceType
+			for zone, prices := range tc.zones {
+				for i, price := range prices {
+					instanceTypes = append(instanceTypes, fake.NewInstanceType(fmt.Sprintf("%s-%d", zone, i),
+						fake.WithOfferings(offeringInZone(v1.CapacityTypeOnDemand, zone, price, true))))
+				}
+			}
+			nodePool := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{
+				Requirements: []v1.NodeSelectorRequirementWithMinValues{{
+					Key:       corev1.LabelInstanceTypeStable,
+					Operator:  corev1.NodeSelectorOpExists,
+					MinValues: new(2),
+				}},
+			}}}})
+			labels := map[string]string{"app": "gang"}
+			pod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels, UID: types.UID("gang-0")},
+				PodRequirements: []corev1.PodAffinityTerm{{
+					LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+					TopologyKey:   corev1.LabelTopologyZone,
+				}},
+			})
+			kubeClient := fakecr.NewFakeClient()
+			cloudProvider := fake.NewCloudProvider()
+			cloudProvider.InstanceTypes = instanceTypes
+			cluster := state.NewCluster(&clock.RealClock{}, kubeClient, cloudProvider)
+			instanceTypesByPool := map[string][]*cloudprovider.InstanceType{nodePool.Name: instanceTypes}
+			topology, err := NewTopology(ctx, kubeClient, cluster, nil, []*v1.NodePool{nodePool}, instanceTypesByPool, []*corev1.Pod{pod})
+			if err != nil {
+				t.Fatalf("creating topology: %v", err)
+			}
+			scheduler := NewScheduler(ctx, kubeClient, []*v1.NodePool{nodePool}, cluster, nil, topology, instanceTypesByPool, nil,
+				events.NewRecorder(&record.FakeRecorder{}), &clock.RealClock{}, nil, nil, MinValuesPolicy(tc.policy))
+			results, err := scheduler.Solve(ctx, []*corev1.Pod{pod})
+			if err != nil {
+				t.Fatalf("solving: %v", err)
+			}
+			if tc.expected == "" {
+				if len(results.NewNodeClaims) != 0 || len(results.PodErrors) != 1 {
+					t.Fatalf("expected the pod not to schedule, got %d NodeClaims and errors %v", len(results.NewNodeClaims), results.PodErrors)
+				}
+				return
+			}
+			if len(results.NewNodeClaims) != 1 {
+				t.Fatalf("expected one NodeClaim, got %d and errors %v", len(results.NewNodeClaims), results.PodErrors)
+			}
+			if got := results.NewNodeClaims[0].Requirements.Get(corev1.LabelTopologyZone).Values(); !slices.Equal(got, []string{tc.expected}) {
+				t.Fatalf("expected %s, got %v", tc.expected, got)
+			}
+		})
 	}
 }
