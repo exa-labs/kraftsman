@@ -131,7 +131,7 @@ func instanceTypeNotFound(its []*cloudprovider.InstanceType, nodeClaim *v1.NodeC
 	if !ok {
 		return InstanceTypeNotFound
 	}
-	reqs := scheduling.NewLabelRequirements(nodeClaim.Labels)
+	reqs := cloudprovider.OfferingLookupRequirements(nodeClaim.Labels)
 	// The reserved capacity type is special because a NodeClaim can be demoted from reserved to on-demand after creation.
 	// For this reason, when evaluating drift due to unavailable offerings, we should check both reserved and on-demand for
 	// reserved nodeclaims. This ensures we don't drift a nodeclaim whoes label hasn't been updated yet. If the NodePool

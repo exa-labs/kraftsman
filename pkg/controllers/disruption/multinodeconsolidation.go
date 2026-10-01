@@ -29,8 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	scheduler "sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 // MultiNodeConsolidationTimeoutDuration bounds the binary search for a multi-node command.
@@ -256,7 +256,7 @@ func filterOutSameInstanceType(replacement *Replacement, consolidate []*Candidat
 	// get the price of the cheapest node that we currently are considering deleting indexed by instance type
 	for _, c := range consolidate {
 		existingInstanceTypes.Insert(c.instanceType.Name)
-		compatibleOfferings := c.instanceType.Offerings.Compatible(scheduler.NewLabelRequirements(c.Labels()))
+		compatibleOfferings := c.instanceType.Offerings.Compatible(cloudprovider.OfferingLookupRequirements(c.Labels()))
 		if len(compatibleOfferings) == 0 {
 			continue
 		}
