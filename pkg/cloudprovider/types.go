@@ -55,6 +55,12 @@ var (
 	// ReservedCapacityLabels is the set of additional labels that are associated with reserved offerings. Each reserved
 	// offering should define a requirement for these labels, and all other offerings should define a DoesNotExist requirement.
 	ReservedCapacityLabels = sets.New[string]()
+
+	// OfferingValueLabels are offering requirement keys whose value can change during an offering's lifetime (for
+	// example a market price) while a node launched from that offering keeps, as a label, the value it launched with.
+	// Code that finds a node's offering from the node's labels builds its requirements with
+	// OfferingLookupRequirements, so a value change is not mistaken for the offering having disappeared.
+	OfferingValueLabels = sets.New[string]()
 )
 
 type DriftReason string
@@ -597,6 +603,17 @@ func (ofs Offerings) HasCompatible(reqs scheduling.Requirements) bool {
 		}
 	}
 	return false
+}
+
+// OfferingLookupRequirements are the requirements that find a node's offering from the node's labels. Every key in
+// OfferingValueLabels matches any value, whether or not the node carries it: a node's value is the one it launched
+// with, and a node launched before the key was registered has none.
+func OfferingLookupRequirements(labels map[string]string) scheduling.Requirements {
+	requirements := scheduling.NewLabelRequirements(labels)
+	for label := range OfferingValueLabels {
+		requirements[label] = scheduling.NewRequirement(label, corev1.NodeSelectorOpExists)
+	}
+	return requirements
 }
 
 // Cheapest returns the cheapest offering from the returned offerings
