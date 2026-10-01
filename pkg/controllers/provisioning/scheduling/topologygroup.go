@@ -126,12 +126,14 @@ func NewTopologyGroup(
 	}
 }
 
-func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
+// Get returns the domains a pod may schedule to on a node with nodeDomains, along with the set of valid domains.
+// preference only steers which domain bootstraps a self-selecting pod affinity; it may be nil.
+func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement, preference *BootstrapPreference) (*scheduling.Requirement, sets.Set[string]) {
 	switch t.Type {
 	case TopologyTypeSpread:
 		return t.nextDomainTopologySpread(pod, podDomains, nodeDomains)
 	case TopologyTypePodAffinity:
-		req := t.nextDomainAffinity(pod, podDomains, nodeDomains)
+		req := t.nextDomainAffinity(pod, podDomains, nodeDomains, preference)
 		return req, sets.New[string](req.Values()...)
 	case TopologyTypePodAntiAffinity:
 		req := t.nextDomainAntiAffinity(podDomains, nodeDomains)
@@ -353,7 +355,7 @@ func (t *TopologyGroup) domainMinCount(domains *scheduling.Requirement) int32 {
 }
 
 // nolint:gocyclo
-func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduling.Requirement, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
+func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduling.Requirement, nodeDomains *scheduling.Requirement, preference *BootstrapPreference) *scheduling.Requirement {
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 
 	// We special-case kubernetes.io/hostname primarily for new NodeClaims since their domain won't be registered until we Add() them
@@ -395,28 +397,47 @@ func (t *TopologyGroup) nextDomainAffinity(pod *corev1.Pod, podDomains *scheduli
 	}
 
 	// If pod is self-selecting and no pod has been scheduled yet OR the pods that have scheduled are
-	// incompatible with our podDomains, we can pick a domain at random to bootstrap scheduling.
+	// incompatible with our podDomains, we pick a domain to bootstrap scheduling: the cheapest one to launch in.
 	if t.selects(pod) && (len(t.domains) == len(t.emptyDomains) || !t.anyCompatiblePodDomain(podDomains)) {
-		// First try to find a domain that is within the intersection of pod/node domains. In the case of an in-flight node
-		// this causes us to pick the domain that the existing in-flight node is already in if possible instead of picking
-		// a random viable domain.
+		// A node pinned to one domain can only bootstrap there, so there is no choice to steer.
+		if nodeDomains.Operator() == corev1.NodeSelectorOpIn && nodeDomains.Len() == 1 {
+			preference = nil
+		}
+		candidates := t.bootstrapCandidates(podDomains, preference)
+
+		// First try to find a domain that is within the intersection of pod/node domains. In the case of an in-flight or
+		// existing node this causes us to pick the domain that the node is already in if possible instead of picking
+		// another viable domain.
 		intersected := podDomains.Intersection(nodeDomains)
-		for domain := range t.domains {
+		for _, domain := range candidates {
 			if intersected.Has(domain) {
 				options.Insert(domain)
+				preference.record(t.Key, domain)
 				break
 			}
 		}
 
-		// and if there are no node domains, just return the first random domain that is viable
-		for domain := range t.domains {
-			if podDomains.Has(domain) {
-				options.Insert(domain)
-				break
-			}
+		// and if there are no node domains, just return the first domain that is viable
+		if len(candidates) > 0 {
+			options.Insert(candidates[0])
 		}
 	}
 	return options
+}
+
+// bootstrapCandidates returns the known domains the pod may schedule to that preference has not excluded, cheapest
+// first (see orderBootstrapCandidates). Prices are only resolved when there is more than one candidate to choose from.
+func (t *TopologyGroup) bootstrapCandidates(podDomains *scheduling.Requirement, preference *BootstrapPreference) []string {
+	candidates := make([]string, 0, len(t.domains))
+	for domain := range t.domains {
+		if podDomains.Has(domain) && !preference.excludes(t.Key, domain) {
+			candidates = append(candidates, domain)
+		}
+	}
+	if len(candidates) > 1 {
+		orderBootstrapCandidates(candidates, preference.pricesFor(t.Key), t.Hash())
+	}
+	return candidates
 }
 
 // anyCompatiblePodDomain validates whether any t.domain is compatible with our podDomains

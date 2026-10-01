@@ -17,6 +17,7 @@ limitations under the License.
 package scheduling
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -264,18 +265,160 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	// affinity.
 	// NOTE: Topology requirements should come last since they can result in a single domain from a set of compatible
 	// domains. This can result in unnecessary failures from subsequent checks that narrow requirements.
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	var p *topologyPlacement
+	var err error
+	if n.topology.HasSelfSelectingAffinity(pod) {
+		p, err = n.placeWithBootstrapFallback(ctx, pod, podData, nodeClaimRequirements, allocationResult, relaxMinValues)
+	} else {
+		// No domain is bootstrapped, so there is nothing to price or fall back from.
+		p, err = n.placeWithoutBootstrap(ctx, pod, podData, nodeClaimRequirements, allocationResult, relaxMinValues)
+	}
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	return p.requirements, p.instanceTypes, p.offeringsToReserve, allocationResult, nil
+}
+
+// narrowByTopology tightens nodeClaimRequirements in place to the domains the pod's topology constraints leave on this
+// NodeClaim. preference, which may be nil, steers the domain a self-selecting pod affinity bootstraps in.
+func (n *NodeClaim) narrowByTopology(pod *corev1.Pod, podData *PodData, nodeClaimRequirements scheduling.Requirements, preference *BootstrapPreference) error {
+	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, preference, scheduling.AllowUndefinedWellKnownLabels)
+	if err != nil {
+		return err
+	}
 	if err = nodeClaimRequirements.Compatible(topologyRequirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
-		return nil, nil, nil, nil, err
+		return err
 	}
 	nodeClaimRequirements.Add(topologyRequirements.Values()...)
+	return nil
+}
 
-	// Check instance type combinations
+// placeWithoutBootstrap places a pod that has no self-selecting pod affinity: it narrows nodeClaimRequirements, which it
+// takes ownership of, by the pod's topology and then filters the NodeClaim's instance types and reserved offerings.
+func (n *NodeClaim) placeWithoutBootstrap(
+	ctx context.Context,
+	pod *corev1.Pod,
+	podData *PodData,
+	nodeClaimRequirements scheduling.Requirements,
+	allocationResult *dynamicresources.AllocationResult,
+	relaxMinValues bool,
+) (*topologyPlacement, error) {
+	if err := n.narrowByTopology(pod, podData, nodeClaimRequirements, nil); err != nil {
+		return nil, err
+	}
+	// The requests are only merged once topology has accepted the pod.
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
+	return n.filterPlacement(ctx, pod, podData, nodeClaimRequirements, requests, allocationResult, relaxMinValues)
+}
 
+// topologyPlacement is where a pod fits on a NodeClaim once topology has narrowed its requirements.
+type topologyPlacement struct {
+	requirements       scheduling.Requirements
+	instanceTypes      []*cloudprovider.InstanceType
+	offeringsToReserve []*cloudprovider.Offering
+	// relaxedMinValues is set when the instance types only satisfy minValues after relaxing them.
+	relaxedMinValues bool
+}
+
+// maxBootstrapDomains bounds how many domains placeWithBootstrapFallback tries for one pod, so that a backlog of pods
+// that fit nowhere cannot multiply the cost of a scheduling pass by the number of domains.
+const maxBootstrapDomains = 3
+
+// placeWithBootstrapFallback places a pod whose self-selecting pod affinity may bootstrap a domain. It ranks the
+// candidate domains by the cheapest offering this NodeClaim could launch there and, when the chosen domain leaves
+// nothing to launch (or, with relaxMinValues, only launches by relaxing minValues), tries the next-ranked one. Each
+// attempt excludes the domains the previous one chose, and at most maxBootstrapDomains domains are tried.
+//
+// Pinning a domain only narrows the requirements, so before the first pinned filter it checks the instance types
+// against the requirements without the pin: if they reject the pod there, every domain fails the same way and it
+// returns that error at once; if they only accept it by relaxing minValues, no domain avoids relaxing and it does not
+// fall back. It returns the first placement that needs no relaxation, else the first relaxed one, else the first error.
+func (n *NodeClaim) placeWithBootstrapFallback(
+	ctx context.Context,
+	pod *corev1.Pod,
+	podData *PodData,
+	nodeClaimRequirements scheduling.Requirements,
+	allocationResult *dynamicresources.AllocationResult,
+	relaxMinValues bool,
+) (*topologyPlacement, error) {
+	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
+	preference := NewBootstrapPreference(n.domainPrices(ctx, pod, nodeClaimRequirements, requests, allocatableInstanceTypes(n.InstanceTypeOptions, allocationResult)))
+	var attempts placementAttempts
+	fallback := true
+	for attempt := 1; ; attempt++ {
+		requirements := scheduling.NewRequirements(nodeClaimRequirements.Values()...)
+		err := n.narrowByTopology(pod, podData, requirements, preference)
+		if err == nil && attempt == 1 {
+			// The requirements without the pin tell whether another domain could do any better.
+			fallback, err = n.checkWithoutDomain(pod, podData, nodeClaimRequirements, requests, relaxMinValues, preference)
+		}
+		var p *topologyPlacement
+		if err == nil {
+			p, err = n.filterPlacement(ctx, pod, podData, requirements, requests, allocationResult, relaxMinValues)
+		}
+		if final := attempts.record(p, err); final != nil {
+			return final, nil
+		}
+		if !fallback || !preference.Chosen() || attempt >= maxBootstrapDomains {
+			return attempts.result()
+		}
+		preference.ExcludeChosen()
+	}
+}
+
+// checkWithoutDomain checks the NodeClaim's instance types against nodeClaimRequirements as they stand before topology
+// pins a domain, when the evaluation that just ran bootstrapped one. It returns the filter's error when they reject the
+// pod, and whether falling back to another domain can still help.
+func (n *NodeClaim) checkWithoutDomain(pod *corev1.Pod, podData *PodData, nodeClaimRequirements scheduling.Requirements, requests corev1.ResourceList, relaxMinValues bool, preference *BootstrapPreference) (bool, error) {
+	if !preference.Chosen() {
+		return true, nil
+	}
+	_, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
+	if err != nil {
+		return false, n.instanceTypeFilterError(pod, podData, relaxMinValues, err)
+	}
+	return !relaxMinValues || len(unsatisfiableKeys) == 0, nil
+}
+
+// placementAttempts accumulates the outcomes of placeWithBootstrapFallback's attempts.
+type placementAttempts struct {
+	firstErr error
+	relaxed  *topologyPlacement
+}
+
+// record notes an attempt's outcome and returns its placement when it needs no relaxation, ending the search.
+func (a *placementAttempts) record(p *topologyPlacement, err error) *topologyPlacement {
+	switch {
+	case err != nil:
+		a.firstErr = cmp.Or(a.firstErr, err)
+	case !p.relaxedMinValues:
+		return p
+	case a.relaxed == nil:
+		a.relaxed = p
+	}
+	return nil
+}
+
+// result returns the first relaxed placement, else the first error.
+func (a *placementAttempts) result() (*topologyPlacement, error) {
+	if a.relaxed != nil {
+		return a.relaxed, nil
+	}
+	return nil, a.firstErr
+}
+
+// filterPlacement filters the NodeClaim's instance types and reserved offerings against nodeClaimRequirements, which it
+// takes ownership of.
+func (n *NodeClaim) filterPlacement(
+	ctx context.Context,
+	pod *corev1.Pod,
+	podData *PodData,
+	nodeClaimRequirements scheduling.Requirements,
+	requests corev1.ResourceList,
+	allocationResult *dynamicresources.AllocationResult,
+	relaxMinValues bool,
+) (*topologyPlacement, error) {
+	// Check instance type combinations
 	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
 	if relaxMinValues {
 		// Update min values on the requirements if they are relaxed
@@ -284,30 +427,65 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 		}
 	}
 	if err != nil {
-		// We avoid wrapping this err with fmt.Errorf because calling String() on InstanceTypeFilterError is an expensive
-		// operation due to calls to resources.Merge and stringifying the nodeClaimRequirements.
-		if n.instanceTypeFilterFailureIsInvariant(pod, podData, relaxMinValues) {
-			return nil, nil, nil, nil, NewNodePoolIncompatibleError(err)
-		}
-		return nil, nil, nil, nil, err
+		return nil, n.instanceTypeFilterError(pod, podData, relaxMinValues, err)
 	}
 	// Apply the DRA-specific instance type filter: only instance types whose device allocation succeeded survive.
 	if allocationResult != nil {
-		supported := sets.New(lo.Map(allocationResult.InstanceTypes, func(it dynamicresources.InstanceTypeID, _ int) string {
-			return it.Value()
-		})...)
-		remaining = lo.Filter(remaining, func(it *cloudprovider.InstanceType, _ int) bool {
-			return supported.Has(it.Name)
-		})
+		remaining = allocatableInstanceTypes(remaining, allocationResult)
 		if len(remaining) == 0 {
-			return nil, nil, nil, nil, fmt.Errorf("no instance type satisfies both scheduling and dynamic resource requirements")
+			return nil, fmt.Errorf("no instance type satisfies both scheduling and dynamic resource requirements")
 		}
 	}
 	ofs, err := n.offeringsToReserve(ctx, remaining, nodeClaimRequirements)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
-	return nodeClaimRequirements, remaining, ofs, allocationResult, nil
+	return &topologyPlacement{
+		requirements:       nodeClaimRequirements,
+		instanceTypes:      remaining,
+		offeringsToReserve: ofs,
+		relaxedMinValues:   relaxMinValues && len(unsatisfiableKeys) != 0,
+	}, nil
+}
+
+// domainPrices prices the domains this NodeClaim could launch pod in, given its requirements, the resource requests it
+// must fit and the instance types still eligible for it. Reserved offerings only count when the ReservedCapacity feature
+// gate is on and this NodeClaim could still reserve them.
+func (n *NodeClaim) domainPrices(ctx context.Context, pod *corev1.Pod, requirements scheduling.Requirements, requests corev1.ResourceList, instanceTypes []*cloudprovider.InstanceType) DomainPriceFunc {
+	reservedCapacity := opts.FromContext(ctx).FeatureGates.ReservedCapacity
+	return func(topologyKey string) map[string]float64 {
+		return cheapestPriceByDomain(instanceTypes, n.daemonOverheadGroups, pod, requirements, requests, topologyKey, func(o *cloudprovider.Offering) bool {
+			if o.CapacityType() != v1.CapacityTypeReserved {
+				return true
+			}
+			return reservedCapacity && (n.reservationManager == nil || n.reservationManager.CanReserve(n.hostname, o))
+		})
+	}
+}
+
+// allocatableInstanceTypes returns the instance types whose dynamic resource allocation succeeded, or instanceTypes
+// unchanged when nothing was allocated.
+func allocatableInstanceTypes(instanceTypes []*cloudprovider.InstanceType, allocationResult *dynamicresources.AllocationResult) []*cloudprovider.InstanceType {
+	if allocationResult == nil {
+		return instanceTypes
+	}
+	supported := sets.New(lo.Map(allocationResult.InstanceTypes, func(it dynamicresources.InstanceTypeID, _ int) string {
+		return it.Value()
+	})...)
+	return lo.Filter(instanceTypes, func(it *cloudprovider.InstanceType, _ int) bool {
+		return supported.Has(it.Name)
+	})
+}
+
+// instanceTypeFilterError returns the error for an instance type filter that rejected pod, marking it as a NodePool
+// incompatibility when it holds in every scheduling pass.
+func (n *NodeClaim) instanceTypeFilterError(pod *corev1.Pod, podData *PodData, relaxMinValues bool, err error) error {
+	// We avoid wrapping this err with fmt.Errorf because calling String() on InstanceTypeFilterError is an expensive
+	// operation due to calls to resources.Merge and stringifying the nodeClaimRequirements.
+	if n.instanceTypeFilterFailureIsInvariant(pod, podData, relaxMinValues) {
+		return NewNodePoolIncompatibleError(err)
+	}
+	return err
 }
 
 // instanceTypeFilterFailureIsInvariant reports whether a failed instance type filter for pod rules the pod out of this

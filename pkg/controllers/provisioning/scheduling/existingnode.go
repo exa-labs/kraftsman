@@ -171,7 +171,7 @@ func (n *ExistingNode) tryVolumeAlternative(pod *v1.Pod, podData *PodData, baseR
 	// Check Topology Requirements
 	// NOTE: podData.StrictRequirements does NOT include volume requirements,
 	// ensuring TSC counting uses pod's original affinity.
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.cachedTaints, podData.StrictRequirements, nodeRequirements)
+	topologyRequirements, err := n.topology.AddRequirements(pod, n.cachedTaints, podData.StrictRequirements, nodeRequirements, nil)
 	if err != nil {
 		return nil, err
 	}

@@ -17,9 +17,11 @@ limitations under the License.
 package scheduling
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -63,8 +65,11 @@ type Topology struct {
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
 	excludedPods sets.Set[string]
-	cluster      *state.Cluster
-	stateNodes   []*state.StateNode
+	// selfAffinityPods are the UIDs of pods that own a pod affinity group selecting themselves, the only pods whose
+	// affinity can bootstrap a domain and so the only ones a BootstrapPreference can steer.
+	selfAffinityPods sets.Set[string]
+	cluster          *state.Cluster
+	stateNodes       []*state.StateNode
 }
 
 func NewTopology(
@@ -86,6 +91,7 @@ func NewTopology(
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[string]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
+		selfAffinityPods:      sets.New[string](),
 	}
 
 	// these are the pods that we intend to schedule, so if they are currently in the cluster we shouldn't count them for
@@ -186,6 +192,7 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 	for _, topology := range t.topologyGroups {
 		topology.RemoveOwner(p.UID)
 	}
+	t.selfAffinityPods.Delete(string(p.UID))
 
 	if (t.preferencePolicy == PreferencePolicyIgnore && pod.HasRequiredPodAntiAffinity(p)) ||
 		(t.preferencePolicy == PreferencePolicyRespect && pod.HasPodAntiAffinity(p)) {
@@ -211,9 +218,23 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 		} else {
 			tg = existing
 		}
-		tg.AddOwner(p.UID)
+		t.addOwner(tg, p)
 	}
 	return nil
+}
+
+// addOwner makes p an owner of tg, noting p when tg is a pod affinity that selects p itself.
+func (t *Topology) addOwner(tg *TopologyGroup, p *corev1.Pod) {
+	tg.AddOwner(p.UID)
+	if tg.Type == TopologyTypePodAffinity && tg.selects(p) {
+		t.selfAffinityPods.Insert(string(p.UID))
+	}
+}
+
+// HasSelfSelectingAffinity reports whether p owns a pod affinity that selects p itself. Only such an affinity can
+// bootstrap a domain, so for any other pod domain prices are never consulted.
+func (t *Topology) HasSelfSelectingAffinity(p *corev1.Pod) bool {
+	return t.selfAffinityPods.Has(string(p.UID))
 }
 
 // Record records the topology changes given that pod p schedule on a node with the given requirements
@@ -245,19 +266,29 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 // AddRequirements tightens the input requirements by adding additional requirements that are being enforced by topology spreads
 // affinities, anti-affinities or inverse anti-affinities.  The nodeHostname is the hostname that we are currently considering
 // placing the pod on.  It returns these newly tightened requirements, or an error in the case of a set of requirements that
-// cannot be satisfied.
-func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
+// cannot be satisfied. preference, which may be nil, steers the domain a self-selecting pod affinity bootstraps in.
+func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, preference *BootstrapPreference, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
-	for _, topology := range t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...) {
+	matchingTopologies := t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...)
+	// With a preference, pod affinities go last and choose among the domains the other topologies left, so that a
+	// bootstrapping affinity never settles on a domain another topology rules out; the other topologies see the node's
+	// own domains. Without one nothing steers a bootstrap, and topologies apply in their usual order.
+	if preference != nil {
+		slices.SortStableFunc(matchingTopologies, func(a, b *TopologyGroup) int {
+			return cmp.Compare(lo.Ternary(a.Type == TopologyTypePodAffinity, 1, 0), lo.Ternary(b.Type == TopologyTypePodAffinity, 1, 0))
+		})
+	}
+	for _, topology := range matchingTopologies {
 		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
 		if podRequirements.Has(topology.Key) {
 			podDomains = podRequirements.Get(topology.Key)
 		}
+		nodeDomainSource := lo.Ternary(preference != nil && topology.Type == TopologyTypePodAffinity, requirements, nodeRequirements)
 		nodeDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
-		if nodeRequirements.Has(topology.Key) {
-			nodeDomains = nodeRequirements.Get(topology.Key)
+		if nodeDomainSource.Has(topology.Key) {
+			nodeDomains = nodeDomainSource.Get(topology.Key)
 		}
-		domains, _ := topology.Get(p, podDomains, nodeDomains)
+		domains, _ := topology.Get(p, podDomains, nodeDomains, preference)
 		if domains.Len() == 0 {
 			return nil, topologyError{
 				topology:    topology,
@@ -285,7 +316,7 @@ func (t *Topology) GetTopologyZoneConstraints(p *corev1.Pod, podRequirements sch
 			podDomains = podRequirements.Get(topology.Key)
 		}
 		nodeDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
-		_, validDomains := topology.Get(p, podDomains, nodeDomains)
+		_, validDomains := topology.Get(p, podDomains, nodeDomains, nil)
 
 		if validDomains.Len() == 0 {
 			return nil, false
