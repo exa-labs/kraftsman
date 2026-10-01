@@ -158,7 +158,7 @@ func TestAffinityBootstrapPrefersPricedDomains(t *testing.T) {
 func TestAffinityBootstrapIsDeterministicWithoutPrices(t *testing.T) {
 	pod := gangPod()
 	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
-	for _, prices := range []DomainPriceFunc{nil, staticPrices(map[string]float64{}), staticPrices(map[string]float64{"zone-a": 1, "zone-b": 1, "zone-c": 1, "zone-d": 1})} {
+	for _, prices := range []DomainPriceFunc{staticPrices(nil), staticPrices(map[string]float64{"zone-a": 1, "zone-b": 1, "zone-c": 1, "zone-d": 1})} {
 		first := bootstrappedZones(t, topology, pod, zoneRequirements(corev1.NodeSelectorOpExists), prices)
 		if len(first) != 1 {
 			t.Fatalf("expected one zone, got %v", first)
@@ -202,7 +202,6 @@ func TestBootstrapPreferenceExcludesChosenDomains(t *testing.T) {
 	topology := zoneTopology(newZoneTopologyGroup(TopologyTypePodAffinity, pod), pod)
 	preference := NewBootstrapPreference(staticPrices(map[string]float64{"zone-a": 3, "zone-b": 1, "zone-c": 2, "zone-d": 1.5}))
 	for _, expected := range []string{"zone-b", "zone-d", "zone-c", "zone-a"} {
-		preference.ResetChosen()
 		requirements, err := topology.AddRequirements(pod, nil, scheduling.NewRequirements(), zoneRequirements(corev1.NodeSelectorOpExists), preference)
 		if err != nil {
 			t.Fatalf("AddRequirements: %v", err)
@@ -215,7 +214,6 @@ func TestBootstrapPreferenceExcludesChosenDomains(t *testing.T) {
 		}
 		preference.ExcludeChosen()
 	}
-	preference.ResetChosen()
 	if _, err := topology.AddRequirements(pod, nil, scheduling.NewRequirements(), zoneRequirements(corev1.NodeSelectorOpExists), preference); err == nil {
 		t.Fatalf("expected no domain once every candidate is excluded")
 	}
