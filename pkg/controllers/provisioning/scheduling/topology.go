@@ -65,8 +65,11 @@ type Topology struct {
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
 	excludedPods sets.Set[string]
-	cluster      *state.Cluster
-	stateNodes   []*state.StateNode
+	// selfAffinityPods are the UIDs of pods that own a pod affinity group selecting themselves, the only pods whose
+	// affinity can bootstrap a domain and so the only ones a BootstrapPreference can steer.
+	selfAffinityPods sets.Set[string]
+	cluster          *state.Cluster
+	stateNodes       []*state.StateNode
 }
 
 func NewTopology(
@@ -88,6 +91,7 @@ func NewTopology(
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[string]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
+		selfAffinityPods:      sets.New[string](),
 	}
 
 	// these are the pods that we intend to schedule, so if they are currently in the cluster we shouldn't count them for
@@ -188,6 +192,7 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 	for _, topology := range t.topologyGroups {
 		topology.RemoveOwner(p.UID)
 	}
+	t.selfAffinityPods.Delete(string(p.UID))
 
 	if (t.preferencePolicy == PreferencePolicyIgnore && pod.HasRequiredPodAntiAffinity(p)) ||
 		(t.preferencePolicy == PreferencePolicyRespect && pod.HasPodAntiAffinity(p)) {
@@ -213,9 +218,23 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 		} else {
 			tg = existing
 		}
-		tg.AddOwner(p.UID)
+		t.addOwner(tg, p)
 	}
 	return nil
+}
+
+// addOwner makes p an owner of tg, noting p when tg is a pod affinity that selects p itself.
+func (t *Topology) addOwner(tg *TopologyGroup, p *corev1.Pod) {
+	tg.AddOwner(p.UID)
+	if tg.Type == TopologyTypePodAffinity && tg.selects(p) {
+		t.selfAffinityPods.Insert(string(p.UID))
+	}
+}
+
+// HasSelfSelectingAffinity reports whether p owns a pod affinity that selects p itself. Only such an affinity can
+// bootstrap a domain, so for any other pod domain prices are never consulted.
+func (t *Topology) HasSelfSelectingAffinity(p *corev1.Pod) bool {
+	return t.selfAffinityPods.Has(string(p.UID))
 }
 
 // Record records the topology changes given that pod p schedule on a node with the given requirements
@@ -251,17 +270,20 @@ func (t *Topology) Record(p *corev1.Pod, taints []corev1.Taint, requirements sch
 func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequirements, nodeRequirements scheduling.Requirements, preference *BootstrapPreference, compatibilityOptions ...option.Function[scheduling.CompatibilityOptions]) (scheduling.Requirements, error) {
 	requirements := scheduling.NewRequirements(nodeRequirements.Values()...)
 	matchingTopologies := t.getMatchingTopologies(p, taints, nodeRequirements, compatibilityOptions...)
-	// Pod affinities go last and choose among the domains the other topologies left, so that a bootstrapping affinity
-	// never settles on a domain another topology rules out. The other topologies see the node's own domains.
-	slices.SortStableFunc(matchingTopologies, func(a, b *TopologyGroup) int {
-		return cmp.Compare(lo.Ternary(a.Type == TopologyTypePodAffinity, 1, 0), lo.Ternary(b.Type == TopologyTypePodAffinity, 1, 0))
-	})
+	// With a preference, pod affinities go last and choose among the domains the other topologies left, so that a
+	// bootstrapping affinity never settles on a domain another topology rules out; the other topologies see the node's
+	// own domains. Without one nothing steers a bootstrap, and topologies apply in their usual order.
+	if preference != nil {
+		slices.SortStableFunc(matchingTopologies, func(a, b *TopologyGroup) int {
+			return cmp.Compare(lo.Ternary(a.Type == TopologyTypePodAffinity, 1, 0), lo.Ternary(b.Type == TopologyTypePodAffinity, 1, 0))
+		})
+	}
 	for _, topology := range matchingTopologies {
 		podDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
 		if podRequirements.Has(topology.Key) {
 			podDomains = podRequirements.Get(topology.Key)
 		}
-		nodeDomainSource := lo.Ternary(topology.Type == TopologyTypePodAffinity, requirements, nodeRequirements)
+		nodeDomainSource := lo.Ternary(preference != nil && topology.Type == TopologyTypePodAffinity, requirements, nodeRequirements)
 		nodeDomains := scheduling.NewRequirement(topology.Key, corev1.NodeSelectorOpExists)
 		if nodeDomainSource.Has(topology.Key) {
 			nodeDomains = nodeDomainSource.Get(topology.Key)

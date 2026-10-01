@@ -265,6 +265,15 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 	// affinity.
 	// NOTE: Topology requirements should come last since they can result in a single domain from a set of compatible
 	// domains. This can result in unnecessary failures from subsequent checks that narrow requirements.
+	if !n.topology.HasSelfSelectingAffinity(pod) {
+		// Without a self-selecting pod affinity no domain is bootstrapped, so there is nothing to price or fall back from,
+		// and the requests are only merged once topology has accepted the pod.
+		p, err := n.placeWithoutBootstrap(ctx, pod, podData, nodeClaimRequirements, allocationResult, relaxMinValues)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		return p.requirements, p.instanceTypes, p.offeringsToReserve, allocationResult, nil
+	}
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 	preference := NewBootstrapPreference(n.domainPrices(ctx, pod, nodeClaimRequirements, requests, allocatableInstanceTypes(n.InstanceTypeOptions, allocationResult)))
 	p, err := n.placeWithBootstrapFallback(ctx, pod, podData, nodeClaimRequirements, requests, allocationResult, relaxMinValues, preference)
@@ -272,6 +281,28 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 		return nil, nil, nil, nil, err
 	}
 	return p.requirements, p.instanceTypes, p.offeringsToReserve, allocationResult, nil
+}
+
+// placeWithoutBootstrap places a pod that has no self-selecting pod affinity: it narrows nodeClaimRequirements, which it
+// takes ownership of, by the pod's topology and then filters the NodeClaim's instance types and reserved offerings.
+func (n *NodeClaim) placeWithoutBootstrap(
+	ctx context.Context,
+	pod *corev1.Pod,
+	podData *PodData,
+	nodeClaimRequirements scheduling.Requirements,
+	allocationResult *dynamicresources.AllocationResult,
+	relaxMinValues bool,
+) (*topologyPlacement, error) {
+	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, nil, scheduling.AllowUndefinedWellKnownLabels)
+	if err != nil {
+		return nil, err
+	}
+	if err = nodeClaimRequirements.Compatible(topologyRequirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
+		return nil, err
+	}
+	nodeClaimRequirements.Add(topologyRequirements.Values()...)
+	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
+	return n.filterPlacement(ctx, pod, podData, nodeClaimRequirements, requests, allocationResult, relaxMinValues)
 }
 
 // topologyPlacement is where a pod fits on a NodeClaim once topology has narrowed its requirements.
