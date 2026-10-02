@@ -61,7 +61,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"sigs.k8s.io/karpenter/pkg/apis/v1"
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -177,7 +177,7 @@ func (w *diffWorld) randomOfferings(it *diffInstanceType) []diffOffering {
 
 func (w *diffWorld) randomNodePool(name string, uid types.UID) *v1.NodePool {
 	np := test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid, Generation: 1}})
-	np.Spec.Weight = lo.ToPtr(int32(w.rng.Intn(50)))
+	np.Spec.Weight = lo.ToPtr(w.rng.Int31n(50))
 	w.randomizeNodePoolSpec(np)
 	// The provider returns a pool-specific subset of the catalog.
 	var names []string
@@ -312,6 +312,7 @@ func (w *diffWorld) bindDaemonPods(node *corev1.Node) {
 
 var diffPodSeq int
 
+//nolint:gocyclo
 func (w *diffWorld) randomWorkloadPod(nodeName string) *corev1.Pod {
 	diffPodSeq++
 	name := fmt.Sprintf("pod-%d", diffPodSeq)
@@ -348,7 +349,7 @@ func (w *diffWorld) randomWorkloadPod(nodeName string) *corev1.Pod {
 	}
 	if w.rng.Intn(2) == 0 {
 		tsc := corev1.TopologySpreadConstraint{
-			MaxSkew: int32(1 + w.rng.Intn(2)), TopologyKey: w.pick(corev1.LabelTopologyZone, corev1.LabelHostname),
+			MaxSkew: 1 + w.rng.Int31n(2), TopologyKey: w.pick(corev1.LabelTopologyZone, corev1.LabelHostname),
 			WhenUnsatisfiable: corev1.DoNotSchedule, LabelSelector: selector(),
 		}
 		if w.rng.Intn(3) == 0 {
@@ -374,6 +375,8 @@ func (w *diffWorld) randomWorkloadPod(nodeName string) *corev1.Pod {
 
 // mutate applies one random cluster change between passes, bumping the versions the real API
 // server and provider would bump.
+//
+//nolint:gocyclo
 func (w *diffWorld) mutate() string {
 	switch w.rng.Intn(11) {
 	case 0:
@@ -480,6 +483,7 @@ type diffPassInputs struct {
 	revisions     map[string]uint64
 }
 
+//nolint:gocyclo
 func (w *diffWorld) passInputs(t *testing.T) diffPassInputs {
 	t.Helper()
 	ctx := context.Background()
@@ -808,11 +812,82 @@ func runCacheDifferentialWorld(t *testing.T, seed int64) string {
 				return fmt.Sprintf("pass %d step %d candidate %+v differs\nhistory:\n  %s\n%s", pass, step, candidate, strings.Join(history, "\n  "), diff)
 			}
 			// Solving writes into everything the scheduler owns; a write into shared cached
-			// state surfaces as a mismatch in a later candidate.
-			if _, err := cached.Solve(cachedCtx, pods); err != nil {
+			// state surfaces as a mismatch in a later candidate. The decisions themselves must
+			// match too, up to the ties topology breaks by map iteration order.
+			cachedResults, err := cached.Solve(cachedCtx, copyPods(pods))
+			if err != nil {
 				return fmt.Sprintf("solve: %v", err)
+			}
+			if msg := w.compareDecisions(t, cachedCtx, uncachedCtx, in, candidate, renderResults(cachedResults), uncached, pods); msg != "" {
+				return fmt.Sprintf("pass %d step %d candidate %+v: %s\nhistory:\n  %s", pass, step, candidate, msg, strings.Join(history, "\n  "))
 			}
 		}
 	}
 	return ""
+}
+
+func copyPods(pods []*corev1.Pod) []*corev1.Pod {
+	return lo.Map(pods, func(p *corev1.Pod, _ int) *corev1.Pod { return p.DeepCopy() })
+}
+
+// renderResults renders a Solve's decisions: where each pod went (an existing node, or a new
+// NodeClaim described by its NodePool, its pods and its instance type options) and which pods failed,
+// and whether each failure is pass-invariant.
+func renderResults(r Results) string {
+	var out []string
+	for _, n := range r.ExistingNodes {
+		for _, p := range n.Pods {
+			out = append(out, fmt.Sprintf("%s -> existing %s", p.Name, n.Name()))
+		}
+	}
+	for _, nc := range r.NewNodeClaims {
+		pods := lo.Map(nc.Pods, func(p *corev1.Pod, _ int) string { return p.Name })
+		sort.Strings(pods)
+		its := lo.Map(nc.InstanceTypeOptions, func(it *cloudprovider.InstanceType, _ int) string { return it.Name })
+		sort.Strings(its)
+		out = append(out, fmt.Sprintf("new %s pods=%v its=%v", nc.NodePoolName, pods, its))
+	}
+	for p, err := range r.PodErrors {
+		out = append(out, fmt.Sprintf("%s -> error invariant=%t", p.Name, IsIncompatibleWithAllNodePools(err)))
+	}
+	sort.Strings(out)
+	return strings.Join(out, "\n")
+}
+
+// compareDecisions compares the cached scheduler's decisions with the uncached scheduler's.
+// Topology spread breaks ties between equally loaded domains by map iteration order, so either side
+// can legitimately produce several outcomes from the same inputs. Both sides are rebuilt and solved
+// afresh, up to ten times each, and they agree as soon as one outcome appears on both; a mismatch is
+// reported only when the two outcome sets never meet.
+func (w *diffWorld) compareDecisions(t *testing.T, cachedCtx, uncachedCtx context.Context, in diffPassInputs, candidate diffCandidate, cachedFirst string, uncached *Scheduler, pods []*corev1.Pod) string {
+	t.Helper()
+	cachedSeen, uncachedSeen := sets.New(cachedFirst), sets.New[string]()
+	solve := func(ctx context.Context, s *Scheduler) (string, error) {
+		results, err := s.Solve(ctx, copyPods(pods))
+		if err != nil {
+			return "", err
+		}
+		return renderResults(results), nil
+	}
+	for attempt := range 10 {
+		if attempt > 0 {
+			uncached, _ = w.buildScheduler(t, uncachedCtx, in, candidate)
+		}
+		rendered, err := solve(uncachedCtx, uncached)
+		if err != nil {
+			return fmt.Sprintf("uncached solve: %v", err)
+		}
+		if uncachedSeen.Insert(rendered); cachedSeen.Has(rendered) {
+			return ""
+		}
+		cached, _ := w.buildScheduler(t, cachedCtx, in, candidate)
+		if rendered, err = solve(cachedCtx, cached); err != nil {
+			return fmt.Sprintf("cached solve: %v", err)
+		}
+		if cachedSeen.Insert(rendered); uncachedSeen.Has(rendered) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("decisions differ\ncached (%d distinct):\n%s\nuncached (%d distinct):\n%s",
+		cachedSeen.Len(), strings.Join(sets.List(cachedSeen), "\n---\n"), uncachedSeen.Len(), strings.Join(sets.List(uncachedSeen), "\n---\n"))
 }
