@@ -57,8 +57,9 @@ func linearLadder() []*cloudprovider.InstanceType {
 	})
 }
 
-// solveLinearLadder places fifteen one-core pods, plus a 400m DaemonSet on every node, on a single NodePool with the
-// given packing policy, and returns the NodeClaims and the sum of their cheapest launch prices.
+// solveLinearLadder places fifteen one-core pods on a single NodePool with the given packing policy, and returns the
+// NodeClaims and the sum of their cheapest launch prices. The fake instance types reserve 100m for the kubelet, so a
+// node of n cores holds n-1 one-core pods.
 func solveLinearLadder(t *testing.T, policy PackingPolicy) ([]*NodeClaim, float64) {
 	t.Helper()
 	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
@@ -77,13 +78,6 @@ func solveLinearLadder(t *testing.T, policy PackingPolicy) ([]*NodeClaim, float6
 			Status: corev1.PodStatus{Phase: corev1.PodPending},
 		}
 	})
-	daemon := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "daemon", Namespace: "default", UID: "daemon"},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{{
-			Name:      "daemon",
-			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("400m")}},
-		}}},
-	}
 	instanceTypes := linearLadder()
 	client := fakecr.NewFakeClient()
 	provider := fake.NewCloudProvider()
@@ -94,7 +88,7 @@ func solveLinearLadder(t *testing.T, policy PackingPolicy) ([]*NodeClaim, float6
 	if err != nil {
 		t.Fatalf("creating topology: %v", err)
 	}
-	s := NewScheduler(ctx, client, []*v1.NodePool{nodePool}, cluster, nil, topology, byNodePool, []*corev1.Pod{daemon},
+	s := NewScheduler(ctx, client, []*v1.NodePool{nodePool}, cluster, nil, topology, byNodePool, nil,
 		events.NewRecorder(&record.FakeRecorder{}), clock.RealClock{}, nil, nil)
 	results, err := s.Solve(ctx, pods)
 	if err != nil || len(results.PodErrors) != 0 {
@@ -112,8 +106,9 @@ func solveLinearLadder(t *testing.T, policy PackingPolicy) ([]*NodeClaim, float6
 }
 
 // The step from one size to the next costs as much as the claim already does, while a fresh claim for one pod costs
-// the smallest size, so marginal-cost stops growing a claim at about twice a pod's own size. On a linear ladder that
-// buys no discount and pays the DaemonSet and kubelet overhead once per extra node.
+// the smallest size that fits it, so marginal-cost stops growing a claim at about twice that size. On a linear ladder
+// that buys no discount and pays the per-node overhead (here the kubelet reservation) once per extra node: a 4-core
+// claim holds three pods, so fifteen pods take five of them where binpack fits all fifteen on one 16-core claim.
 func TestMarginalCostSplitsLinearPriceLadders(t *testing.T) {
 	binpacked, binpackPrice := solveLinearLadder(t, PackingPolicyBinpack)
 	if len(binpacked) != 1 || math.Abs(binpackPrice-1.6) > 1e-9 {

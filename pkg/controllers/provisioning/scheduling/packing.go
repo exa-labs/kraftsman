@@ -26,8 +26,8 @@ limitations under the License.
 // cheaper per unit than the small ones, that pod opens a new small NodeClaim instead, so such volume discounts are only
 // captured by pods that need the large size outright. Pools whose sizes scale price linearly do not pack as under
 // "binpack" either: on a doubling ladder the step costs as much as the NodeClaim already does, while a fresh NodeClaim
-// costs the pod's smallest size, so NodeClaims stop growing at about twice a pod's size, and the extra nodes each pay
-// for their own DaemonSets and kubelet reservation (TestMarginalCostSplitsLinearPriceLadders: 25% dearer than binpack).
+// costs the smallest size that fits the pod, so NodeClaims stop growing at about twice that size, and the extra nodes
+// each pay for their own kubelet reservation and DaemonSets (TestMarginalCostSplitsLinearPriceLadders: 25% dearer).
 // Opt in only NodePools whose small sizes are cheaper per unit, such as accelerator families.
 //
 // The policy is per NodePool. A scheduler with no marginal-cost NodePool runs the original binpack code path
