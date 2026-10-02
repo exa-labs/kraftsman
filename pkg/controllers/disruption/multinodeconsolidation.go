@@ -56,7 +56,7 @@ func NewMultiNodeConsolidation(c consolidation, opts ...option.Function[MethodOp
 }
 
 // nolint:gocyclo
-func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (_ []Command, err error) {
 	ctx = withConsolidationType(ctx, m.ConsolidationType())
 	ctx = scheduling.WithDaemonOverheadCache(ctx, scheduling.NewDaemonOverheadCacheWithGroupStore(m.daemonOverheadGroups))
 	ctx = scheduling.WithDomainGroupCache(ctx, scheduling.NewDomainGroupCache())
@@ -76,7 +76,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 			outcome = PassOutcomeTimedOut
 		}
 		ObserveConsolidationPass(m.ConsolidationType(), outcome, depth)
-		m.recordPassOutcome(ctx, outcome)
+		m.recordPassOutcome(ctx, outcome, err)
 	}()
 	if m.IsConsolidated() {
 		return []Command{}, nil
@@ -167,10 +167,17 @@ func (m *MultiNodeConsolidation) DueForPass(ctx context.Context) bool {
 	return !m.clock.Now().Before(m.nextPass)
 }
 
+// RecordEmptyPass schedules the next pass after one that had no candidates to evaluate, which
+// found nothing as surely as a search that came up empty.
+func (m *MultiNodeConsolidation) RecordEmptyPass(ctx context.Context) {
+	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
+}
+
 // recordPassOutcome schedules the next pass: immediately after a pass that produced a command,
-// since the fleet just changed and the search may find another, and one interval out otherwise.
-func (m *MultiNodeConsolidation) recordPassOutcome(ctx context.Context, outcome string) {
-	if outcome == PassOutcomeCompleted {
+// since the fleet just changed and the search may find another, or that failed, so the
+// controller's retry runs it again; one interval out after a pass that found nothing.
+func (m *MultiNodeConsolidation) recordPassOutcome(ctx context.Context, outcome string, err error) {
+	if outcome == PassOutcomeCompleted || err != nil {
 		m.nextPass = time.Time{}
 		return
 	}

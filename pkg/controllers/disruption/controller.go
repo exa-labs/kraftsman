@@ -187,10 +187,14 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 // evaluation.
 type passGate interface {
 	DueForPass(ctx context.Context) bool
+	// RecordEmptyPass tells the method a pass ended with no candidates to evaluate, which
+	// ComputeCommands never sees.
+	RecordEmptyPass(ctx context.Context)
 }
 
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
-	if gate, ok := disruption.(passGate); ok && !gate.DueForPass(ctx) {
+	gate, gated := disruption.(passGate)
+	if gated && !gate.DueForPass(ctx) {
 		return false, nil
 	}
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
@@ -211,6 +215,9 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
+		if gated {
+			gate.RecordEmptyPass(ctx)
+		}
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring

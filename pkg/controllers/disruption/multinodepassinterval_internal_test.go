@@ -18,10 +18,12 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	clocktesting "k8s.io/utils/clock/testing"
+	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
@@ -43,7 +45,7 @@ func TestMultiNodePassIntervalDisabledByDefault(t *testing.T) {
 	m := newIntervalMultiNode(clk)
 	ctx := multiNodeIntervalContext(0)
 
-	m.recordPassOutcome(ctx, PassOutcomeNoOp)
+	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
 	if !m.DueForPass(ctx) {
 		t.Fatal("with no interval configured, every loop iteration must run a pass")
 	}
@@ -58,7 +60,7 @@ func TestMultiNodePassIntervalSpacesPassesAfterNoCommand(t *testing.T) {
 		t.Fatal("the first pass must be due")
 	}
 	for _, outcome := range []string{PassOutcomeNoOp, PassOutcomeTimedOut} {
-		m.recordPassOutcome(ctx, outcome)
+		m.recordPassOutcome(ctx, outcome, nil)
 		if m.DueForPass(ctx) {
 			t.Fatalf("a pass ending %s must push the next one out by the interval", outcome)
 		}
@@ -73,10 +75,23 @@ func TestMultiNodePassIntervalSpacesPassesAfterNoCommand(t *testing.T) {
 	}
 
 	// A pass that found a command changed the fleet, so the next one is due at once.
-	m.recordPassOutcome(ctx, PassOutcomeNoOp)
-	m.recordPassOutcome(ctx, PassOutcomeCompleted)
+	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
+	m.recordPassOutcome(ctx, PassOutcomeCompleted, nil)
 	if !m.DueForPass(ctx) {
 		t.Fatal("a pass that produced a command must leave the next pass due immediately")
+	}
+
+	// A pass that failed is retried by the controller; the interval must not swallow the retry.
+	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
+	m.recordPassOutcome(ctx, PassOutcomeNoOp, errors.New("transient"))
+	if !m.DueForPass(ctx) {
+		t.Fatal("a pass that returned an error must leave the next pass due immediately")
+	}
+
+	// A pass with no candidates never reaches ComputeCommands; the controller reports it instead.
+	m.RecordEmptyPass(ctx)
+	if m.DueForPass(ctx) {
+		t.Fatal("a pass with no candidates must push the next one out by the interval")
 	}
 }
 
@@ -105,6 +120,7 @@ type gatedMethod struct {
 }
 
 func (g *gatedMethod) DueForPass(context.Context) bool                { return false }
+func (g *gatedMethod) RecordEmptyPass(context.Context)                {}
 func (g *gatedMethod) ShouldDisrupt(context.Context, *Candidate) bool { return true }
 func (g *gatedMethod) ComputeCommands(context.Context, map[string]int, ...*Candidate) ([]Command, error) {
 	g.computed = true
@@ -125,5 +141,29 @@ func TestControllerSkipsMethodThatIsNotDue(t *testing.T) {
 	}
 	if method.computed {
 		t.Fatal("a method that is not due must not compute commands")
+	}
+}
+
+func TestControllerRecordsEmptyMultiNodePass(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Now())
+	cloudProvider := fake.NewCloudProvider()
+	m := newIntervalMultiNode(clk)
+	c := &Controller{
+		clock:         clk,
+		kubeClient:    fakecr.NewFakeClient(),
+		cluster:       state.NewCluster(clk, nil, cloudProvider),
+		cloudProvider: cloudProvider,
+		recorder:      noopRecorder{},
+	}
+	ctx := multiNodeIntervalContext(10 * time.Minute)
+
+	// The cluster has no nodes, so the pass ends before ComputeCommands. It still found nothing,
+	// and the next loop iteration must not rebuild candidates for it.
+	acted, err := c.disrupt(ctx, m)
+	if err != nil || acted {
+		t.Fatalf("expected an empty pass to report no action and no error, got %v, %v", acted, err)
+	}
+	if m.DueForPass(ctx) {
+		t.Fatal("a pass with no candidates must push the next one out by the interval")
 	}
 }
