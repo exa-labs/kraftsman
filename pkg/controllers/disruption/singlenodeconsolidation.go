@@ -216,15 +216,6 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			depth = i + 1
 			continue
 		}
-		// A candidate whose last replacement failed to launch is held off for a while rather than
-		// simulated, launched and torn down again; it is not evaluated, so it stays out of the
-		// coverage cycle and keeps the pass from declaring the fleet consolidated.
-		if s.queue.ReplacementBackoff().Holds(ctx, candidate) {
-			heldOffAfterFailedLaunch = true
-			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipReplacementBackoff)
-			depth = i + 1
-			continue
-		}
 		// Skip candidates whose best-case score (delete ratio) cannot pass the
 		// threshold. A DELETE is the upper bound; if it fails, no REPLACE will pass.
 		if !s.evaluator.CanPassThreshold(candidate) {
@@ -272,6 +263,15 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			if fingerprint != "" && durability.Conclusive() {
 				s.negativeResults.StoreNegative(candidate.ProviderID(), fingerprint, negativeCacheTTL)
 			}
+			continue
+		}
+		// A candidate whose last replacement failed to launch is still simulated, and deleted if it
+		// can be - a delete launches nothing - but a replace is held off rather than launched and
+		// torn down again. The held replace was not acted on, so the pass must not declare the
+		// fleet consolidated.
+		if cmd.Decision() == ReplaceDecision && s.queue.ReplacementBackoff().Holds(ctx, candidate) {
+			heldOffAfterFailedLaunch = true
+			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipReplacementBackoff)
 			continue
 		}
 		// Score the move: Balanced pools may reject; other policies pass through.

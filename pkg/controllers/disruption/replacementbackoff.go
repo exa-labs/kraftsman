@@ -16,9 +16,11 @@ limitations under the License.
 
 // Replacement failure back-off: after a consolidation command fails because a replacement never
 // launched or never initialized - typically an insufficient-capacity launch whose NodeClaim is
-// deleted - its candidates are held off for a while instead of being proposed again on the next
-// pass. Every retry costs a discovery slot, a NodeClaim create and delete, and a taint and untaint
-// of the candidate, and the market that refused the launch rarely recovers within a pass or two.
+// deleted - single-node consolidation stops proposing replaces of its candidates for a while instead
+// of proposing them again on the next pass; a held candidate is still simulated and may be deleted,
+// since a delete launches nothing. Every retried replace costs a NodeClaim create and delete, a
+// taint and untaint of the candidate and a command slot, and the market that refused the launch
+// rarely recovers within a pass or two.
 
 package disruption
 
@@ -31,12 +33,40 @@ import (
 	"sync"
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
+
+// consecutiveFailuresLabel buckets a candidate's consecutive failed replacement launches.
+const consecutiveFailuresLabel = "consecutive_failures"
+
+// ConsolidationReplacementFailureBackoffsTotal counts holds started or extended.
+var ConsolidationReplacementFailureBackoffsTotal = opmetrics.NewPrometheusCounter(
+	crmetrics.Registry,
+	prometheus.CounterOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: voluntaryDisruptionSubsystem,
+		Name:      "consolidation_replacement_failure_backoffs_total",
+		Help:      "Number of consolidation candidates held off after a command that would have replaced them failed because a replacement did not launch or initialize, by NodePool and the candidate's consecutive failure count (1, 2, 3, 4+). Only counted while consolidation-replacement-failure-backoff is set; replaces skipped while a candidate is held are counted in consolidation_candidate_skips_total with reason replacement_failure_backoff.",
+	},
+	[]string{metrics.NodePoolLabel, consecutiveFailuresLabel},
+)
+
+// ObserveReplacementFailureBackoff records a candidate held off after its consecutive failures-th
+// failed replacement launch.
+func ObserveReplacementFailureBackoff(nodePool string, failures int) {
+	ConsolidationReplacementFailureBackoffsTotal.Inc(map[string]string{
+		metrics.NodePoolLabel:    nodePool,
+		consecutiveFailuresLabel: lo.Ternary(failures >= 4, "4+", strconv.Itoa(failures)),
+	})
+}
 
 // maxReplacementBackoffMultiple caps the doubling: a candidate is never held off for more than this
 // many times the configured base.
@@ -55,8 +85,9 @@ type replacementBackoffEntry struct {
 	fingerprint string
 }
 
-// ReplacementBackoff holds consolidation candidates off after a command that would have replaced
-// them failed because a replacement did not launch or initialize. The hold starts at the configured
+// ReplacementBackoff holds off replacing consolidation candidates after a command that would have
+// replaced them failed because a replacement did not launch or initialize; single-node
+// consolidation may still delete a held candidate. The hold starts at the configured
 // base (CONSOLIDATION_REPLACEMENT_FAILURE_BACKOFF, 0 disables it), doubles on each consecutive
 // failure up to maxReplacementBackoffMultiple times the base, and is released early when the
 // candidate's pods or NodePool change. It is safe for concurrent use: the queue records failures

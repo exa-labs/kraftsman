@@ -165,6 +165,32 @@ var _ = Describe("Replacement failure back-off", func() {
 		Expect(cmds).To(HaveLen(1))
 	})
 
+	It("still deletes a held candidate once its pod fits elsewhere", func() {
+		failReplacementOf(nodeClaims[0].Status.ProviderID)
+		skipped := skipsFor()
+
+		// Room appears on another node while the hold is active. A delete launches nothing, so the
+		// hold does not apply to it.
+		spareClaim, spareNode := test.NodeClaimAndNode(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+				v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+				corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+			}},
+			Status: v1.NodeClaimStatus{Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("32"), corev1.ResourcePods: resource.MustParse("100")}},
+		})
+		ExpectApplied(ctx, env.Client, spareClaim, spareNode)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{spareNode}, []*v1.NodeClaim{spareClaim})
+
+		cmds, err := singleNode.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidates()...)
+		Expect(err).To(Succeed())
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+		Expect(cmds[0].Candidates[0].ProviderID()).To(Equal(nodeClaims[0].Status.ProviderID))
+		Expect(skipsFor()).To(Equal(skipped))
+	})
+
 	It("proposes the candidate again on the next pass when the back-off is off", func() {
 		ctx = options.ToContext(ctx, test.Options())
 		failReplacementOf(nodeClaims[0].Status.ProviderID)
