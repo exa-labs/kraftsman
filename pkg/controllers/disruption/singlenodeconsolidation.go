@@ -425,7 +425,8 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 }
 
 // awaitClusterSync waits until cluster state holds no NodeClaim that has yet to launch, polling
-// until the given time. It reports whether the cluster synced in time.
+// until the given time. It reports whether the cluster synced before that time; a sync first
+// observed after it, at the poll that straddles it, does not count.
 func (s *SingleNodeConsolidation) awaitClusterSync(ctx context.Context, until time.Time) bool {
 	for !s.cluster.Synced(ctx) {
 		if !s.clock.Now().Before(until) {
@@ -437,7 +438,7 @@ func (s *SingleNodeConsolidation) awaitClusterSync(ctx context.Context, until ti
 		case <-s.clock.After(clusterSyncPollInterval):
 		}
 	}
-	return true
+	return s.clock.Now().Before(until)
 }
 
 func (s *SingleNodeConsolidation) Reason() v1.DisruptionReason {
