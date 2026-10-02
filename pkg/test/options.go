@@ -55,6 +55,7 @@ type OptionsFields struct {
 	IgnoreDRARequests                       *bool
 	MaxConsolidationReplacements            *int
 	MaxConsolidationCommandsPerPass         *int
+	MultiNodeConsolidationInterval          *time.Duration
 	ConsolidationSplitFallback              *bool
 	ConsolidationSplitShadow                *bool
 	ConsolidationSplitShadowMaxReplacements *int
@@ -120,6 +121,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		IgnoreDRARequests:                       lo.FromPtrOr(opts.IgnoreDRARequests, true),
 		MaxConsolidationReplacements:            lo.FromPtrOr(opts.MaxConsolidationReplacements, 1),
 		MaxConsolidationCommandsPerPass:         lo.FromPtrOr(opts.MaxConsolidationCommandsPerPass, 1),
+		MultiNodeConsolidationInterval:          lo.FromPtrOr(opts.MultiNodeConsolidationInterval, 0),
 		ConsolidationSplitFallback:              lo.FromPtrOr(opts.ConsolidationSplitFallback, false),
 		ConsolidationSplitShadow:                lo.FromPtrOr(opts.ConsolidationSplitShadow, false),
 		ConsolidationSplitShadowMaxReplacements: lo.FromPtrOr(opts.ConsolidationSplitShadowMaxReplacements, 8),

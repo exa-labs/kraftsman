@@ -182,7 +182,33 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
+// passGate is implemented by methods that decide for themselves whether a loop iteration runs
+// them. A method that is not due is skipped before its candidates are built, and records no
+// evaluation.
+type passGate interface {
+	DueForPass(ctx context.Context) bool
+	// RecordEmptyPass tells the method a pass ended with no candidates to evaluate, which
+	// ComputeCommands never sees.
+	RecordEmptyPass(ctx context.Context)
+}
+
+// notDue reports whether the method gates its own passes and is not due for one.
+func notDue(ctx context.Context, disruption Method) bool {
+	gate, gated := disruption.(passGate)
+	return gated && !gate.DueForPass(ctx)
+}
+
+// recordEmptyPass tells a gated method that its pass found no candidates.
+func recordEmptyPass(ctx context.Context, disruption Method) {
+	if gate, gated := disruption.(passGate); gated {
+		gate.RecordEmptyPass(ctx)
+	}
+}
+
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+	if notDue(ctx, disruption) {
+		return false, nil
+	}
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
@@ -201,6 +227,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
+		recordEmptyPass(ctx, disruption)
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
