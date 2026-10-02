@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -132,12 +133,15 @@ var _ = Describe("Replacement failure back-off", func() {
 		Expect(candidates()).To(HaveLen(1))
 		failReplacementOf(nodeClaims[0].Status.ProviderID)
 		skipped := skipsFor()
+		recorder.Reset()
 
 		cmds, err := singleNode.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidates()...)
 		Expect(err).To(Succeed())
 		Expect(cmds).To(BeEmpty())
 		Expect(skipsFor()).To(Equal(skipped + 1))
-		// The held candidate was never evaluated, so the pass must not mark the fleet consolidated.
+		// The held replace is never built, so it is never announced.
+		Expect(recorder.Calls(events.ConsolidationCandidate)).To(BeZero())
+		// The held replace was not acted on, so the pass must not mark the fleet consolidated.
 		Expect(singleNode.IsConsolidated()).To(BeFalse())
 
 		env.Clock.Step(5*time.Minute + time.Second)

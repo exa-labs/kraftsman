@@ -241,10 +241,21 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 
-		// compute a possible consolidation option
+		// compute a possible consolidation option. A candidate whose last replacement failed to
+		// launch is still simulated and may be deleted - a delete launches nothing - but the
+		// simulation stops short of a replace (counted as replacement_failure_backoff).
 		candidateCtx, durability := withNoOpDurability(ctx)
+		held := s.queue.ReplacementBackoff().Holds(ctx, candidate)
+		if held {
+			candidateCtx = withReplacementsHeld(candidateCtx)
+		}
 		cmd, err := s.computeConsolidationWithinCandidateBudget(candidateCtx, candidate)
 		depth = i + 1
+		// A held candidate that did not come out as a delete may have been held from a replace;
+		// the pass must not declare the fleet consolidated over it.
+		if held && cmd.Decision() != DeleteDecision {
+			heldOffAfterFailedLaunch = true
+		}
 		if err != nil {
 			// A candidate that ran out of its own budget is abandoned, not an error: the walk
 			// keeps its remaining time for the candidates behind it.
@@ -263,15 +274,6 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			if fingerprint != "" && durability.Conclusive() {
 				s.negativeResults.StoreNegative(candidate.ProviderID(), fingerprint, negativeCacheTTL)
 			}
-			continue
-		}
-		// A candidate whose last replacement failed to launch is still simulated, and deleted if it
-		// can be - a delete launches nothing - but a replace is held off rather than launched and
-		// torn down again. The held replace was not acted on, so the pass must not declare the
-		// fleet consolidated.
-		if cmd.Decision() == ReplaceDecision && s.queue.ReplacementBackoff().Holds(ctx, candidate) {
-			heldOffAfterFailedLaunch = true
-			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipReplacementBackoff)
 			continue
 		}
 		// Score the move: Balanced pools may reject; other policies pass through.
