@@ -31,7 +31,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	operatoroptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
@@ -210,6 +212,27 @@ func TestDaemonOverheadCacheSurvivesNewestPodSwap(t *testing.T) {
 	next.updateDaemonSetGeneration([]*corev1.Pod{liveDaemonSetPod("node-agent-m3n8v", "node-c", "kube-api-access-zz9k1")})
 	if _, outcome, ok := next.overheadGroups(nct); !ok || outcome != cacheOutcomeHitCrossPass {
 		t.Fatalf("expected the next pass to be served from the group store after a newest-pod swap, got outcome %q", outcome)
+	}
+}
+
+// Cached overhead groups outlive the stand-in pod they were built from. A pod that later takes that pod's namespaced
+// name must still conflict with the DaemonSet's host ports rather than be exempted as the reservation's owner.
+func TestDaemonOverheadGroupHostPortsConflictWithAPodReusingTheStandInName(t *testing.T) {
+	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
+	standIn := liveDaemonSetPod("node-agent-x7k2p", "node-a", "kube-api-access-88mrr")
+	standIn.Spec.NodeSelector = nil
+	standIn.Spec.Affinity = nil
+	nct := &NodeClaimTemplate{NodePoolName: "default", InstanceTypeOptions: fake.InstanceTypes(1), Requirements: scheduling.NewRequirements()}
+	groups := buildDaemonOverheadGroupsForTemplate(ctx, nct, []*corev1.Pod{standIn})
+	if len(groups) != 1 {
+		t.Fatalf("expected one overhead group, got %d", len(groups))
+	}
+	reusing := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: standIn.Namespace, Name: standIn.Name},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Ports: []corev1.ContainerPort{{ContainerPort: 9100, HostPort: 9100, Protocol: corev1.ProtocolTCP}}}}},
+	}
+	if err := groups[0].HostPortUsage.Conflicts(reusing, scheduling.GetHostPorts(reusing)); err == nil {
+		t.Fatal("expected a pod reusing the stand-in's name to conflict with the DaemonSet's host port")
 	}
 }
 
