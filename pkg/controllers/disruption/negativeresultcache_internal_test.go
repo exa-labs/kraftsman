@@ -382,13 +382,20 @@ func TestInstanceTypesContentHash(t *testing.T) {
 	}
 }
 
-func mustContentHash(t *testing.T, instanceTypes []*cloudprovider.InstanceType) uint64 {
+// mustContentHash returns the fingerprint of a fixed candidate whose NodePool offers the given
+// instance types, at an unchanging provider revision. Going through the fingerprint rather than
+// the hash helper keeps these tests meaningful against fingerprints that ignore instance type
+// content: there, every "must change" case fails.
+func mustContentHash(t *testing.T, instanceTypes []*cloudprovider.InstanceType) string {
 	t.Helper()
-	hash, ok := instanceTypesContentHash(instanceTypes)
-	if !ok {
-		t.Fatal("instance type content could not be hashed")
+	provider := fake.NewCloudProvider()
+	provider.InstanceTypes = instanceTypes
+	fingerprint := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: provider, revision: 7}).
+		fingerprint(context.Background(), fingerprintCandidate("n1", "c1", 1, "uid-a"))
+	if fingerprint == "" {
+		t.Fatal("the candidate could not be fingerprinted")
 	}
-	return hash
+	return fingerprint
 }
 
 // TestInstanceTypesContentHashCoversOverridesAndDevices pins that offering resource overrides,
@@ -550,8 +557,12 @@ func BenchmarkInstanceTypesContentHash(b *testing.B) {
 	for i := range 700 {
 		instanceTypes = append(instanceTypes, fake.NewInstanceType(fmt.Sprintf("instance-type-%d", i)))
 	}
+	provider := fake.NewCloudProvider()
+	provider.InstanceTypes = instanceTypes
+	revisionProvider := &fakeRevisionProvider{CloudProvider: provider, revision: 7}
+	candidate := fingerprintCandidate("n1", "c1", 1, "uid-a")
 	b.ReportAllocs()
 	for b.Loop() {
-		instanceTypesContentHash(instanceTypes)
+		newNegativeCacheFingerprints(fakecr.NewFakeClient(), revisionProvider).fingerprint(context.Background(), candidate)
 	}
 }
