@@ -17,6 +17,8 @@ limitations under the License.
 package disruption_test
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -109,6 +111,50 @@ var _ = Describe("Census", func() {
 		Expect(queue.GetCommands()).To(HaveLen(0))
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
 		Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(2))
+	})
+
+	It("sweeps again after the configured interval", func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ConsolidationCensusInterval: lo.ToPtr(time.Hour)}))
+		ExpectApplied(ctx, env.Client, nodeClaims[0], nodes[0], nodePool)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0]}, []*v1.NodeClaim{nodeClaims[0]})
+
+		result, err := censusController.Reconcile(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(time.Hour))
+	})
+
+	It("never sweeps or requeues when disabled", func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ConsolidationCensusInterval: lo.ToPtr(time.Duration(0))}))
+		rs := test.ReplicaSet()
+		ExpectApplied(ctx, env.Client, rs)
+		pods := test.Pods(2, test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{"app": "census-test"},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         "apps/v1",
+						Kind:               "ReplicaSet",
+						Name:               rs.Name,
+						UID:                rs.UID,
+						Controller:         new(true),
+						BlockOwnerDeletion: new(true),
+					},
+				},
+			}})
+		ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool)
+		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
+
+		result, err := censusController.Reconcile(ctx)
+		Expect(err).ToNot(HaveOccurred())
+		// A zero result is how a singleton stops: it is never reconciled again.
+		Expect(result).To(BeZero())
+		// Both nodes are actionable deletes, so an enabled census would have published them.
+		_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_actionable_candidates", map[string]string{
+			"nodepool": nodePool.Name,
+		})
+		Expect(found).To(BeFalse())
 	})
 
 	It("publishes zero actionable candidates when nodes cannot be consolidated", func() {

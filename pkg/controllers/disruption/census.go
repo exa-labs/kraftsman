@@ -31,22 +31,19 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
 // CensusConsolidationType labels census-originated simulation metrics so they
 // never mix with the real single-node pass's series.
 const CensusConsolidationType = "census"
 
-// CensusInterval is how often the actionable-candidate census sweeps all
-// consolidation candidates.
-var CensusInterval = 10 * time.Minute
-
 // CensusSweepTimeout bounds a single sweep's wall-clock time. A truncated
 // sweep still publishes its partial counts; consolidation_census_candidates_evaluated
 // exposes how far it got.
 var CensusSweepTimeout = 5 * time.Minute
 
-// CensusController periodically simulates consolidation for every candidate
+// CensusController periodically (ConsolidationCensusInterval) simulates consolidation for every candidate
 // without executing anything, publishing how many candidates currently have a
 // strictly cheaper delete or replace available. The disruption controller's
 // single-node pass stops at the first winner, so its metrics cannot answer
@@ -80,6 +77,12 @@ func (c *CensusController) Register(_ context.Context, m manager.Manager) error 
 
 func (c *CensusController) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+	// A disabled census returns without requeueing, so the singleton never runs again and no
+	// census series is published.
+	interval := options.FromContext(ctx).ConsolidationCensusInterval
+	if interval <= 0 {
+		return reconciler.Result{}, nil
+	}
 	if !c.method.cluster.Synced(ctx) {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
@@ -136,5 +139,5 @@ func (c *CensusController) Reconcile(ctx context.Context) (reconciler.Result, er
 	ConsolidationCensusDurationSeconds.Set(c.method.clock.Since(start).Seconds(), nil)
 	ConsolidationCensusCandidatesEvaluated.Set(float64(evaluated), nil)
 
-	return reconciler.Result{RequeueAfter: CensusInterval}, nil
+	return reconciler.Result{RequeueAfter: interval}, nil
 }
