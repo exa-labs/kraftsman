@@ -89,11 +89,12 @@ func benchmarkForEachDomain(b *testing.B, domains, taintGroupsPerDomain int, tol
 	for d := 0; d < domains; d++ {
 		domain := fmt.Sprintf("test-zone-%d", d)
 		for t := 0; t < taintGroupsPerDomain; t++ {
-			dg.Insert(domain, corev1.Taint{
+			// Each taint group is supplied by its own NodePool, the unit domain sources are keyed by.
+			dg.Insert(domain, fmt.Sprintf("nodepool-%d", t), []corev1.Taint{{
 				Key:    fmt.Sprintf("bench.example.com/taint-%d", t),
 				Value:  "true",
 				Effect: corev1.TaintEffectNoSchedule,
-			})
+			}}, nil)
 		}
 	}
 	pod := test.Pod()
@@ -106,11 +107,13 @@ func benchmarkForEachDomain(b *testing.B, domains, taintGroupsPerDomain int, tol
 		}
 	}
 
+	nodeFilter := scheduling.MakeTopologyNodeFilter(pod, corev1.NodeInclusionPolicyHonor, corev1.NodeInclusionPolicyIgnore)
+
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		count := 0
-		dg.ForEachDomain(pod, corev1.NodeInclusionPolicyHonor, func(domain string) {
+		dg.ForEachDomain(pod, nodeFilter, func(domain string) {
 			count++
 		})
 		_ = count
