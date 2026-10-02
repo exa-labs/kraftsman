@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/pprof"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -38,6 +39,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -56,6 +58,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -106,6 +109,11 @@ type Operator struct {
 type Options struct {
 	LeaderElectionLabels map[string]string
 	LeaderElectionConfig *rest.Config // Optional separate config for leader election
+	// ObjectSelector, when set, restricts the manager's cache to the NodePools, NodeClaims, NodeOverlays and Nodes
+	// whose labels match it. See WithObjectSelector.
+	ObjectSelector labels.Selector
+	// CacheByObject holds per-type cache options merged into the manager's cache. See WithCacheByObject.
+	CacheByObject map[client.Object]cache.ByObject
 }
 
 // Adds LeaderElectionLabels to the underlying manager's LeaderElectionOptions
@@ -120,6 +128,66 @@ func WithLeaderElectionConfig(config *rest.Config) option.Function[Options] {
 	return func(opts *Options) {
 		opts.LeaderElectionConfig = config
 	}
+}
+
+// WithObjectSelector scopes the operator to the NodePools, NodeClaims, NodeOverlays and Nodes whose labels match
+// selector: the manager's cache never lists, watches or returns any other object of those types, so every controller
+// behaves as if they did not exist. Two operators given complementary selectors (for example `example.com/instance=a`
+// and `!example.com/instance`) can run in one cluster without acting on each other's capacity.
+//
+// Each instance needs its own leader election identity (LeaderElectionName); instances sharing one would elect a single
+// leader between them, leaving the other's capacity unreconciled.
+//
+// The label must be on both the NodePool's metadata and its template (spec.template.metadata.labels): the selector
+// matches the NodePool's own labels, while NodeClaims take theirs from the template, and a NodeClaim outside the cache
+// is never launched. The Node must carry it when the kubelet registers it (through --node-labels), since a NodeClaim
+// cannot register a Node its cache does not hold. Labels under kubernetes.io and k8s.io cannot be set by the kubelet,
+// so use another domain.
+// Pods, DaemonSets and the other inputs to scheduling stay unscoped; route pods to an instance's NodePools with node
+// selectors or taints. Topology spread and pod (anti-)affinity are computed over the pods on in-scope Nodes only: a
+// pod bound to another instance's Node is skipped like a pod on a deleted Node, so constraints whose matching pods span
+// instances are not enforced across them. The NodePool, NodeClaim and NodeOverlay CRDs must be installed, since the
+// manager resolves every scoped type when it starts.
+func WithObjectSelector(selector labels.Selector) option.Function[Options] {
+	return func(opts *Options) {
+		opts.ObjectSelector = selector
+	}
+}
+
+// WithCacheByObject merges per-type cache options into the manager's cache, for types the operator does not scope
+// itself (a cloud provider's NodeClass, say). An entry replaces the operator's own entry for the same type, including
+// the one WithObjectSelector sets.
+func WithCacheByObject(byObject map[client.Object]cache.ByObject) option.Function[Options] {
+	return func(opts *Options) {
+		opts.CacheByObject = byObject
+	}
+}
+
+// cacheByObject returns the manager's per-type cache options: the operator's defaults, then the ObjectSelector applied
+// to the scoped types, then CacheByObject. Entries are keyed by Go type, so a later entry replaces an earlier one for
+// the same type instead of sitting beside it under a different key.
+func cacheByObject(opts *Options) map[client.Object]cache.ByObject {
+	byType := map[reflect.Type]client.Object{}
+	out := map[client.Object]cache.ByObject{}
+	set := func(obj client.Object, byObject cache.ByObject) {
+		if previous, ok := byType[reflect.TypeOf(obj)]; ok {
+			delete(out, previous)
+		}
+		byType[reflect.TypeOf(obj)] = obj
+		out[obj] = byObject
+	}
+	set(&coordinationv1.Lease{}, cache.ByObject{
+		Field: fields.SelectorFromSet(fields.Set{"metadata.namespace": "kube-node-lease"}),
+	})
+	if opts.ObjectSelector != nil {
+		for _, obj := range []client.Object{&v1.NodePool{}, &v1.NodeClaim{}, &v1alpha1.NodeOverlay{}, &corev1.Node{}} {
+			set(obj, cache.ByObject{Label: opts.ObjectSelector})
+		}
+	}
+	for obj, byObject := range opts.CacheByObject {
+		set(obj, byObject)
+	}
+	return out
 }
 
 // NewOperator instantiates a controller manager or panics
@@ -190,11 +258,7 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 			return ctx
 		},
 		Cache: cache.Options{
-			ByObject: map[client.Object]cache.ByObject{
-				&coordinationv1.Lease{}: {
-					Field: fields.SelectorFromSet(fields.Set{"metadata.namespace": "kube-node-lease"}),
-				},
-			},
+			ByObject: cacheByObject(opts),
 		},
 		Controller: ctrlconfig.Controller{
 			// EnableWarmup allows controllers to start their sources (watches/informers) before leader election
