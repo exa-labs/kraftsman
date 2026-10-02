@@ -192,9 +192,21 @@ type passGate interface {
 	RecordEmptyPass(ctx context.Context)
 }
 
-func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+// notDue reports whether the method gates its own passes and is not due for one.
+func notDue(ctx context.Context, disruption Method) bool {
 	gate, gated := disruption.(passGate)
-	if gated && !gate.DueForPass(ctx) {
+	return gated && !gate.DueForPass(ctx)
+}
+
+// recordEmptyPass tells a gated method that its pass found no candidates.
+func recordEmptyPass(ctx context.Context, disruption Method) {
+	if gate, gated := disruption.(passGate); gated {
+		gate.RecordEmptyPass(ctx)
+	}
+}
+
+func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+	if notDue(ctx, disruption) {
 		return false, nil
 	}
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
@@ -215,9 +227,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
-		if gated {
-			gate.RecordEmptyPass(ctx)
-		}
+		recordEmptyPass(ctx, disruption)
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring

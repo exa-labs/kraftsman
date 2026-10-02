@@ -223,7 +223,7 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if o.CPURequests <= 0 {
 		o.CPURequests = 1000
 	}
-	if err := errors.Join(o.validateLeaderElection(), o.validateConsolidation()); err != nil {
+	if err := errors.Join(o.validateLeaderElection(), o.validateConsolidation(), o.validateMultiNodeConsolidation()); err != nil {
 		return err
 	}
 	if !lo.Contains([]TopologyCountCacheMode{TopologyCountCacheModeOff, TopologyCountCacheModeShadow, TopologyCountCacheModeOn}, TopologyCountCacheMode(o.topologyCountCacheModeRaw)) {
@@ -266,9 +266,6 @@ func (o *Options) validateConsolidation() error {
 	if o.MaxConsolidationCommandsPerPass < 1 {
 		return fmt.Errorf("validating cli flags / env vars, MAX_CONSOLIDATION_COMMANDS_PER_PASS must be >= 1, got %d", o.MaxConsolidationCommandsPerPass)
 	}
-	if o.MultiNodeConsolidationInterval < 0 {
-		return fmt.Errorf("validating cli flags / env vars, MULTI_NODE_CONSOLIDATION_INTERVAL must be >= 0, got %s", o.MultiNodeConsolidationInterval)
-	}
 	if o.ConsolidationSplitMaxAttempts < 0 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_SPLIT_MAX_ATTEMPTS must be >= 0, got %d", o.ConsolidationSplitMaxAttempts)
 	}
@@ -288,6 +285,14 @@ func (o *Options) validateConsolidation() error {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationReplaceMinSavings)
 	}
 	return o.validateNegativeCache()
+}
+
+// validateMultiNodeConsolidation checks the multi-node consolidation pass cadence.
+func (o *Options) validateMultiNodeConsolidation() error {
+	if o.MultiNodeConsolidationInterval < 0 {
+		return fmt.Errorf("validating cli flags / env vars, MULTI_NODE_CONSOLIDATION_INTERVAL must be >= 0, got %s", o.MultiNodeConsolidationInterval)
+	}
+	return nil
 }
 
 func (o *Options) validateSpotToSpot() error {
