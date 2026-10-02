@@ -35,6 +35,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/dump"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -375,7 +376,8 @@ func (f *negativeCacheFingerprints) instanceTypeContent(ctx context.Context, nod
 	if f.revisionProvider != nil {
 		if revision, err := f.revisionProvider.InstanceTypeRevision(ctx, nodePool); err == nil && revision != 0 {
 			if instanceTypes, err := f.cloudProvider.GetInstanceTypes(ctx, nodePool); err == nil {
-				content = instanceTypeContent{hash: instanceTypesContentHash(instanceTypes), ok: true}
+				hash, ok := instanceTypesContentHash(instanceTypes)
+				content = instanceTypeContent{hash: hash, ok: ok}
 			}
 		}
 	}
@@ -388,11 +390,13 @@ func (f *negativeCacheFingerprints) instanceTypeContent(ctx context.Context, nod
 var instanceTypeContentSeed = maphash.MakeSeed()
 
 // instanceTypesContentHash hashes what a consolidation verdict depends on in a list of instance
-// types: each type's name, capacity, overhead, and requirements, in name order. Requirement keys
-// that the type's offerings also carry (zone, capacity type, reservation) are derived from which
-// offerings exist and are available, so they are left out with the offerings themselves: their
-// changes are bounded by the entry TTL, like price moves.
-func instanceTypesContentHash(instanceTypes []*cloudprovider.InstanceType) uint64 {
+// types: each type's name, capacity, overhead, requirements, DRA device metadata, and offering
+// capacity and overhead overrides together with the requirements of the offering they apply to,
+// in name order. Offering prices and availability are left out, and so are the type-level
+// requirement keys offerings also carry (zone, capacity type, reservation): providers derive
+// those from which offerings are available, so they move with availability, and their changes
+// are bounded by the entry TTL like price moves.
+func instanceTypesContentHash(instanceTypes []*cloudprovider.InstanceType) (uint64, bool) {
 	sorted := slices.SortedFunc(slices.Values(instanceTypes), func(a, b *cloudprovider.InstanceType) int {
 		return cmp.Compare(a.Name, b.Name)
 	})
@@ -417,8 +421,43 @@ func instanceTypesContentHash(instanceTypes []*cloudprovider.InstanceType) uint6
 			writeResources(&hash, instanceType.Overhead.Total())
 		}
 		hash.WriteByte(3)
+		writeUint64(&hash, offeringOverridesHash(instanceType.Offerings))
+		hash.WriteByte(4)
+		if len(instanceType.DynamicResources.ResourceSliceTemplates) > 0 || len(instanceType.DynamicResources.AttributeBindings) > 0 {
+			// The device metadata holds interned handles that JSON encodes as empty objects, so
+			// it is dumped by content, following pointers and sorting map keys.
+			hash.WriteString(dump.ForHash(instanceType.DynamicResources))
+		}
+		hash.WriteByte(5)
 	}
-	return hash.Sum64()
+	return hash.Sum64(), true
+}
+
+// offeringOverridesHash combines, order-insensitively, each offering's capacity and overhead
+// overrides with the requirements of the offering they apply to, so moving an override from one
+// zone to another changes it. Offerings without overrides contribute nothing, which keeps
+// availability and price out of it.
+func offeringOverridesHash(offerings cloudprovider.Offerings) uint64 {
+	var combined uint64
+	for _, offering := range offerings {
+		if offering.CapacityOverride == nil && offering.OverheadOverride == nil {
+			continue
+		}
+		var hash maphash.Hash
+		hash.SetSeed(instanceTypeContentSeed)
+		var requirements uint64
+		for _, requirement := range offering.Requirements {
+			requirements += requirement.ContentHash64(instanceTypeContentSeed)
+		}
+		writeUint64(&hash, requirements)
+		writeResources(&hash, offering.CapacityOverride)
+		hash.WriteByte(0)
+		if offering.OverheadOverride != nil {
+			writeResources(&hash, offering.OverheadOverride.Total())
+		}
+		combined += hash.Sum64()
+	}
+	return combined
 }
 
 // carriedByOfferings reports whether any of the offerings constrains the requirement key.

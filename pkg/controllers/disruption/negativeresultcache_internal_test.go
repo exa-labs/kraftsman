@@ -358,7 +358,7 @@ func TestInstanceTypesContentHash(t *testing.T) {
 			),
 		}
 	}
-	base := instanceTypesContentHash(instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4"))
+	base := mustContentHash(t, instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4"))
 
 	for name, unchanged := range map[string][]*cloudprovider.InstanceType{
 		"an offering price move":               instanceTypes(0.5, true, []string{"zone-1", "zone-2"}, "amd64", "4"),
@@ -367,7 +367,7 @@ func TestInstanceTypesContentHash(t *testing.T) {
 		"the list arriving in another order":   reversed(instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4")),
 		"the same content built a second time": instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4"),
 	} {
-		if got := instanceTypesContentHash(unchanged); got != base {
+		if got := mustContentHash(t, unchanged); got != base {
 			t.Fatalf("%s changed the instance type content hash", name)
 		}
 	}
@@ -376,9 +376,75 @@ func TestInstanceTypesContentHash(t *testing.T) {
 		"capacity":                             instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "8"),
 		"the set of instance types":            instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4")[1:],
 	} {
-		if got := instanceTypesContentHash(changed); got == base {
+		if got := mustContentHash(t, changed); got == base {
 			t.Fatalf("changing %s did not change the instance type content hash", name)
 		}
+	}
+}
+
+func mustContentHash(t *testing.T, instanceTypes []*cloudprovider.InstanceType) uint64 {
+	t.Helper()
+	hash, ok := instanceTypesContentHash(instanceTypes)
+	if !ok {
+		t.Fatal("instance type content could not be hashed")
+	}
+	return hash
+}
+
+// TestInstanceTypesContentHashCoversOverridesAndDevices pins that offering resource overrides,
+// keyed to the offering they apply to, and DRA device metadata are part of the content.
+func TestInstanceTypesContentHashCoversOverridesAndDevices(t *testing.T) {
+	zoneOffering := func(zone string, available bool, gpus string) cloudprovider.Offering {
+		o := cloudprovider.Offering{
+			Available: available,
+			Price:     1,
+			Requirements: scheduling.NewLabelRequirements(map[string]string{
+				corev1.LabelTopologyZone: zone,
+				v1.CapacityTypeLabelKey:  "on-demand",
+			}),
+		}
+		if gpus != "" {
+			o.CapacityOverride = corev1.ResourceList{"example.com/gpu": resource.MustParse(gpus)}
+		}
+		return o
+	}
+	withOfferings := func(offerings ...cloudprovider.Offering) []*cloudprovider.InstanceType {
+		return []*cloudprovider.InstanceType{fake.NewInstanceType("type-a", fake.WithOfferings(offerings...))}
+	}
+	base := mustContentHash(t, withOfferings(zoneOffering("zone-1", true, "1"), zoneOffering("zone-2", true, "")))
+
+	if got := mustContentHash(t, withOfferings(zoneOffering("zone-1", false, "1"), zoneOffering("zone-2", true, ""))); got != base {
+		t.Fatal("an overridden offering becoming unavailable changed the hash")
+	}
+	for name, changed := range map[string][]*cloudprovider.InstanceType{
+		"an offering's capacity override":       withOfferings(zoneOffering("zone-1", true, "2"), zoneOffering("zone-2", true, "")),
+		"which offering an override applies to": withOfferings(zoneOffering("zone-1", true, ""), zoneOffering("zone-2", true, "1")),
+		"the instance type's DRA device metadata": func() []*cloudprovider.InstanceType {
+			instanceTypes := withOfferings(zoneOffering("zone-1", true, "1"), zoneOffering("zone-2", true, ""))
+			template := fake.ResourceSliceTemplate("gpu.example.com", "pool", fake.Devices("gpu-0")...)
+			instanceTypes[0].DynamicResources.ResourceSliceTemplates = []*cloudprovider.ResourceSliceTemplate{&template}
+			return instanceTypes
+		}(),
+	} {
+		if got := mustContentHash(t, changed); got == base {
+			t.Fatalf("changing %s did not change the hash", name)
+		}
+	}
+
+	// Device metadata is hashed by content: the same templates rebuilt are the same, and a
+	// different driver name, held in an interned handle, is different.
+	withDriver := func(driver string) []*cloudprovider.InstanceType {
+		instanceTypes := withOfferings(zoneOffering("zone-1", true, "1"), zoneOffering("zone-2", true, ""))
+		template := fake.ResourceSliceTemplate(driver, "pool", fake.Devices("gpu-0")...)
+		instanceTypes[0].DynamicResources.ResourceSliceTemplates = []*cloudprovider.ResourceSliceTemplate{&template}
+		return instanceTypes
+	}
+	withGPU := mustContentHash(t, withDriver("gpu.example.com"))
+	if rebuilt := mustContentHash(t, withDriver("gpu.example.com")); rebuilt != withGPU {
+		t.Fatal("rebuilding identical device metadata changed the hash")
+	}
+	if mustContentHash(t, withDriver("other.example.com")) == withGPU {
+		t.Fatal("changing a device driver did not change the hash")
 	}
 }
 
