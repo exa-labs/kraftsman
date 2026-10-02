@@ -1917,6 +1917,22 @@ var _ = Context("Scheduling", func() {
 					"outcome":  "new_no_inflight",
 				})
 			})
+			It("should label packing decisions and construction phases with the controller that built the scheduler", func() {
+				scheduling.PackingDecisionsTotal.Reset()
+				scheduling.ConstructionPhaseDurationSeconds.Reset()
+				ExpectApplied(ctx, env.Client, nodePool)
+				pods := oneDevicePods(1)
+				ExpectProvisioned(injection.WithControllerName(ctx, "provisioner"), env.Client, cluster, cloudProvider, prov, pods...)
+				ExpectMetricCounterValue(scheduling.PackingDecisionsTotal, 1, map[string]string{
+					"controller": "provisioner",
+					"nodepool":   nodePool.Name,
+					"outcome":    "new_no_inflight",
+				})
+				for _, phase := range []string{"domain_groups", "topology_update", "existing_nodes", "node_claim_templates"} {
+					_, found := FindMetricWithLabelValues("karpenter_scheduler_construction_phase_duration_seconds", map[string]string{"controller": "provisioner", "phase": phase})
+					Expect(found).To(BeTrue(), phase)
+				}
+			})
 			It("should keep packing while growing costs no more than a new NodeClaim", func() {
 				// linear pricing: each step up the ladder costs exactly one more one-device box, and the tie keeps the
 				// in-flight NodeClaim, so the pods still share a node as under binpack

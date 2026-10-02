@@ -38,7 +38,7 @@ type ReservationManager struct {
 func newReservationManagerTimed(ctx context.Context, nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) *ReservationManager {
 	start := time.Now()
 	defer func() {
-		ConstructionPhaseDurationSeconds.Observe(time.Since(start).Seconds(), map[string]string{phaseLabel: phaseReservationManager})
+		ConstructionPhaseDurationSeconds.Observe(time.Since(start).Seconds(), constructionPhaseLabels(ctx, phaseReservationManager))
 	}()
 	return &ReservationManager{
 		reservations: map[string]sets.Set[string]{},

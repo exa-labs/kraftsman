@@ -172,7 +172,7 @@ func NewScheduler(
 	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
 		return nodeClaimTemplateForNodePool(ctx, np, instanceTypes[np.Name], minValuesPolicy, priceLimit, recorder)
 	})
-	ConstructionPhaseDurationSeconds.Observe(time.Since(templatesStart).Seconds(), map[string]string{phaseLabel: phaseNodeClaimTemplates})
+	ConstructionPhaseDurationSeconds.Observe(time.Since(templatesStart).Seconds(), constructionPhaseLabels(ctx, phaseNodeClaimTemplates))
 	// The daemonset generation must be updated before any daemon-derived cache reads (overhead
 	// groups below, daemon pods/requests during existing node construction) so a daemonset change
 	// invalidates them all up front.
@@ -182,7 +182,7 @@ func NewScheduler(
 	}
 	daemonGroupsStart := time.Now()
 	daemonOverheadGroups := buildDaemonOverheadGroups(ctx, daemonOverheadCache, templates, daemonSetPods)
-	ConstructionPhaseDurationSeconds.Observe(time.Since(daemonGroupsStart).Seconds(), map[string]string{phaseLabel: phaseDaemonOverheadGroups})
+	ConstructionPhaseDurationSeconds.Observe(time.Since(daemonGroupsStart).Seconds(), constructionPhaseLabels(ctx, phaseDaemonOverheadGroups))
 	s := &Scheduler{
 		uuid:                 uuid.NewUUID(),
 		kubeClient:           kubeClient,
@@ -234,7 +234,7 @@ func NewScheduler(
 	s.deletingNodeNames = deletingNodeNames
 	existingNodesStart := time.Now()
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, option.Resolve(opts...).enforceConsolidateAfter)
-	ConstructionPhaseDurationSeconds.Observe(time.Since(existingNodesStart).Seconds(), map[string]string{phaseLabel: phaseExistingNodes})
+	ConstructionPhaseDurationSeconds.Observe(time.Since(existingNodesStart).Seconds(), constructionPhaseLabels(ctx, phaseExistingNodes))
 	return s
 }
 
@@ -723,23 +723,20 @@ func (s *Scheduler) addByMarginalCost(ctx context.Context, pod *corev1.Pod) erro
 			return err
 		}
 		s.commitNewNodeClaim(ctx, pod, fresh)
-		PackingDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingOutcomeNewNoInflight})
+		PackingDecisionsTotal.Inc(packingLabels(ctx, fresh.nodeClaim.NodePoolName, packingOutcomeNewNoInflight))
 		return nil
 	}
 	if inflight.delta > 0 {
 		if fresh, err := s.evaluateNewNodeClaim(ctx, pod); err == nil {
 			if price, ok := launchPrice(fresh.instanceTypes, fresh.requirements, fresh.offeringsToReserve); ok && cheaperThan(price, inflight.delta) {
 				s.commitNewNodeClaim(ctx, pod, fresh)
-				PackingDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingOutcomeNew})
+				PackingDecisionsTotal.Inc(packingLabels(ctx, fresh.nodeClaim.NodePoolName, packingOutcomeNew))
 				return nil
 			}
 		}
 	}
 	inflight.commit(ctx, pod, s.cachedPodData[pod.UID], s.allocator)
-	PackingDecisionsTotal.Inc(map[string]string{
-		metrics.NodePoolLabel: inflight.nodeClaim.NodePoolName,
-		outcomeLabel:          lo.Ternary(inflight.unpriced, packingOutcomeInflightUnpriced, packingOutcomeInflight),
-	})
+	PackingDecisionsTotal.Inc(packingLabels(ctx, inflight.nodeClaim.NodePoolName, lo.Ternary(inflight.unpriced, packingOutcomeInflightUnpriced, packingOutcomeInflight)))
 	return nil
 }
 
@@ -797,14 +794,14 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 		if fresh, _, _ := s.evaluateFreshPlacement(ctx, pod); fresh != nil {
 			nodePool = fresh.nodeClaim.NodePoolName
 		}
-		PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: nodePool, outcomeLabel: packingShadowOutcomeSameNew})
+		PackingShadowDecisionsTotal.Inc(packingLabels(ctx, nodePool, packingShadowOutcomeSameNew))
 		return
 	}
 	// Marginal-cost would open a new NodeClaim only when growing the cheapest in-flight option costs more than a
 	// fresh launch; binpack joins firstFit regardless.
 	if cheapest.delta > 0 {
 		if fresh, price, ok := s.evaluateFreshPlacement(ctx, pod); ok && cheaperThan(price, cheapest.delta) {
-			PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: fresh.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeWouldOpenNew})
+			PackingShadowDecisionsTotal.Inc(packingLabels(ctx, fresh.nodeClaim.NodePoolName, packingShadowOutcomeWouldOpenNew))
 			log.FromContext(ctx).V(1).WithValues(
 				"Pod", klog.KObj(pod),
 				"binpackNodeClaim", klog.KRef("", firstFit.nodeClaim.Name),
@@ -816,7 +813,7 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 		}
 	}
 	if cheapest.nodeClaim != firstFit.nodeClaim {
-		PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: cheapest.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeWouldJoinOtherInflight})
+		PackingShadowDecisionsTotal.Inc(packingLabels(ctx, cheapest.nodeClaim.NodePoolName, packingShadowOutcomeWouldJoinOtherInflight))
 		log.FromContext(ctx).V(1).WithValues(
 			"Pod", klog.KObj(pod),
 			"binpackNodeClaim", klog.KRef("", firstFit.nodeClaim.Name),
@@ -826,7 +823,7 @@ func (s *Scheduler) shadowMarginalCost(ctx context.Context, pod *corev1.Pod) {
 		).Info("marginal-cost would join a different in-flight NodeClaim than binpack")
 		return
 	}
-	PackingShadowDecisionsTotal.Inc(map[string]string{metrics.NodePoolLabel: firstFit.nodeClaim.NodePoolName, outcomeLabel: packingShadowOutcomeSameInflight})
+	PackingShadowDecisionsTotal.Inc(packingLabels(ctx, firstFit.nodeClaim.NodePoolName, packingShadowOutcomeSameInflight))
 }
 
 // firstAndCheapestInflight returns the first in-flight NodeClaim that fits pod (binpack's choice) and the one
