@@ -403,6 +403,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		scheduler.DisableReservedCapacityFallback,
 		scheduler.NumConcurrentReconciles(int(math.Ceil(float64(options.FromContext(ctx).CPURequests) / 1000.0))),
 		scheduler.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy),
+		scheduler.ExplainExistingNodeRejections,
 	}
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
 		opts = append(opts, scheduler.IgnorePreferences)

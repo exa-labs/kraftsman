@@ -97,6 +97,8 @@ type options struct {
 	numConcurrentReconciles int
 	enforceConsolidateAfter bool
 	newNodeClaimPriceLimit  float64
+	// explainExistingNodeRejections enables explainExistingNodeRejections; see ExplainExistingNodeRejections.
+	explainExistingNodeRejections bool
 }
 
 type Options = option.Function[options]
@@ -123,6 +125,13 @@ var MinValuesPolicy = func(policy karpopts.MinValuesPolicy) func(*options) {
 
 var IsConsolidationSimulation = func(opts *options) {
 	opts.enforceConsolidateAfter = true
+}
+
+// ExplainExistingNodeRejections makes the scheduler record, and log when the pod opens a new NodeClaim, why existing
+// nodes rejected a pod from a deleting node. Only the provisioner sets it: disruption simulations log nothing and would
+// pay a sequential CanAdd pass over every existing node for each such pod in every simulation.
+var ExplainExistingNodeRejections = func(opts *options) {
+	opts.explainExistingNodeRejections = true
 }
 
 // NewNodeClaimPriceLimit restricts the instance types a simulation may launch new capacity from to those whose
@@ -203,6 +212,7 @@ func NewScheduler(
 		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		explainRejections:       option.Resolve(opts...).explainExistingNodeRejections,
 		allocator:               allocator,
 		instanceTypes:           instanceTypes,
 		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
@@ -317,6 +327,11 @@ type Scheduler struct {
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
 	deletingNodeNames       sets.Set[string]
+	// existingNodeRejections holds, for a pod from a deleting node that no existing node accepted, why the existing
+	// nodes that admit it by taints and labels rejected it (see explainExistingNodeRejections). It stays nil unless
+	// explainRejections is set.
+	existingNodeRejections map[types.UID]string
+	explainRejections      bool
 	// pricePlacements is set when any NodePool opts into PackingPolicyMarginalCost; it switches pod placement from
 	// first-fit onto in-flight NodeClaims to the priced comparison in addByMarginalCost (see packing.go for how
 	// binpack NodePools keep their behavior under it).
@@ -898,7 +913,49 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod) error 
 		existingNode.Add(ctx, p, s.cachedPodData[p.UID], requirements, volumes, allocationResult)
 		return nil
 	}
+	s.recordExistingNodeRejections(ctx, p, volumes)
 	return fmt.Errorf("failed scheduling pod to existing nodes")
+}
+
+// recordExistingNodeRejections stores explainExistingNodeRejections for a pod from a deleting node that no existing
+// node accepted, when the scheduler was built with ExplainExistingNodeRejections.
+func (s *Scheduler) recordExistingNodeRejections(ctx context.Context, p *corev1.Pod, volumes scheduling.Volumes) {
+	if !s.explainRejections || !s.deletingNodeNames.Has(p.Spec.NodeName) || s.cachedPodData[p.UID].HasResourceClaimRequests {
+		return
+	}
+	if s.existingNodeRejections == nil {
+		s.existingNodeRejections = map[types.UID]string{}
+	}
+	s.existingNodeRejections[p.UID] = s.explainExistingNodeRejections(ctx, p, volumes)
+}
+
+// maxExplainedRejections bounds how many existing nodes explainExistingNodeRejections names.
+const maxExplainedRejections = 5
+
+// explainExistingNodeRejections says why each existing node whose taints and labels admit pod still rejected it:
+// resources, volumes, host ports or topology. It is the evidence for a pod that leaves a deleting node and needs new
+// capacity, which is a disruption decision that expected the pod to fit elsewhere. It re-runs CanAdd sequentially and
+// is only called on that rare path, never for pods with ResourceClaims, whose evaluation reserves devices.
+func (s *Scheduler) explainExistingNodeRejections(ctx context.Context, p *corev1.Pod, volumes scheduling.Volumes) string {
+	podData := s.cachedPodData[p.UID]
+	var reasons []string
+	eligible := 0
+	for _, node := range s.existingNodes {
+		if scheduling.Taints(node.cachedTaints).ToleratesPod(p) != nil || node.requirements.Compatible(podData.Requirements) != nil {
+			continue
+		}
+		eligible++
+		if len(reasons) == maxExplainedRejections {
+			continue
+		}
+		if _, _, err := node.CanAdd(ctx, p, podData, volumes, nil); err != nil {
+			reasons = append(reasons, fmt.Sprintf("%s: %s", node.Name(), err))
+		}
+	}
+	if eligible == 0 {
+		return "no existing node's taints and labels admit the pod"
+	}
+	return fmt.Sprintf("%d existing node(s) admit the pod by taints and labels and rejected it: %s", eligible, strings.Join(reasons, "; "))
 }
 
 func (s *Scheduler) addToInflightNode(ctx context.Context, pod *corev1.Pod) error {
@@ -949,6 +1006,14 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 // commitNewNodeClaim schedules pod onto the new NodeClaim of a placement returned by evaluateNewNodeClaim, adds the
 // NodeClaim to the in-flight set and charges its maximum possible resource usage against the NodePool's limits.
 func (s *Scheduler) commitNewNodeClaim(ctx context.Context, pod *corev1.Pod, fresh *placement) {
+	if rejections, ok := s.existingNodeRejections[pod.UID]; ok {
+		log.FromContext(ctx).WithValues(
+			"Pod", klog.KObj(pod),
+			"deleting-node", pod.Spec.NodeName,
+			"NodePool", klog.KRef("", fresh.nodeClaim.NodePoolName),
+			"existing-node-rejections", rejections,
+		).Info("pod from a deleting node needs new capacity")
+	}
 	fresh.commit(ctx, pod, s.cachedPodData[pod.UID], s.allocator)
 	s.newNodeClaims = append(s.newNodeClaims, fresh.nodeClaim)
 	s.remainingResources[fresh.nodeClaim.NodePoolName] = subtractMax(s.remainingResources[fresh.nodeClaim.NodePoolName], fresh.nodeClaim.InstanceTypeOptions)
