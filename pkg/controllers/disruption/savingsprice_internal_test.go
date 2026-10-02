@@ -78,6 +78,15 @@ func counterValue(t *testing.T, name string, labels map[string]string) float64 {
 	return 0
 }
 
+// approxSavings checks an executedSavings result that must have been priced.
+func approxSavings(t *testing.T, got float64, ok bool, want float64) {
+	t.Helper()
+	if !ok {
+		t.Fatalf("executedSavings reported the command unpriceable, want %v", want)
+	}
+	approx(t, "executedSavings", got, want)
+}
+
 func approx(t *testing.T, what string, got, want float64) {
 	t.Helper()
 	if math.Abs(got-want) > 1e-9 {
@@ -122,7 +131,8 @@ func spotReplacementCommand() Command {
 func TestExecutedSavingsPricesTheOfferingTheReplacementLaunched(t *testing.T) {
 	cmd := spotReplacementCommand()
 	kubeClient := fake.NewClientBuilder().WithObjects(launchedNodeClaim("b.large", "zone-b", v1.CapacityTypeSpot)).Build()
-	approx(t, "executedSavings", executedSavings(context.Background(), kubeClient, cmd), 0.30)
+	savings, ok := executedSavings(context.Background(), kubeClient, cmd)
+	approxSavings(t, savings, ok, 0.30)
 }
 
 func TestExecutedSavingsFallsBackToTheEstimateWhenTheLaunchIsUnknown(t *testing.T) {
@@ -133,7 +143,8 @@ func TestExecutedSavingsFallsBackToTheEstimateWhenTheLaunchIsUnknown(t *testing.
 		"not launched yet":                fake.NewClientBuilder().WithObjects(&v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: replacementName}}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			approx(t, "executedSavings", executedSavings(context.Background(), kubeClient.Build(), spotReplacementCommand()), 0.80)
+			savings, ok := executedSavings(context.Background(), kubeClient.Build(), spotReplacementCommand())
+			approxSavings(t, savings, ok, 0.80)
 		})
 	}
 }
@@ -192,5 +203,47 @@ func TestExecutedSavingsPricesTheReservationTheReplacementLaunchedInto(t *testin
 	}
 	launched := launchedNodeClaim("g.xlarge", "zone-a", v1.CapacityTypeReserved)
 	launched.Labels[cloudprovider.ReservationIDLabel] = "r-b"
-	approx(t, "executedSavings", executedSavings(context.Background(), fake.NewClientBuilder().WithObjects(launched).Build(), cmd), 0.30)
+	savings, ok := executedSavings(context.Background(), fake.NewClientBuilder().WithObjects(launched).Build(), cmd)
+	approxSavings(t, savings, ok, 0.30)
+}
+
+func TestExecutedSavingsLeavesOutACommandItCannotPrice(t *testing.T) {
+	// The launch cannot be resolved and none of the replacement's offerings is available any more: crediting the
+	// command would credit the candidate's whole price.
+	cmd := spotReplacementCommand()
+	for _, it := range cmd.Replacements[0].InstanceTypeOptions {
+		for _, of := range it.Offerings {
+			of.Available = false
+		}
+	}
+	if savings, ok := executedSavings(context.Background(), fake.NewClientBuilder().Build(), cmd); ok {
+		t.Fatalf("executedSavings() = (%v, true), want the command left out", savings)
+	}
+	ConsolidationRealizedSavingsDollarsPerHourTotal.Reset()
+	ObserveRealizedSavings(context.Background(), fake.NewClientBuilder().Build(), cmd)
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() == "karpenter_voluntary_disruption_consolidation_realized_savings_dollars_per_hour_total" && len(family.GetMetric()) != 0 {
+			t.Fatalf("an unpriceable command was counted: %v", family.GetMetric())
+		}
+	}
+}
+
+func TestExecutedSavingsDoesNotTakeAZeroSpotPriceAtFaceValue(t *testing.T) {
+	cmd := spotReplacementCommand()
+	for _, it := range cmd.Replacements[0].InstanceTypeOptions {
+		if it.Name == "b.large" {
+			for _, of := range it.Offerings {
+				if of.Zone() == "zone-b" {
+					of.Price = 0
+				}
+			}
+		}
+	}
+	kubeClient := fake.NewClientBuilder().WithObjects(launchedNodeClaim("b.large", "zone-b", v1.CapacityTypeSpot)).Build()
+	savings, ok := executedSavings(context.Background(), kubeClient, cmd)
+	approxSavings(t, savings, ok, 0.80)
 }

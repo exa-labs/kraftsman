@@ -35,6 +35,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
@@ -1121,7 +1122,10 @@ func ObserveAcceptedCandidate(cmd Command, consolidationType string, position in
 
 func ObserveRealizedSavings(ctx context.Context, kubeClient client.Reader, cmd Command) {
 	transition := capacityTypeTransition(ctx, kubeClient, cmd)
-	savings := executedSavings(ctx, kubeClient, cmd)
+	savings, ok := executedSavings(ctx, kubeClient, cmd)
+	if !ok {
+		return
+	}
 	// A counter cannot go down, and a replacement can launch pricier than the nodes it replaced (the cheap
 	// offerings it was priced against were out of capacity), so a loss goes to its own counter.
 	saved, added := max(savings, 0), max(-savings, 0)
@@ -1164,8 +1168,8 @@ func ObserveExecutedCommandValue(ctx context.Context, kubeClient client.Reader, 
 		return
 	}
 	transition := capacityTypeTransition(ctx, kubeClient, cmd)
-	if sourceCost := cmd.SourceCost(); sourceCost > 0 {
-		savings := executedSavings(ctx, kubeClient, cmd)
+	if savings, ok := executedSavings(ctx, kubeClient, cmd); ok && cmd.SourceCost() > 0 {
+		sourceCost := cmd.SourceCost()
 		for _, nodePoolName := range uniqueSorted(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })) {
 			ConsolidationExecutedSavingsFraction.Observe(savings/sourceCost, map[string]string{
 				metrics.NodePoolLabel:       nodePoolName,
@@ -1190,19 +1194,38 @@ func ObserveExecutedCommandValue(ctx context.Context, kubeClient client.Reader, 
 // candidates' price less the price of the offering each replacement actually launched, read from the replacement
 // NodeClaim's instance type, zone and capacity type labels and priced from the instance type options consolidation
 // evaluated. A launch may land on any type and zone its requirements allow - a pricier zone when the cheap ones are
-// out of capacity, a pricier type among the launch options - so the cheapest option EstimatedSavings charges is only a
-// lower bound on what a replacement costs. When any replacement's launched offering cannot be resolved the command
-// keeps that estimate.
-func executedSavings(ctx context.Context, kubeClient client.Reader, cmd Command) float64 {
+// out of capacity, a pricier type among the launch options - so the cheapest option is only a lower bound on what a
+// replacement costs. A replacement whose launched offering cannot be resolved is charged that lower bound, the
+// cheapest available offering its requirements admit; one without even that reports false, so the command is left
+// out rather than credited with the candidates' whole price.
+func executedSavings(ctx context.Context, kubeClient client.Reader, cmd Command) (float64, bool) {
 	savings := cmd.SourceCost()
 	for _, replacement := range cmd.Replacements {
+		if replacement == nil || replacement.NodeClaim == nil {
+			return 0, false
+		}
 		price, ok := launchedOfferingPrice(ctx, kubeClient, replacement)
 		if !ok {
-			return cmd.EstimatedSavings()
+			price, ok = cheapestAdmittedOfferingPrice(replacement.NodeClaim)
+		}
+		if !ok {
+			return 0, false
 		}
 		savings -= price
 	}
-	return savings
+	return savings, true
+}
+
+// cheapestAdmittedOfferingPrice is the price of the cheapest available, priced offering, across a replacement's
+// instance type options, that its requirements admit. It reports false when there is none.
+func cheapestAdmittedOfferingPrice(nc *pscheduling.NodeClaim) (float64, bool) {
+	offerings := lo.Filter(lo.FlatMap(nc.InstanceTypeOptions, func(it *cloudprovider.InstanceType, _ int) []*cloudprovider.Offering {
+		return it.Offerings.Available().Compatible(nc.Requirements)
+	}), func(of *cloudprovider.Offering, _ int) bool { return priced(of) })
+	if len(offerings) == 0 {
+		return 0, false
+	}
+	return cloudprovider.Offerings(offerings).Cheapest().Price, true
 }
 
 // launchedOfferingPrice prices the offering a replacement NodeClaim launched as. It reports false when the
@@ -1223,10 +1246,16 @@ func launchedOfferingPrice(ctx context.Context, kubeClient client.Reader, replac
 		return 0, false
 	}
 	launched, ok := lo.Find(instanceType.Offerings, func(of *cloudprovider.Offering) bool { return launchedAs(nodeClaim, of) })
-	if !ok {
+	if !ok || !priced(launched) {
 		return 0, false
 	}
 	return launched.Price, true
+}
+
+// priced reports whether an offering carries a usable price. Only reserved capacity is legitimately priced at zero;
+// elsewhere a zero price means the provider had none to report.
+func priced(of *cloudprovider.Offering) bool {
+	return of.Price > 0 || of.CapacityType() == v1.CapacityTypeReserved
 }
 
 // launchedAs reports whether a launched NodeClaim's zone and capacity type labels name the offering. Reservations of
