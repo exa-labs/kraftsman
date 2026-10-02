@@ -144,8 +144,10 @@ func WithLeaderElectionConfig(config *rest.Config) option.Function[Options] {
 // cannot register a Node its cache does not hold. Labels under kubernetes.io and k8s.io cannot be set by the kubelet,
 // so use another domain.
 // Pods, DaemonSets and the other inputs to scheduling stay unscoped; route pods to an instance's NodePools with node
-// selectors or taints. The NodePool, NodeClaim and NodeOverlay CRDs must be installed, since the manager resolves every
-// scoped type when it starts.
+// selectors or taints. Topology spread and pod (anti-)affinity are computed over the pods on in-scope Nodes only: a
+// pod bound to another instance's Node is skipped like a pod on a deleted Node, so constraints whose matching pods span
+// instances are not enforced across them. The NodePool, NodeClaim and NodeOverlay CRDs must be installed, since the
+// manager resolves every scoped type when it starts.
 func WithObjectSelector(selector labels.Selector) option.Function[Options] {
 	return func(opts *Options) {
 		opts.ObjectSelector = selector
