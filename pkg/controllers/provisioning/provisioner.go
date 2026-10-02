@@ -89,6 +89,12 @@ type Provisioner struct {
 	cm                         *pretty.ChangeMonitor
 	clock                      clock.Clock
 	deviceAllocationController *deviceallocation.Controller
+	// domainGroups and daemonOverheadGroups carry construction results from one provisioning loop to the next.
+	// Both are pure functions of fingerprinted inputs (NodePool identity and generation, the provider's instance
+	// type revision or content, the DaemonSet generation), so a loop whose inputs match an earlier one's reuses its
+	// result instead of rebuilding it for every NodePool and instance type.
+	domainGroups         *scheduler.DomainGroupCache
+	daemonOverheadGroups *scheduler.DaemonOverheadGroupStore
 }
 
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
@@ -105,6 +111,8 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		cm:                         pretty.NewChangeMonitor(),
 		clock:                      clock,
 		deviceAllocationController: deviceAllocationController,
+		domainGroups:               scheduler.NewDomainGroupCache(),
+		daemonOverheadGroups:       scheduler.NewDaemonOverheadGroupStore(),
 	}
 	return p
 }
@@ -407,8 +415,13 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
 		opts = append(opts, scheduler.IgnorePreferences)
 	}
+	// The template cache lives for this loop only: it supplies the template fingerprints the overhead group store is
+	// keyed by. The daemon overhead cache is likewise per loop, backed by the store that outlives it.
+	constructionCtx := scheduler.WithDomainGroupCache(ctx, p.domainGroups)
+	constructionCtx = scheduler.WithNodeClaimTemplateCache(constructionCtx, scheduler.NewNodeClaimTemplateCache())
+	constructionCtx = scheduler.WithDaemonOverheadCache(constructionCtx, scheduler.NewDaemonOverheadCacheWithGroupStore(p.daemonOverheadGroups))
 	s, err := p.NewScheduler(
-		ctx,
+		constructionCtx,
 		pods,
 		nodes.Active(),
 		deletingPodUIDs,
