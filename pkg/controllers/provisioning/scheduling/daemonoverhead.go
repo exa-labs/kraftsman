@@ -66,17 +66,10 @@ func candidateRequirements(nct *NodeClaimTemplate, it *cloudprovider.InstanceTyp
 	return candidate
 }
 
-// daemonAlternatives returns the node selection alternatives under which a daemon pod schedules onto a node
-// satisfying candidate. Kubernetes ORs the RequiredDuringScheduling node selector terms, so each term compatible with
-// candidate, combined with the pod's nodeSelector, is one alternative. Falls back to the pod's strict requirements
-// (its first term) when no term is compatible, which is how the caller established compatibility.
-func daemonAlternatives(candidate scheduling.Requirements, p *corev1.Pod) []scheduling.Requirements {
-	return newDaemonNodeSelection(p).alternatives(candidate)
-}
-
-// daemonNodeSelection holds the candidate-independent half of daemonAlternatives for one daemon pod: each required
-// node affinity term combined with the pod's nodeSelector (or the nodeSelector alone when the pod has no terms), and
-// the pod's strict requirements. Its requirement sets are shared by every candidate and are only ever read.
+// daemonNodeSelection holds what decides the node selection alternatives under which a daemon pod schedules onto a
+// node satisfying a candidate, built once per pod: each required node affinity term combined with the pod's
+// nodeSelector (or the nodeSelector alone when the pod has no terms), and the pod's strict requirements. Its
+// requirement sets are shared by every candidate and are only ever read.
 type daemonNodeSelection struct {
 	// terms holds one requirement set per required node affinity term, or the nodeSelector alone when hasTerms is false.
 	terms    []scheduling.Requirements
@@ -104,7 +97,10 @@ func newDaemonNodeSelection(p *corev1.Pod) daemonNodeSelection {
 	}
 }
 
-// alternatives returns the pod's node selection alternatives for candidate; see daemonAlternatives.
+// alternatives returns the node selection alternatives under which the pod schedules onto a node satisfying
+// candidate. Kubernetes ORs the RequiredDuringScheduling node selector terms, so each term compatible with candidate,
+// combined with the pod's nodeSelector, is one alternative. Falls back to the pod's strict requirements (its first
+// term) when no term is compatible, which is how the caller established compatibility.
 func (s daemonNodeSelection) alternatives(candidate scheduling.Requirements) []scheduling.Requirements {
 	if !s.hasTerms {
 		return s.terms
@@ -153,7 +149,7 @@ func (m *daemonPodMemo) sum(pods []*corev1.Pod) corev1.ResourceList {
 	return merged
 }
 
-// alternatives returns daemonAlternatives(candidate, p) from the memoized node selection of p.
+// alternatives returns the node selection alternatives of p for candidate from the memoized node selection of p.
 func (m *daemonPodMemo) alternatives(candidate scheduling.Requirements, p *corev1.Pod) []scheduling.Requirements {
 	selection, ok := m.selection[p]
 	if !ok {
