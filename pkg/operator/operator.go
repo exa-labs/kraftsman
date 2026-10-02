@@ -135,9 +135,14 @@ func WithLeaderElectionConfig(config *rest.Config) option.Function[Options] {
 // behaves as if they did not exist. Two operators given complementary selectors (for example `example.com/instance=a`
 // and `!example.com/instance`) can run in one cluster without acting on each other's capacity.
 //
-// The label must reach each object through the NodePool: NodeClaims inherit it from the NodePool template, and the Node
-// must carry it when the kubelet registers it (through --node-labels), since a NodeClaim cannot register a Node its
-// cache does not hold. Labels under kubernetes.io and k8s.io cannot be set by the kubelet, so use another domain.
+// Each instance needs its own leader election identity (LeaderElectionName); instances sharing one would elect a single
+// leader between them, leaving the other's capacity unreconciled.
+//
+// The label must be on both the NodePool's metadata and its template (spec.template.metadata.labels): the selector
+// matches the NodePool's own labels, while NodeClaims take theirs from the template, and a NodeClaim outside the cache
+// is never launched. The Node must carry it when the kubelet registers it (through --node-labels), since a NodeClaim
+// cannot register a Node its cache does not hold. Labels under kubernetes.io and k8s.io cannot be set by the kubelet,
+// so use another domain.
 // Pods, DaemonSets and the other inputs to scheduling stay unscoped; route pods to an instance's NodePools with node
 // selectors or taints. The NodePool, NodeClaim and NodeOverlay CRDs must be installed, since the manager resolves every
 // scoped type when it starts.
