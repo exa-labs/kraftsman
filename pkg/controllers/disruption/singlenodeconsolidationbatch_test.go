@@ -24,6 +24,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	clocktesting "k8s.io/utils/clock/testing"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -124,6 +126,28 @@ func (v immediateValidator) Validate(ctx context.Context, cmd disruption.Command
 	return v.inner.Validate(ctx, cmd, 0)
 }
 
+// admissionFailuresMatching sums the single-node admission failure series carrying every given
+// label value; the tests compare it as a delta since the registry is process-wide.
+func admissionFailuresMatching(labels map[string]string) float64 {
+	GinkgoHelper()
+	families, err := crmetrics.Registry.Gather()
+	Expect(err).To(Succeed())
+	want := lo.Assign(labels, map[string]string{"consolidation_type": disruption.SingleNodeConsolidationType})
+	total := 0.0
+	for _, family := range families {
+		if family.GetName() != "karpenter_voluntary_disruption_consolidation_admission_failures_total" {
+			continue
+		}
+		for _, m := range family.Metric {
+			have := lo.SliceToMap(m.Label, func(l *dto.LabelPair) (string, string) { return l.GetName(), l.GetValue() })
+			if lo.EveryBy(lo.Entries(want), func(e lo.Entry[string, string]) bool { return have[e.Key] == e.Value }) {
+				total += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return total
+}
+
 var _ = Describe("Batched Single-Node Consolidation", func() {
 	var nodePool *v1.NodePool
 	var nodeClaims []*v1.NodeClaim
@@ -176,15 +200,7 @@ var _ = Describe("Batched Single-Node Consolidation", func() {
 	// stage, which the tests compare as a delta since the registry is process-wide.
 	admissionFailures := func(stage, reason string) float64 {
 		GinkgoHelper()
-		metric, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_admission_failures_total", map[string]string{
-			"consolidation_type": disruption.SingleNodeConsolidationType,
-			"stage":              stage,
-			"reason":             reason,
-		})
-		if !found {
-			return 0
-		}
-		return metric.GetCounter().GetValue()
+		return admissionFailuresMatching(map[string]string{"stage": stage, "reason": reason})
 	}
 
 	// batchedPasses reads how many passes reported a batch size, and passOutcomes the running total
@@ -457,12 +473,23 @@ var _ = Describe("Batched Single-Node Consolidation", func() {
 		Expect(candidates).To(HaveLen(2))
 
 		rejected := admissionFailures(disruption.AdmissionStageValidation, "scheduling")
+		// The rejection names the check that failed and the command admitted ahead of it: the first
+		// command's pod and the second's now compete for the spare node, and the one left over
+		// needs a NodeClaim the delete does not launch.
+		detailed := admissionFailuresMatching(map[string]string{
+			"stage": disruption.AdmissionStageValidation, "reason": "scheduling",
+			"detail": "replacement_count_changed", "decision": "delete", "after_admitted": "delete",
+		})
 		cmds, err := real.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidates...)
 		Expect(err).To(Succeed())
 		Expect(cmds).To(HaveLen(1))
 		Expect(queue.GetCommands()).To(HaveLen(1))
 		// The second proposal was held, then rejected against the state the first command created.
 		Expect(admissionFailures(disruption.AdmissionStageValidation, "scheduling")).To(Equal(rejected + 1))
+		Expect(admissionFailuresMatching(map[string]string{
+			"stage": disruption.AdmissionStageValidation, "reason": "scheduling",
+			"detail": "replacement_count_changed", "decision": "delete", "after_admitted": "delete",
+		})).To(Equal(detailed + 1))
 	})
 
 	It("starts every command exactly once when the controller runs the pass", func() {
