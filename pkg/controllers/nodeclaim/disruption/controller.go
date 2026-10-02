@@ -22,7 +22,6 @@ import (
 
 	"github.com/patrickmn/go-cache"
 	"go.uber.org/multierr"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -111,13 +110,17 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	return result.Min(results...), nil
 }
 
+// Register watches the inputs the drift and consolidation reconcilers read: the NodeClaim, its NodePool and its
+// NodeClass. Pods are deliberately not watched. Consolidation reads pod activity only through the NodeClaim's
+// lastPodEventTime, which the podevents controller writes (and that write is a NodeClaim event), and drift never
+// reads pods. A pod watch would re-run both reconcilers, including the cloud provider drift check, on every pod
+// update on every node without any input having changed.
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	b := controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)}).
-		Watches(&v1.NodePool{}, nodeclaimutils.NodePoolEventHandler(c.kubeClient, c.cloudProvider)).
-		Watches(&corev1.Pod{}, nodeclaimutils.PodEventHandler(c.kubeClient, c.cloudProvider))
+		Watches(&v1.NodePool{}, nodeclaimutils.NodePoolEventHandler(c.kubeClient, c.cloudProvider))
 
 	for _, nodeClass := range c.cloudProvider.GetSupportedNodeClasses() {
 		b.Watches(nodeClass, nodeclaimutils.NodeClassEventHandler(c.kubeClient))
