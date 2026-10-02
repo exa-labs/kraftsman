@@ -83,6 +83,10 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	// Pods the provisioner is already launching capacity for, on a NodeClaim the pass's sync check
 	// skipped, are left out: a simulation that saw them would launch that capacity again.
 	pods, excludedPending := withoutCapacityInFlight(ctx, cluster, pods)
+	if len(excludedPending) > 0 {
+		// excludeUnprovisionablePods counted the backlog before this exclusion.
+		SimulationPendingPods.Set(float64(len(pods)), map[string]string{dispositionLabel: simulationPodsDispositionSimulated})
+	}
 
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until

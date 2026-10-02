@@ -159,6 +159,8 @@ var _ = Describe("Disruption Sync Policy: capacity in flight", func() {
 			Expect(queue.GetCommands()[0].Decision()).To(Equal(disruption.ReplaceDecision))
 			Expect(replacementPods()).To(ConsistOf(candidatePod.Name))
 			ExpectMetricGaugeValue(disruption.SimulationPendingPods, 1, map[string]string{"disposition": "excluded_capacity_in_flight"})
+			// The pending pod left out is not also counted as simulated.
+			ExpectMetricGaugeValue(disruption.SimulationPendingPods, 0, map[string]string{"disposition": "simulated"})
 		},
 		Entry("an interrupted node's pod, IgnoreNonReplacements", displacedOnInterruptedNode, options.DisruptionSyncPolicyIgnoreNonReplacements, nil, "in_flight"),
 		Entry("an interrupted node's pod, deferred launch, IgnoreFailedOrDeferred", displacedOnInterruptedNode, options.DisruptionSyncPolicyIgnoreFailedOrDeferred, deferred, "launch_deferred"),
