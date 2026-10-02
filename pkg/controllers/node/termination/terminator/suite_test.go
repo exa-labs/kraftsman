@@ -143,6 +143,28 @@ var _ = Describe("Eviction/Queue", func() {
 			Expect(e[0].Reason).To(Equal(events.FailedDraining))
 			Expect(e[0].Message).To(ContainSubstring("evicting pod violates a PDB"))
 		})
+		It("should drop the pod from the queue when the eviction finds it gone", func() {
+			queue.Add(pod)
+			// Reconcile directly: the object reconciler skips a pod missing from the cache before evicting.
+			_, err := queue.Reconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			ExpectMetricCounterValue(terminator.PodsEvictionRequestsTotal, 1, map[string]string{terminator.CodeLabel: "404"})
+			Expect(queue.Has(pod)).To(BeFalse())
+		})
+		It("should drop the pod from the queue when a PDB is blocking and its node is gone, so it can be queued again", func() {
+			ExpectApplied(ctx, env.Client, pdb, pod, node)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectDeleted(ctx, env.Client, node)
+			queue.Add(pod)
+			result := ExpectObjectReconciled(ctx, env.Client, queue, pod)
+			//nolint:staticcheck
+			Expect(result.Requeue).To(BeFalse())
+			ExpectMetricCounterValue(terminator.PodsEvictionRequestsTotal, 1, map[string]string{terminator.CodeLabel: "429"})
+			Expect(recorder.Events()).To(HaveLen(0))
+			Expect(queue.Has(pod)).To(BeFalse())
+			queue.Add(pod)
+			Expect(queue.Has(pod)).To(BeTrue())
+		})
 		It("should return a NodeDrainError event when two PDBs refer to the same pod", func() {
 			pdb2 := test.PodDisruptionBudget(test.PDBOptions{
 				Labels:         testLabels,

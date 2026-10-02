@@ -191,6 +191,7 @@ func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Resul
 			// https://github.com/kubernetes/kubernetes/blob/ad19beaa83363de89a7772f4d5af393b85ce5e61/pkg/registry/core/pod/storage/eviction.go#L160
 			// 409 - The pod exists, but it is not the same pod that we initiated the eviction on
 			// https://github.com/kubernetes/kubernetes/blob/ad19beaa83363de89a7772f4d5af393b85ce5e61/pkg/registry/core/pod/storage/eviction.go#L318
+			q.forget(pod)
 			return reconcile.Result{}, nil
 		}
 		// The pod exists and is the same pod, we need to continue
@@ -200,6 +201,11 @@ func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Resul
 		if apierrors.IsTooManyRequests(err) || message == multiplePodDisruptionBudgetsError {
 			node, err2 := podutils.NodeForPod(ctx, q.kubeClient, pod)
 			if err2 != nil {
+				// If the pod has no node, we should exit without evicting
+				if apierrors.IsNotFound(err2) {
+					q.forget(pod)
+					return reconcile.Result{}, nil
+				}
 				return reconcile.Result{}, err2
 			}
 			errorMessage := lo.Ternary(message == multiplePodDisruptionBudgetsError, "eviction does not support multiple PDBs", "evicting pod violates a PDB")
@@ -214,10 +220,16 @@ func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Resul
 	q.recorder.Publish(terminatorevents.EvictPod(pod, reason))
 	PodsDrainedTotal.Inc(map[string]string{ReasonLabel: reason})
 
+	q.forget(pod)
+	return reconcile.Result{}, nil
+}
+
+// forget removes the pod's key once its eviction is finished, whether it succeeded or ended without one, so a later
+// Add can queue the pod again. Only the requeueing exits (a blocking PDB, a transient error) keep the key.
+func (q *Queue) forget(pod *corev1.Pod) {
 	q.Lock()
 	defer q.Unlock()
 	q.set.Delete(NewQueueKey(pod))
-	return reconcile.Result{}, nil
 }
 
 func evictionReason(ctx context.Context, pod *corev1.Pod, kubeClient client.Client) string {
