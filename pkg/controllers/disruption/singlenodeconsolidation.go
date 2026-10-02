@@ -79,8 +79,9 @@ type SingleNodeConsolidation struct {
 	// remembered by fingerprint, so an identical candidate in a later pass can be skipped.
 	negativeResults *NegativeResultCache
 	// completedCommandsSeen is the queue's completed-command count at the last pass. Any command
-	// completing between passes — from any disruption method, not just this one — can free
-	// capacity that a cached no-op verdict depended on, so the cache is cleared when it moves.
+	// completing between passes — from any disruption method, not just this one — can change
+	// capacity that a cached no-op verdict depended on, so with ConsolidationNegativeCacheClear
+	// set the cache is cleared when it moves.
 	completedCommandsSeen uint64
 }
 
