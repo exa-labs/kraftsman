@@ -751,11 +751,26 @@ func (s *Scheduler) marginalCostPrices(nc *NodeClaim) bool {
 		(s.shadowPricePlacements && nc.PackingPolicy == PackingPolicyMarginalCostShadow)
 }
 
-// inflightPlacements evaluates every in-flight NodeClaim for pod in parallel and returns one placement per claim
-// in s.newNodeClaims order, nil where the pod does not fit. Only claims priced by the active policy carry a delta.
+// inflightPlacements evaluates the in-flight NodeClaims for pod in parallel and returns one placement per claim in
+// s.newNodeClaims order, nil where the pod does not fit. Only claims priced by the active policy carry a delta.
+//
+// Evaluation stops at the first claim that takes the pod at zero delta, which every fitting claim of an unpriced
+// NodePool does. Deltas are never negative, so no later claim can be cheaper than that one, and ties go to the
+// earlier claim; the first fit and the cheapest fit are therefore both decided by the claims up to it. Entries after
+// it are nil whether or not the pod fits them, so the result does not depend on how far the workers got.
 func (s *Scheduler) inflightPlacements(ctx context.Context, pod *corev1.Pod) []*inflightPlacement {
 	candidates := make([]*inflightPlacement, len(s.newNodeClaims))
+	var mu sync.Mutex
+	cutoff := len(s.newNodeClaims)
 	parallelizeUntil(s.numConcurrentReconciles, len(s.newNodeClaims), func(i int) bool {
+		// Claims are handed out in order, so once a worker draws one past the cutoff every claim before the cutoff has
+		// already been drawn and the remaining ones are past it too.
+		mu.Lock()
+		pastCutoff := i > cutoff
+		mu.Unlock()
+		if pastCutoff {
+			return false
+		}
 		nc := s.newNodeClaims[i]
 		r, its, ofr, result, err := nc.CanAdd(ctx, pod, s.cachedPodData[pod.UID], false, s.allocator)
 		if err != nil {
@@ -766,8 +781,16 @@ func (s *Scheduler) inflightPlacements(ctx context.Context, pod *corev1.Pod) []*
 			candidate.delta, candidate.unpriced = marginalLaunchPrice(nc, its, r, ofr)
 		}
 		candidates[i] = candidate
+		if candidate.delta == 0 {
+			mu.Lock()
+			cutoff = min(cutoff, i)
+			mu.Unlock()
+		}
 		return true
 	})
+	for i := cutoff + 1; i < len(candidates); i++ {
+		candidates[i] = nil
+	}
 	return candidates
 }
 
