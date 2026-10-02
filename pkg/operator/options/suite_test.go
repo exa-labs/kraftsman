@@ -507,6 +507,10 @@ var _ = Describe("Options", func() {
 			Expect(opts.Parse(fs, "--consolidation-replace-min-savings-per-hour=-0.01")).ToNot(Succeed())
 		})
 
+		It("should fail validation when consolidation-replace-min-savings-per-hour is not finite", func() {
+			Expect(opts.Parse(fs, "--consolidation-replace-min-savings-per-hour=+Inf")).ToNot(Succeed())
+		})
+
 		It("should default consolidation-replace-min-savings to 0", func() {
 			Expect(opts.Parse(fs)).To(Succeed())
 			Expect(opts.ConsolidationReplaceMinSavings).To(BeZero())

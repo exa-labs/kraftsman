@@ -288,8 +288,8 @@ func (o *Options) validateConsolidation() error {
 }
 
 func (o *Options) validateReplaceMinSavingsPerHour() error {
-	if math.IsNaN(o.ConsolidationReplaceMinSavingsPerHour) || o.ConsolidationReplaceMinSavingsPerHour < 0 {
-		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS_PER_HOUR must be >= 0, got %f", o.ConsolidationReplaceMinSavingsPerHour)
+	if math.IsNaN(o.ConsolidationReplaceMinSavingsPerHour) || math.IsInf(o.ConsolidationReplaceMinSavingsPerHour, 0) || o.ConsolidationReplaceMinSavingsPerHour < 0 {
+		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS_PER_HOUR must be finite and >= 0, got %f", o.ConsolidationReplaceMinSavingsPerHour)
 	}
 	return nil
 }
