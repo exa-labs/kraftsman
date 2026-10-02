@@ -54,6 +54,10 @@ func admissionBudget(proposals int) time.Duration {
 	return commandValidationDelay + time.Duration(proposals)*commandAdmissionReserve
 }
 
+// clusterSyncPollInterval is how often admission re-checks whether the NodeClaims created by the
+// commands it already admitted have launched.
+var clusterSyncPollInterval = 250 * time.Millisecond
+
 const SingleNodeConsolidationType = "single"
 
 // consolidationProposal is a command a pass has selected but not yet validated or queued.
@@ -353,6 +357,13 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 // an earlier command consumed fails validation the same way a plan drifting across the settling
 // window does today, instead of double-booking that capacity. Validating the whole batch first
 // and starting the commands concurrently would lose exactly that property.
+//
+// Those effects are only modeled correctly once the replacements have launched. A replacement
+// NodeClaim enters cluster state the moment it is created, but it has no allocatable capacity
+// until the cloud provider resolves its instance, so a re-simulation in that window finds no room
+// for the earlier command's pods and rejects the next proposal for a NodeClaim it would never
+// launch. The controller does not start a pass while any NodeClaim is unlaunched (Cluster.Synced)
+// for the same reason, so each proposal after an admission waits for the same condition.
 func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals []consolidationProposal) ([]Command, error) {
 	admitted := []Command{}
 	// Admission runs on its own budget, so a pass that walked right up to its timeout - or past it,
@@ -368,6 +379,10 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 	for _, proposal := range proposals {
 		if attempted && !s.clock.Now().Add(commandAdmissionReserve).Before(deadline) {
 			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "admission_reserve")
+			continue
+		}
+		if len(admitted) > 0 && !s.awaitClusterSync(ctx, deadline.Add(-commandAdmissionReserve)) {
+			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "replacements_not_launched")
 			continue
 		}
 		if validationDelay == 0 {
@@ -407,6 +422,22 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 		admitted = append(admitted, cmd)
 	}
 	return admitted, nil
+}
+
+// awaitClusterSync waits until cluster state holds no NodeClaim that has yet to launch, polling
+// until the given time. It reports whether the cluster synced in time.
+func (s *SingleNodeConsolidation) awaitClusterSync(ctx context.Context, until time.Time) bool {
+	for !s.cluster.Synced(ctx) {
+		if !s.clock.Now().Before(until) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-s.clock.After(clusterSyncPollInterval):
+		}
+	}
+	return true
 }
 
 func (s *SingleNodeConsolidation) Reason() v1.DisruptionReason {
