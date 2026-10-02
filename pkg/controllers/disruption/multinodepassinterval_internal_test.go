@@ -45,7 +45,7 @@ func TestMultiNodePassIntervalDisabledByDefault(t *testing.T) {
 	m := newIntervalMultiNode(clk)
 	ctx := multiNodeIntervalContext(0)
 
-	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
+	m.recordPassOutcome(ctx, false, nil)
 	if !m.DueForPass(ctx) {
 		t.Fatal("with no interval configured, every loop iteration must run a pass")
 	}
@@ -60,7 +60,7 @@ func TestMultiNodePassIntervalSpacesPassesAfterNoCommand(t *testing.T) {
 		t.Fatal("the first pass must be due")
 	}
 	for _, outcome := range []string{PassOutcomeNoOp, PassOutcomeTimedOut} {
-		m.recordPassOutcome(ctx, outcome, nil)
+		m.recordPassOutcome(ctx, false, nil)
 		if m.DueForPass(ctx) {
 			t.Fatalf("a pass ending %s must push the next one out by the interval", outcome)
 		}
@@ -75,15 +75,15 @@ func TestMultiNodePassIntervalSpacesPassesAfterNoCommand(t *testing.T) {
 	}
 
 	// A pass that found a command changed the fleet, so the next one is due at once.
-	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
-	m.recordPassOutcome(ctx, PassOutcomeCompleted, nil)
+	m.recordPassOutcome(ctx, false, nil)
+	m.recordPassOutcome(ctx, true, nil)
 	if !m.DueForPass(ctx) {
 		t.Fatal("a pass that produced a command must leave the next pass due immediately")
 	}
 
 	// A pass that failed is retried by the controller; the interval must not swallow the retry.
-	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
-	m.recordPassOutcome(ctx, PassOutcomeNoOp, errors.New("transient"))
+	m.recordPassOutcome(ctx, false, nil)
+	m.recordPassOutcome(ctx, false, errors.New("transient"))
 	if !m.DueForPass(ctx) {
 		t.Fatal("a pass that returned an error must leave the next pass due immediately")
 	}

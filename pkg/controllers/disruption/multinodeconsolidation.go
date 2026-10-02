@@ -71,12 +71,15 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	depth := 0
 	outcome := PassOutcomeNoOp
 	timedOut := false
+	// found records that the search produced a command, whether or not validation then accepted
+	// it: a fleet with a consolidatable batch is worth searching again at once.
+	found := false
 	defer func() {
 		if timedOut && outcome == PassOutcomeNoOp {
 			outcome = PassOutcomeTimedOut
 		}
 		ObserveConsolidationPass(m.ConsolidationType(), outcome, depth)
-		m.recordPassOutcome(ctx, outcome, err)
+		m.recordPassOutcome(ctx, found || outcome == PassOutcomeCompleted, err)
 	}()
 	if m.IsConsolidated() {
 		return []Command{}, nil
@@ -142,6 +145,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		m.evaluator.EmitMultiNodeEvents(ctx, cmd, perPoolResults, true)
 	}
 
+	found = true
 	if cmd, err = m.validator.Validate(ctx, cmd, commandValidationDelay); err != nil {
 		if IsValidationError(err) {
 			reason := getValidationFailureReason(err)
@@ -170,14 +174,16 @@ func (m *MultiNodeConsolidation) DueForPass(ctx context.Context) bool {
 // RecordEmptyPass schedules the next pass after one that had no candidates to evaluate, which
 // found nothing as surely as a search that came up empty.
 func (m *MultiNodeConsolidation) RecordEmptyPass(ctx context.Context) {
-	m.recordPassOutcome(ctx, PassOutcomeNoOp, nil)
+	m.recordPassOutcome(ctx, false, nil)
 }
 
-// recordPassOutcome schedules the next pass: immediately after a pass that produced a command,
-// since the fleet just changed and the search may find another, or that failed, so the
-// controller's retry runs it again; one interval out after a pass that found nothing.
-func (m *MultiNodeConsolidation) recordPassOutcome(ctx context.Context, outcome string, err error) {
-	if outcome == PassOutcomeCompleted || err != nil {
+// recordPassOutcome schedules the next pass: immediately after a pass whose search produced a
+// command (executed or rejected at validation), since the fleet has consolidatable batches, or
+// that failed, so the controller's retry runs it again; one interval out after a pass that found
+// nothing. Nothing else reopens a deferred pass: the interval is wall-clock, held in memory, and
+// starts over on a new leader.
+func (m *MultiNodeConsolidation) recordPassOutcome(ctx context.Context, found bool, err error) {
+	if found || err != nil {
 		m.nextPass = time.Time{}
 		return
 	}
