@@ -33,11 +33,42 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
 type ValidationError struct {
 	error
+	// detail names the specific check that failed, finer than the error's type. It feeds metric
+	// labels, so it is one of the validationDetail constants or empty.
+	detail string
 }
+
+// Validation details, the specific check a validation failed. Each belongs to one error type:
+// churn and budget errors come from re-checking the candidates, scheduling errors from
+// re-simulating the command.
+const (
+	// validationDetailCandidateChanged: a candidate no longer passes candidate filtering.
+	validationDetailCandidateChanged = "candidate_changed"
+	// validationDetailCandidateNominated: a pending pod was nominated to a candidate.
+	validationDetailCandidateNominated = "candidate_nominated"
+	// validationDetailBudgetExhausted: the NodePool's disruption budget no longer covers a candidate.
+	validationDetailBudgetExhausted = "budget_exhausted"
+	// validationDetailNoCandidates: no candidate survived re-validation.
+	validationDetailNoCandidates = "no_candidates"
+	// validationDetailUninitializedNode: a candidate's pods would land on an uninitialized node.
+	validationDetailUninitializedNode = "uninitialized_node"
+	// validationDetailPodsUnschedulable: a candidate's pods would not schedule at all.
+	validationDetailPodsUnschedulable = "pods_unschedulable"
+	// validationDetailReplacementUnneeded: the command launches replacements the re-simulation no
+	// longer needs.
+	validationDetailReplacementUnneeded = "replacement_unneeded"
+	// validationDetailReplacementCountChanged: the re-simulation needs a different, non-zero
+	// number of new NodeClaims than the command launches.
+	validationDetailReplacementCountChanged = "replacement_count_changed"
+	// validationDetailReplacementMismatch: as many new NodeClaims as replacements, but some
+	// replacement cannot stand in for any of them.
+	validationDetailReplacementMismatch = "replacement_mismatch"
+)
 
 func NewValidationError(err error) *ValidationError {
 	return &ValidationError{error: err}
@@ -64,6 +95,13 @@ func (e *BudgetValidationError) Unwrap() error {
 	return e.ValidationError
 }
 
+// newBudgetValidationErrorWithDetail is NewBudgetValidationError naming the failed check.
+func newBudgetValidationErrorWithDetail(detail string, err error) *BudgetValidationError {
+	e := NewBudgetValidationError(err)
+	e.detail = detail
+	return e
+}
+
 // SchedulingValidationError indicates validation failed due to scheduling constraints
 type SchedulingValidationError struct {
 	*ValidationError
@@ -77,6 +115,13 @@ func (e *SchedulingValidationError) Unwrap() error {
 	return e.ValidationError
 }
 
+// newSchedulingValidationErrorWithDetail is NewSchedulingValidationError naming the failed check.
+func newSchedulingValidationErrorWithDetail(detail string, err error) *SchedulingValidationError {
+	e := NewSchedulingValidationError(err)
+	e.detail = detail
+	return e
+}
+
 // ChurnValidationError indicates validation failed due to churn detection
 type ChurnValidationError struct {
 	*ValidationError
@@ -88,6 +133,13 @@ func NewChurnValidationError(err error) *ChurnValidationError {
 
 func (e *ChurnValidationError) Unwrap() error {
 	return e.ValidationError
+}
+
+// newChurnValidationErrorWithDetail is NewChurnValidationError naming the failed check.
+func newChurnValidationErrorWithDetail(detail string, err error) *ChurnValidationError {
+	e := NewChurnValidationError(err)
+	e.detail = detail
+	return e
 }
 
 type Validator interface {
@@ -254,7 +306,7 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 	validatedCandidates = mapCandidates(candidates, validatedCandidates)
 	if len(validatedCandidates) == 0 {
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: e.validationType})
-		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)))
+		return nil, newChurnValidationErrorWithDetail(validationDetailCandidateChanged, fmt.Errorf("%d candidates are no longer valid", len(candidates)))
 	}
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, e.cluster, e.clock, e.kubeClient, e.cloudProvider, e.recorder, e.reason)
 	if err != nil {
@@ -296,7 +348,7 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	// If we filtered out any candidates, return nil as some NodeClaims in the consolidation decision have changed.
 	if len(validatedCandidates) != len(candidates) {
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
-		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)-len(validatedCandidates)))
+		return nil, newChurnValidationErrorWithDetail(validationDetailCandidateChanged, fmt.Errorf("%d candidates are no longer valid", len(candidates)-len(validatedCandidates)))
 	}
 	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, c.reason)
 	if err != nil {
@@ -308,11 +360,11 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	for _, vc := range validatedCandidates {
 		if c.cluster.IsNodeNominated(vc.ProviderID()) {
 			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
-			return nil, NewBudgetValidationError(fmt.Errorf("a candidate was nominated during validation"))
+			return nil, newBudgetValidationErrorWithDetail(validationDetailCandidateNominated, fmt.Errorf("a candidate was nominated during validation"))
 		}
 		if disruptionBudgetMapping[vc.NodePool.Name] == 0 {
 			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
-			return nil, NewBudgetValidationError(fmt.Errorf("a candidate can no longer be disrupted without violating budgets"))
+			return nil, newBudgetValidationErrorWithDetail(validationDetailBudgetExhausted, fmt.Errorf("a candidate can no longer be disrupted without violating budgets"))
 		}
 		disruptionBudgetMapping[vc.NodePool.Name]--
 	}
@@ -323,7 +375,9 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 func (v *validation) validateCommand(ctx context.Context, cmd Command, candidates []*Candidate) error {
 	// None of the chosen candidate are valid for execution, so retry
 	if len(candidates) == 0 {
-		return NewValidationError(fmt.Errorf("no candidates"))
+		e := NewValidationError(fmt.Errorf("no candidates"))
+		e.detail = validationDetailNoCandidates
+		return e
 	}
 	// Re-simulate under the same new-capacity price ceiling the command was computed with, so a split fallback
 	// command is checked against the packing it came from rather than the single-replacement packing the
@@ -333,7 +387,7 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}
 	if !results.AllNonPendingPodsScheduled() {
-		return NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors()))
+		return newSchedulingValidationErrorWithDetail(unscheduledPodsDetail(results), errors.New(results.NonPendingPodSchedulingErrors()))
 	}
 
 	// We want to ensure that the re-simulated scheduling using the current cluster state produces the same result.
@@ -349,12 +403,12 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 		}
 		// if it produced no new NodeClaims, but we were expecting one we should re-simulate as there is likely a better
 		// consolidation option now
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
+		return newSchedulingValidationErrorWithDetail(validationDetailReplacementUnneeded, fmt.Errorf("scheduling simulation produced new results"))
 	}
 
 	// the simulation must produce exactly the number of replacements the command intends to launch
 	if len(results.NewNodeClaims) != len(cmd.Replacements) {
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
+		return newSchedulingValidationErrorWithDetail(validationDetailReplacementCountChanged, fmt.Errorf("scheduling simulation produced new results"))
 	}
 
 	// We know that the scheduling simulation wants to create new nodes and that the command we are verifying wants
@@ -369,9 +423,25 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	// now says that we need to launch a 4xlarge. It's still launching the correct number of NodeClaims, but it's just
 	// as expensive or possibly more so we shouldn't validate.
 	if !replacementsMatchSimulation(cmd.Replacements, results.NewNodeClaims) {
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
+		return newSchedulingValidationErrorWithDetail(validationDetailReplacementMismatch, fmt.Errorf("scheduling simulation produced new results"))
 	}
 	return nil
+}
+
+// unscheduledPodsDetail tells apart the two ways a re-simulation leaves a non-pending pod without
+// a place: it would only fit on a node that has not initialized yet, which the simulation does not
+// trust, or it fits nowhere at all.
+func unscheduledPodsDetail(results scheduling.Results) string {
+	for p, err := range results.PodErrors {
+		if podutils.IsProvisionable(p) {
+			continue
+		}
+		var uninitialized *UninitializedNodeError
+		if errors.As(err, &uninitialized) {
+			return validationDetailUninitializedNode
+		}
+	}
+	return validationDetailPodsUnschedulable
 }
 
 // replacementsMatchSimulation reports whether there is a one-to-one matching between the command's replacements and
@@ -456,6 +526,16 @@ func taintsAreEqual(lhs, rhs []corev1.Taint) bool {
 		}
 	}
 	return true
+}
+
+// getValidationFailureDetail returns the specific check a validation error failed, or "unknown"
+// for an error that did not name one.
+func getValidationFailureDetail(err error) string {
+	var validationErr *ValidationError
+	if errors.As(err, &validationErr) && validationErr.detail != "" {
+		return validationErr.detail
+	}
+	return "unknown"
 }
 
 // getValidationFailureReason categorizes validation errors into specific failure types
