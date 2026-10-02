@@ -112,6 +112,7 @@ type Options struct {
 	IgnoreDRARequests                       bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
 	MaxConsolidationReplacements            int
 	MaxConsolidationCommandsPerPass         int
+	MultiNodeConsolidationInterval          time.Duration
 	ConsolidationSplitFallback              bool
 	ConsolidationSplitShadow                bool
 	ConsolidationSplitShadowMaxReplacements int
@@ -179,6 +180,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.StringVar(&o.minValuesPolicyRaw, "min-values-policy", env.WithDefaultString("MIN_VALUES_POLICY", string(MinValuesPolicyStrict)), "Min values policy for scheduling. Options include 'Strict' for existing behavior where min values are strictly enforced or 'BestEffort' where Karpenter relaxes min values when it isn't satisfied.")
 	fs.IntVar(&o.MaxConsolidationReplacements, "max-consolidation-replacements", env.WithDefaultInt("MAX_CONSOLIDATION_REPLACEMENTS", 1), "The maximum number of replacement nodes a single consolidation candidate may be split into. 1 preserves the classic 1->1 behavior; higher values allow bounded 1->N consolidation (e.g. replacing one large on-demand node with several smaller spot nodes) when the aggregate replacement price is lower.")
 	fs.IntVar(&o.MaxConsolidationCommandsPerPass, "max-consolidation-commands-per-pass", env.WithDefaultInt("MAX_CONSOLIDATION_COMMANDS_PER_PASS", 1), "The maximum number of disruption commands a single single-node consolidation pass may admit. 1 preserves the classic one-command-per-pass behavior; higher values let a pass that has already paid for candidate discovery admit several non-overlapping commands, each still validated against live cluster state immediately before it is queued.")
+	fs.DurationVar(&o.MultiNodeConsolidationInterval, "multi-node-consolidation-interval", env.WithDefaultDuration("MULTI_NODE_CONSOLIDATION_INTERVAL", 0), "The minimum time between multi-node consolidation passes after a pass that found no command. The disruption loop runs its methods serially, so every multi-node pass delays the single-node pass behind it; on a fleet where multi-node consolidation rarely finds a command this bounds what it can take from the loop. A pass that finds a command leaves the next one due immediately. 0 runs multi-node consolidation on every loop iteration.")
 	fs.BoolVarWithEnv(&o.ConsolidationSplitFallback, "consolidation-split-fallback", "CONSOLIDATION_SPLIT_FALLBACK", false, "When set, a single-node consolidation candidate that no cheaper single replacement can absorb is re-simulated with the candidate's own price as a ceiling on new capacity, so the scheduler packs its pods onto several cheaper nodes instead. Bounded by max-consolidation-replacements and consolidation-split-max-attempts.")
 	fs.BoolVarWithEnv(&o.ConsolidationSplitShadow, "consolidation-split-shadow", "CONSOLIDATION_SPLIT_SHADOW", false, "When set while the split fallback is off, each candidate the fallback would have tried is still re-simulated - silently, bounded by consolidation-split-shadow-max-replacements - and the verdict is counted in consolidation_split_shadow_total instead of acted on. The evidence to collect before enabling consolidation-split-fallback.")
 	fs.IntVar(&o.ConsolidationSplitShadowMaxReplacements, "consolidation-split-shadow-max-replacements", env.WithDefaultInt("CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS", 8), "The replacement cap the shadow split simulation evaluates, decoupled from max-consolidation-replacements so the live limit stays conservative while the shadow measures the intended one. Must be >= 2 since a split needs at least two replacements to exist.")
@@ -263,6 +265,9 @@ func (o *Options) validateConsolidation() error {
 	}
 	if o.MaxConsolidationCommandsPerPass < 1 {
 		return fmt.Errorf("validating cli flags / env vars, MAX_CONSOLIDATION_COMMANDS_PER_PASS must be >= 1, got %d", o.MaxConsolidationCommandsPerPass)
+	}
+	if o.MultiNodeConsolidationInterval < 0 {
+		return fmt.Errorf("validating cli flags / env vars, MULTI_NODE_CONSOLIDATION_INTERVAL must be >= 0, got %s", o.MultiNodeConsolidationInterval)
 	}
 	if o.ConsolidationSplitMaxAttempts < 0 {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_SPLIT_MAX_ATTEMPTS must be >= 0, got %d", o.ConsolidationSplitMaxAttempts)

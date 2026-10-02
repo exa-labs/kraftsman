@@ -182,7 +182,17 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 
+// passGate is implemented by methods that decide for themselves whether a loop iteration runs
+// them. A method that is not due is skipped before its candidates are built, and records no
+// evaluation.
+type passGate interface {
+	DueForPass(ctx context.Context) bool
+}
+
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
+	if gate, ok := disruption.(passGate); ok && !gate.DueForPass(ctx) {
+		return false, nil
+	}
 	defer metrics.Measure(EvaluationDurationSeconds, map[string]string{
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),

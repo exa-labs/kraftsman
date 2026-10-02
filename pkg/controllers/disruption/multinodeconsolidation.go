@@ -30,6 +30,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	scheduler "sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -41,6 +42,9 @@ const MultiNodeConsolidationType = "multi"
 type MultiNodeConsolidation struct {
 	consolidation
 	validator Validator
+	// nextPass is the earliest time the next pass may run. Only a pass that found no command
+	// pushes it out, by MultiNodeConsolidationInterval; a pass that found one leaves it zero.
+	nextPass time.Time
 }
 
 func NewMultiNodeConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *MultiNodeConsolidation {
@@ -72,6 +76,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 			outcome = PassOutcomeTimedOut
 		}
 		ObserveConsolidationPass(m.ConsolidationType(), outcome, depth)
+		m.recordPassOutcome(ctx, outcome)
 	}()
 	if m.IsConsolidated() {
 		return []Command{}, nil
@@ -148,6 +153,28 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	outcome = PassOutcomeCompleted
 	ObserveAcceptedCandidate(cmd, m.ConsolidationType(), len(cmd.Candidates)-1)
 	return []Command{cmd}, nil
+}
+
+// DueForPass reports whether the disruption loop should run a multi-node pass now. Multi-node
+// consolidation runs ahead of single-node consolidation on the same serial loop, so on a fleet
+// where it rarely finds a command, running it every iteration spends loop time the single-node
+// pass behind it would otherwise use. MultiNodeConsolidationInterval spaces passes out after one
+// that found nothing; with the default of 0 every iteration runs one.
+func (m *MultiNodeConsolidation) DueForPass(ctx context.Context) bool {
+	if options.FromContext(ctx).MultiNodeConsolidationInterval <= 0 {
+		return true
+	}
+	return !m.clock.Now().Before(m.nextPass)
+}
+
+// recordPassOutcome schedules the next pass: immediately after a pass that produced a command,
+// since the fleet just changed and the search may find another, and one interval out otherwise.
+func (m *MultiNodeConsolidation) recordPassOutcome(ctx context.Context, outcome string) {
+	if outcome == PassOutcomeCompleted {
+		m.nextPass = time.Time{}
+		return
+	}
+	m.nextPass = m.clock.Now().Add(options.FromContext(ctx).MultiNodeConsolidationInterval)
 }
 
 // firstNConsolidationOption looks at the first N NodeClaims to determine if they can all be consolidated at once.  The
