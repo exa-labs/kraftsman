@@ -1344,13 +1344,14 @@ func buildDaemonOverheadGroups(ctx context.Context, cache *DaemonOverheadCache, 
 func buildDaemonOverheadGroupsForTemplate(ctx context.Context, nct *NodeClaimTemplate, daemonSetPods []*corev1.Pod) []DaemonOverheadGroup {
 	groups := map[string]*DaemonOverheadGroup{}
 	candidates := daemonPodTemplateCandidates(ctx, nct, daemonSetPods)
+	memo := newDaemonPodMemo()
 	for _, it := range nct.InstanceTypeOptions {
 		compatible := lo.FilterMap(candidates, func(c daemonPodCandidate, _ int) (*corev1.Pod, bool) {
 			return c.pod, c.fits(it)
 		})
 		// Instance types with the same compatible daemon pods can still differ in overhead when they permit
 		// different label values (see daemonoverhead.go), so the overhead is part of the grouping key.
-		overhead, truncated := computeDaemonOverhead(candidateRequirements(nct, it), compatible)
+		overhead, truncated := computeDaemonOverheadWithMemo(candidateRequirements(nct, it), compatible, memo)
 		if truncated {
 			log.FromContext(ctx).Info("daemon overhead realization space exceeded limit, reserving the sum of all compatible daemon pods",
 				"NodePool", klog.KRef("", nct.NodePoolName), "instance-type", it.Name, "daemon-pods", len(compatible), "limit", daemonOverheadRealizationLimit)
