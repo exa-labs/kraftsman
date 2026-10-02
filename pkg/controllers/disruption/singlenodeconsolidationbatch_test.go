@@ -566,6 +566,26 @@ var _ = Describe("Batched Single-Node Consolidation", func() {
 		Expect(admissionFailures(disruption.AdmissionStageValidation, "scheduling")).To(Equal(rejected))
 	})
 
+	It("does not wait on NodeClaims the pass did not create", func() {
+		applyNodes(4, "1")
+		// A NodeClaim some other controller created and the cloud provider has not launched yet.
+		unrelated := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+		unrelated.Status.ProviderID = ""
+		cluster.UpdateNodeClaim(unrelated)
+		Expect(cluster.Synced(ctx)).To(BeFalse())
+		stop := whileWaiting(false)
+		unlaunched := admissionFailures(disruption.AdmissionStageDeadline, "replacements_not_launched")
+
+		// Every proposal is a delete, so the commands admitted ahead of each one launched nothing it
+		// would be judged against.
+		cmds, err := singleNode.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidatesFor(singleNode)...)
+		stop()
+		Expect(err).To(Succeed())
+		Expect(cmds).To(HaveLen(3))
+		Expect(admissionFailures(disruption.AdmissionStageDeadline, "replacements_not_launched")).To(Equal(unlaunched))
+		cluster.DeleteNodeClaim(unrelated.Name)
+	})
+
 	It("starts every command exactly once when the controller runs the pass", func() {
 		applyNodes(4, "1")
 		controller := disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
