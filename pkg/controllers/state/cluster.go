@@ -62,6 +62,7 @@ type Cluster struct {
 	bindings                  map[types.NamespacedName]string // pod namespaced named -> node name
 	nodeNameToProviderID      map[string]string               // node name -> provider id
 	nodeClaimNameToProviderID map[string]string               // node claim name -> provider id
+	unlaunchedNodeClaims      map[string]UnlaunchedNodeClaim  // node claim name -> launch progress, while it has no provider id
 	nodePoolResources         map[string]corev1.ResourceList  // node pool name -> resource list
 	daemonSetPods             sync.Map                        // daemonSet -> existing pod
 
@@ -112,6 +113,7 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		daemonSetPods:             sync.Map{},
 		nodeNameToProviderID:      map[string]string{},
 		nodeClaimNameToProviderID: map[string]string{},
+		unlaunchedNodeClaims:      map[string]UnlaunchedNodeClaim{},
 		nodePoolResources:         map[string]corev1.ResourceList{},
 
 		NodePoolState: NewNodePoolState(),
@@ -228,6 +230,64 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 		c.hasSynced.Store(true)
 	}
 	return synced
+}
+
+// UnlaunchedNodeClaim is what cluster state records about a NodeClaim that has no provider ID yet,
+// which is what decides whether a caller can act without waiting for it to launch.
+type UnlaunchedNodeClaim struct {
+	Name string
+	// Deleting is set once the NodeClaim has a deletion timestamp. An unlaunched NodeClaim that is
+	// deleting will never become a node: an insufficient-capacity launch deletes its NodeClaim.
+	Deleting bool
+	// LaunchAttemptReason is the reason a launch attempt left on the Launched condition without
+	// launching: a cloud provider deferral or a failed launch, both retried later. It is empty until
+	// the first attempt answers.
+	LaunchAttemptReason string
+}
+
+// newUnlaunchedNodeClaim records the launch progress of a NodeClaim without a provider ID. It reads
+// the conditions directly: StatusConditions() fills in missing conditions, which would mutate the
+// informer's cached object.
+func newUnlaunchedNodeClaim(nodeClaim *v1.NodeClaim) UnlaunchedNodeClaim {
+	u := UnlaunchedNodeClaim{
+		Name:     nodeClaim.Name,
+		Deleting: !nodeClaim.DeletionTimestamp.IsZero(),
+	}
+	for _, cond := range nodeClaim.Status.Conditions {
+		if cond.Type != v1.ConditionTypeLaunched || cond.Status == metav1.ConditionTrue {
+			continue
+		}
+		if cond.Reason != "" && cond.Reason != awaitingReconciliationReason {
+			u.LaunchAttemptReason = cond.Reason
+		}
+	}
+	return u
+}
+
+// awaitingReconciliationReason is the reason operatorpkg's ConditionSet.SetUnknown gives a
+// condition that no controller has set yet.
+const awaitingReconciliationReason = "AwaitingReconciliation"
+
+// UnlaunchedNodeClaims returns every NodeClaim in cluster state that has no provider ID yet. These
+// are the NodeClaims that hold Synced false once cluster state has hydrated.
+func (c *Cluster) UnlaunchedNodeClaims() []UnlaunchedNodeClaim {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var unlaunched []UnlaunchedNodeClaim
+	for name, providerID := range c.nodeClaimNameToProviderID {
+		if providerID != "" {
+			continue
+		}
+		u, ok := c.unlaunchedNodeClaims[name]
+		if !ok {
+			// Both maps are written together, so this cannot happen; an entry with only a name
+			// carries no evidence that its launch has stopped, and no caller may skip it on that basis.
+			u = UnlaunchedNodeClaim{Name: name}
+		}
+		unlaunched = append(unlaunched, u)
+	}
+	return unlaunched
 }
 
 // ForPodsWithAntiAffinity calls the supplied function once for each pod with required anti affinity terms that is
@@ -402,6 +462,11 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 	// If the nodeclaim hasn't launched yet, we want to add it into cluster state to ensure
 	// that we're not racing with the internal cache for the cluster, assuming the node doesn't exist.
 	c.nodeClaimNameToProviderID[nodeClaim.Name] = nodeClaim.Status.ProviderID
+	if nodeClaim.Status.ProviderID == "" {
+		c.unlaunchedNodeClaims[nodeClaim.Name] = newUnlaunchedNodeClaim(nodeClaim)
+	} else {
+		delete(c.unlaunchedNodeClaims, nodeClaim.Name)
+	}
 	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
@@ -692,6 +757,7 @@ func (c *Cluster) Reset() {
 	c.nodes = map[string]*StateNode{}
 	c.nodeNameToProviderID = map[string]string{}
 	c.nodeClaimNameToProviderID = map[string]string{}
+	c.unlaunchedNodeClaims = map[string]UnlaunchedNodeClaim{}
 	c.NodePoolState.Reset()
 	c.nodePoolResources = map[string]corev1.ResourceList{}
 	c.bindings = map[types.NamespacedName]string{}
@@ -796,6 +862,7 @@ func (c *Cluster) cleanupNodeClaim(name string) {
 	// yet. This ensures that if a nodeClaim is created and then deleted before it was able to launch that
 	// this is cleaned up.
 	delete(c.nodeClaimNameToProviderID, name)
+	delete(c.unlaunchedNodeClaims, name)
 
 	// Delete the NodeClaim that is tracked in NodePoolState
 	c.NodePoolState.Cleanup(name)

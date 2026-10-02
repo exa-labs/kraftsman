@@ -233,6 +233,16 @@ var (
 		},
 		[]string{metrics.ReasonLabel, ConsolidationTypeLabel},
 	)
+	UnlaunchedNodeClaimSyncChecksTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "unlaunched_nodeclaim_sync_checks_total",
+			Help:      "Number of disruption loop sync checks that found a NodeClaim without a provider ID. The controller rechecks about once a second while it waits, so the waited count approximates seconds of stalled disruption. Labeled by reason, the class of unlaunched NodeClaim that needs the loosest disruption sync policy to skip (deleting, launch_failed, launch_deferred, in_flight, replacement, or not_hydrated before cluster state first syncs), and outcome, proceeded when the configured policy skipped every unlaunched NodeClaim present or waited otherwise.",
+		},
+		[]string{reasonLabel, outcomeLabel},
+	)
 	DecisionsPerformedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{

@@ -77,6 +77,7 @@ var _ = Describe("Options", func() {
 		"CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS",
 		"OD_TO_SPOT_CONSOLIDATION_SHADOW",
 		"NODECLAIM_INITIALIZATION_TIMEOUT_SHADOW",
+		"DISRUPTION_SYNC_POLICY",
 	}
 
 	BeforeEach(func() {
@@ -412,6 +413,33 @@ var _ = Describe("Options", func() {
 		})
 		It("should fail validation when consolidation-split-shadow-max-replacements is below 2", func() {
 			Expect(opts.Parse(fs, "--consolidation-split-shadow-max-replacements=1")).ToNot(Succeed())
+		})
+
+		It("should default the disruption sync policy to Strict", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.DisruptionSyncPolicy).To(Equal(options.DisruptionSyncPolicyStrict))
+		})
+		It("should set the disruption sync policy via the environment variable", func() {
+			os.Setenv("DISRUPTION_SYNC_POLICY", "IgnoreFailedOrDeferred")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.DisruptionSyncPolicy).To(Equal(options.DisruptionSyncPolicyIgnoreFailedOrDeferred))
+		})
+		It("should set the disruption sync policy via the CLI flag", func() {
+			Expect(opts.Parse(fs, "--disruption-sync-policy=IgnoreNonReplacements")).To(Succeed())
+			Expect(opts.DisruptionSyncPolicy).To(Equal(options.DisruptionSyncPolicyIgnoreNonReplacements))
+		})
+		It("should fail validation for an unknown disruption sync policy", func() {
+			Expect(opts.Parse(fs, "--disruption-sync-policy=IgnoreEverything")).ToNot(Succeed())
+		})
+		It("should refuse IgnoreNonReplacements without replacement attribution", func() {
+			Expect(opts.Parse(fs, "--disruption-sync-policy=IgnoreNonReplacements", "--consolidation-attribute-replacements=false")).ToNot(Succeed())
+		})
+		It("should allow IgnoreFailedOrDeferred without replacement attribution", func() {
+			Expect(opts.Parse(fs, "--disruption-sync-policy=IgnoreFailedOrDeferred", "--consolidation-attribute-replacements=false")).To(Succeed())
 		})
 
 		It("should default spot-to-spot-min-instance-types to 15", func() {

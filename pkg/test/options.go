@@ -69,6 +69,7 @@ type OptionsFields struct {
 	ConsolidationSkipUnchangedNegatives     *bool
 	ConsolidationNegativeCacheTTL           *time.Duration
 	DisruptionUnprovisionablePodTTL         *time.Duration
+	DisruptionSyncPolicy                    *options.DisruptionSyncPolicy
 	NodeClaimInitializationTimeout          *time.Duration
 	NodeClaimInitializationTimeoutShadow    *bool
 	ODToSpotConsolidation                   *bool
@@ -136,6 +137,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		ConsolidationSkipUnchangedNegatives:  lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
 		ConsolidationNegativeCacheTTL:        lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
 		DisruptionUnprovisionablePodTTL:      lo.FromPtrOr(opts.DisruptionUnprovisionablePodTTL, 2*time.Minute),
+		DisruptionSyncPolicy:                 lo.FromPtrOr(opts.DisruptionSyncPolicy, options.DisruptionSyncPolicyStrict),
 		NodeClaimInitializationTimeout:       lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
 		NodeClaimInitializationTimeoutShadow: lo.FromPtrOr(opts.NodeClaimInitializationTimeoutShadow, false),
 		ODToSpotConsolidation:                lo.FromPtrOr(opts.ODToSpotConsolidation, false),
