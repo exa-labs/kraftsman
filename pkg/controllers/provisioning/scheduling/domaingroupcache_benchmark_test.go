@@ -46,6 +46,17 @@ func BenchmarkDomainGroupsCacheWithRevisions(b *testing.B) {
 	benchmarkDomainGroups(b, true, true)
 }
 
+// BenchmarkDomainGroupsFleet builds domain groups from scratch for a production-shaped fleet (see
+// constructionfleet_test.go): 33 NodePools over a ~700 type catalog, what every cache miss and every
+// provisioning loop pays.
+func BenchmarkDomainGroupsFleet(b *testing.B) {
+	fleet := newConstructionFleet(33, 700)
+	b.ResetTimer()
+	for b.Loop() {
+		buildDomainGroups(fleet.nodePools, fleet.instanceTypes)
+	}
+}
+
 // benchmarkDomainGroups approximates a production-shaped input: several NodePools, each resolving
 // hundreds of instance types with multi-zone spot and on-demand offerings.
 func benchmarkDomainGroups(b *testing.B, useCache bool, useRevisions bool) {
