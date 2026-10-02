@@ -64,6 +64,15 @@ func daemonOverheadBenchmarkFleet(pools, instanceTypes, generalDaemons, scopedDa
 
 func BenchmarkBuildDaemonOverheadGroups(b *testing.B) {
 	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
+	// A production-shaped fleet (see constructionfleet_test.go): 33 NodePools over a ~700 type catalog.
+	b.Run("fleet/uncached", func(b *testing.B) {
+		fleet := newConstructionFleet(33, 700)
+		templates := fleet.templates(ctx)
+		b.ResetTimer()
+		for b.Loop() {
+			buildDaemonOverheadGroups(ctx, nil, templates, fleet.daemonSetPods)
+		}
+	})
 	for _, bc := range []struct {
 		name                   string
 		general, scopedDaemons int
