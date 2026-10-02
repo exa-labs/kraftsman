@@ -243,6 +243,28 @@ var _ = Describe("Provisioning", func() {
 		ExpectPodsScheduled(ctx, env.Client, pods...)
 		ExpectMetricHistogramSampleCountValue("karpenter_pods_scheduling_decision_duration_seconds", 100, nil)
 	})
+	It("should reuse domain groups and daemon overhead groups across provisioning loops", func() {
+		cloudProvider.InstanceTypesRevision = 1
+		ExpectApplied(ctx, env.Client, test.NodePool())
+		cacheEvents := func(metric, outcome string) float64 {
+			m, ok := FindMetricWithLabelValues(metric, map[string]string{"outcome": outcome})
+			if !ok {
+				return 0
+			}
+			return m.GetCounter().GetValue()
+		}
+		const domainGroupEvents, overheadGroupEvents = "karpenter_scheduler_domain_group_cache_events_total", "karpenter_scheduler_daemon_overhead_group_cache_events_total"
+		first := test.UnschedulablePod()
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, first)
+		domainGroupHits, overheadGroupCrossLoopHits := cacheEvents(domainGroupEvents, "hit"), cacheEvents(overheadGroupEvents, "hit_cross_pass")
+
+		second := test.UnschedulablePod()
+		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, second)
+		Expect(cacheEvents(domainGroupEvents, "hit")).To(BeNumerically(">", domainGroupHits))
+		Expect(cacheEvents(overheadGroupEvents, "hit_cross_pass")).To(BeNumerically(">", overheadGroupCrossLoopHits))
+		ExpectScheduled(ctx, env.Client, first)
+		ExpectScheduled(ctx, env.Client, second)
+	})
 	It("should expect nodeclaim terminationGracePeriod to be the global value when the nodepool terminationGracePeriod is not set", func() {
 		nodePool := test.NodePool()
 		pscheduling.DefaultTerminationGracePeriod = &metav1.Duration{Duration: 98 * time.Hour}
