@@ -146,6 +146,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if !verdict.Proceed {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
+	ctx = withCapacityInFlight(ctx, verdict)
 
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.

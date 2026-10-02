@@ -19,6 +19,7 @@ package state_test
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -72,6 +73,25 @@ var _ = Describe("Unlaunched NodeClaims", func() {
 		nodeClaim.Status.Conditions = nil
 		cluster.UpdateNodeClaim(nodeClaim)
 		Expect(nodeClaim.Status.Conditions).To(BeEmpty())
+	})
+	It("should record that the pods a NodeClaim was created for are recorded", func() {
+		nodeClaim := unlaunched()
+		cluster.UpdateNodeClaim(nodeClaim)
+		Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: nodeClaim.Name}))
+
+		pod := test.Pod()
+		cluster.UpdatePodToNodeClaimMapping(map[string][]*corev1.Pod{nodeClaim.Name: {pod}})
+		Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: nodeClaim.Name, PodsRecorded: true}))
+		Expect(cluster.PodNodeClaimMapping(client.ObjectKeyFromObject(pod))).To(Equal(nodeClaim.Name))
+	})
+	It("should forget the record when the NodeClaim is deleted", func() {
+		nodeClaim := unlaunched()
+		cluster.UpdateNodeClaim(nodeClaim)
+		cluster.UpdatePodToNodeClaimMapping(map[string][]*corev1.Pod{nodeClaim.Name: {test.Pod()}})
+		cluster.DeleteNodeClaim(nodeClaim.Name)
+		// A NodeClaim recreated under the same name starts without a record.
+		cluster.UpdateNodeClaim(nodeClaim)
+		Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: nodeClaim.Name}))
 	})
 	It("should drop a NodeClaim once it launches", func() {
 		nodeClaim := unlaunched()

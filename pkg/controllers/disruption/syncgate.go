@@ -19,21 +19,31 @@ limitations under the License.
 // Cluster state counts as synced only when every NodeClaim has a provider ID. The gate exists for
 // disruption commands: a replacement NodeClaim is not a node in cluster state until it launches, and
 // a pass that runs before then sees the command's candidates marked for deletion with no capacity
-// for their pods, so its simulation launches that capacity again. A NodeClaim that is not a pending
-// replacement cannot cause that. It is not in the simulation's node set whether or not the pass
-// waits for it, so skipping it only lets the pods bound for it count as pending, which is how a
-// pass sees any pod the provisioner has not launched capacity for yet.
+// for their pods, so its simulation launches that capacity again.
 //
-// The policy (options.DisruptionSyncPolicy) chooses which of those NodeClaims a pass may skip. Every
-// check that found cluster state unsynced is classified and counted whatever the policy, so a
-// looser policy's effect is measurable before it is enabled.
+// Any other unlaunched NodeClaim poses the same hazard to the pods it was created for: they are
+// pending, or on a deleting node, and a simulation that sees them without the NodeClaim launches
+// capacity for them a second time, inside a command that only accounts for the candidate. So a pass
+// may skip such a NodeClaim only when it can leave those pods out of its simulations: the
+// provisioner records them when it creates the NodeClaim (Cluster.PodNodeClaimMapping), and a
+// NodeClaim without that record is waited on. The pods left out neither take room on existing
+// nodes nor open or share a simulated NodeClaim; once the NodeClaim launches or is deleted they are
+// simulated again. A NodeClaim that is deleting before it launched will never host its pods, so it
+// is skipped without leaving them out: they have no capacity coming, which is what the strict gate
+// shows a pass a moment later, once the NodeClaim is gone.
+//
+// The policy (options.DisruptionSyncPolicy) chooses which NodeClaims a pass may skip. Every check
+// that found cluster state unsynced is classified and counted whatever the policy, so a looser
+// policy's effect is measurable before it is enabled.
 
 package disruption
 
 import (
 	"context"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -45,6 +55,9 @@ const (
 	// unlaunchedReplacement is a disruption replacement: annotated with its origin by the queue, or
 	// named by an in-flight command.
 	unlaunchedReplacement = "replacement"
+	// unlaunchedUnrecorded is a NodeClaim that will still launch but whose pods are not recorded, so
+	// a pass could not leave them out of its simulations; as after a controller restart.
+	unlaunchedUnrecorded = "pods_unrecorded"
 	// unlaunchedInFlight is any other NodeClaim whose launch has not answered yet, usually the
 	// provisioner's.
 	unlaunchedInFlight = "in_flight"
@@ -77,7 +90,8 @@ var unlaunchedClassRank = map[string]int{
 	unlaunchedLaunchFailed:   2,
 	unlaunchedLaunchDeferred: 3,
 	unlaunchedInFlight:       4,
-	unlaunchedReplacement:    5,
+	unlaunchedUnrecorded:     5,
+	unlaunchedReplacement:    6,
 }
 
 // skippableUnder reports whether a policy lets a pass skip NodeClaims of the class.
@@ -96,13 +110,16 @@ func skippableUnder(policy options.DisruptionSyncPolicy, class string) bool {
 // replacement still has a command waiting on it, and that command's candidates stay marked for
 // deletion until the queue notices the replacement is gone. The annotation covers the window between
 // the queue creating a replacement and registering its command; the queue's names cover a
-// replacement created without the annotation.
+// replacement created without the annotation. A NodeClaim that will still launch is unrecorded
+// until the pods it was created for are recorded.
 func classifyUnlaunched(nodeClaim state.UnlaunchedNodeClaim, replacements sets.Set[string]) string {
 	switch {
 	case nodeClaim.Replacement || replacements.Has(nodeClaim.Name):
 		return unlaunchedReplacement
 	case nodeClaim.Deleting:
 		return unlaunchedDeleting
+	case !nodeClaim.PodsRecorded:
+		return unlaunchedUnrecorded
 	case nodeClaim.LaunchAttemptReason == launchFailedReason:
 		return unlaunchedLaunchFailed
 	case nodeClaim.LaunchAttemptReason != "":
@@ -119,20 +136,28 @@ type syncVerdict struct {
 	// Reason is empty when cluster state was strictly synced. Otherwise it is the highest-ranked
 	// class of the unlaunched NodeClaims present, or stateNotHydrated.
 	Reason string
+	// CapacityInFlight names the skipped NodeClaims that will still launch. The pass leaves the
+	// pods recorded against them out of its simulations.
+	CapacityInFlight sets.Set[string]
 }
 
 // judgeUnlaunched decides whether a pass may proceed past the given unlaunched NodeClaims under the
 // policy. It is pure so the policy's semantics are testable without a cluster.
 func judgeUnlaunched(policy options.DisruptionSyncPolicy, unlaunched []state.UnlaunchedNodeClaim, replacements sets.Set[string]) syncVerdict {
-	verdict := syncVerdict{Proceed: true}
+	verdict := syncVerdict{Proceed: true, CapacityInFlight: sets.New[string]()}
 	for _, nodeClaim := range unlaunched {
 		class := classifyUnlaunched(nodeClaim, replacements)
 		if !skippableUnder(policy, class) {
 			verdict.Proceed = false
+		} else if class != unlaunchedDeleting {
+			verdict.CapacityInFlight.Insert(nodeClaim.Name)
 		}
 		if unlaunchedClassRank[class] > unlaunchedClassRank[verdict.Reason] {
 			verdict.Reason = class
 		}
+	}
+	if !verdict.Proceed {
+		verdict.CapacityInFlight = sets.New[string]()
 	}
 	return verdict
 }
@@ -166,4 +191,44 @@ func (v syncVerdict) record() {
 		outcome = syncOutcomeProceeded
 	}
 	UnlaunchedNodeClaimSyncChecksTotal.Inc(map[string]string{reasonLabel: v.Reason, outcomeLabel: outcome})
+}
+
+type capacityInFlightKey struct{}
+
+// withCapacityInFlight scopes the verdict's skipped NodeClaims to the pass, so every simulation the
+// pass runs, validation included, leaves out the same pods.
+func withCapacityInFlight(ctx context.Context, verdict syncVerdict) context.Context {
+	if verdict.CapacityInFlight.Len() == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, capacityInFlightKey{}, verdict.CapacityInFlight)
+}
+
+// withoutCapacityInFlight returns the pods that are not recorded against a NodeClaim the pass
+// skipped and that is still launching. A NodeClaim that has since launched is a node in cluster
+// state, and one that has since been deleted will never host its pods: either way its pods are
+// simulated again. Callers pass pending pods and pods on deleting nodes, never a candidate's pods,
+// which need capacity of their own whatever the provisioner planned for them.
+func withoutCapacityInFlight(ctx context.Context, cluster *state.Cluster, pods []*corev1.Pod) (kept, excluded []*corev1.Pod) {
+	skipped, _ := ctx.Value(capacityInFlightKey{}).(sets.Set[string])
+	if skipped.Len() == 0 || len(pods) == 0 {
+		return pods, nil
+	}
+	launching := sets.New[string]()
+	for _, nodeClaim := range cluster.UnlaunchedNodeClaims() {
+		if skipped.Has(nodeClaim.Name) && !nodeClaim.Deleting {
+			launching.Insert(nodeClaim.Name)
+		}
+	}
+	if launching.Len() == 0 {
+		return pods, nil
+	}
+	for _, pod := range pods {
+		if launching.Has(cluster.PodNodeClaimMapping(client.ObjectKeyFromObject(pod))) {
+			excluded = append(excluded, pod)
+		} else {
+			kept = append(kept, pod)
+		}
+	}
+	return kept, excluded
 }

@@ -65,6 +65,9 @@ import (
 const (
 	simulationPodsDispositionSimulated = "simulated"
 	simulationPodsDispositionExcluded  = "excluded_unprovisionable"
+	// simulationPodsDispositionCapacityInFlight counts the pending pods and pods on deleting nodes
+	// left out because a NodeClaim the pass's sync check skipped is already launching for them.
+	simulationPodsDispositionCapacityInFlight = "excluded_capacity_in_flight"
 
 	// unprovisionablePodsLogInterval spaces the Info-level log of excluded pods. The gauge carries
 	// the continuous signal; the log is a periodic, sampled confirmation of which pods it counts.

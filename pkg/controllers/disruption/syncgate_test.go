@@ -47,9 +47,10 @@ var _ = Describe("Disruption Sync Policy", func() {
 	withPolicy := func(policy options.DisruptionSyncPolicy) {
 		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{DisruptionSyncPolicy: lo.ToPtr(policy)}))
 	}
-	// applyUnlaunched creates a NodeClaim without a provider ID in the NodePool and informs cluster
-	// state about it, the way the provisioner's create and the NodeClaim informer do.
-	applyUnlaunched := func(np *v1.NodePool, mutate func(*v1.NodeClaim)) *v1.NodeClaim {
+	// applyUnrecorded creates a NodeClaim without a provider ID in the NodePool and informs cluster
+	// state about it, as the NodeClaim informer does, with no record of the pods it was created for:
+	// a NodeClaim created before a controller restart.
+	applyUnrecorded := func(np *v1.NodePool, mutate func(*v1.NodeClaim)) *v1.NodeClaim {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: np.Name}}})
 		nodeClaim.Status.ProviderID = ""
 		if mutate != nil {
@@ -57,6 +58,13 @@ var _ = Describe("Disruption Sync Policy", func() {
 		}
 		ExpectApplied(ctx, env.Client, nodeClaim)
 		ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+		return nodeClaim
+	}
+	// applyUnlaunched does the same and records the pods the NodeClaim was created for, as the
+	// provisioner does when it creates one.
+	applyUnlaunched := func(np *v1.NodePool, mutate func(*v1.NodeClaim), pods ...*corev1.Pod) *v1.NodeClaim {
+		nodeClaim := applyUnrecorded(np, mutate)
+		cluster.UpdatePodToNodeClaimMapping(map[string][]*corev1.Pod{nodeClaim.Name: pods})
 		return nodeClaim
 	}
 	// markDeleting gives the NodeClaim a deletion timestamp that a finalizer holds open, as the
@@ -203,7 +211,7 @@ var _ = Describe("Disruption Sync Policy", func() {
 			Expect(queue.ReplacementNames().Has(cmd.Replacements[0].Name)).To(BeTrue())
 			// The queue annotates the replacement before creating it, so cluster state knows it is one
 			// from its first record, before the command enters the queue.
-			Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: cmd.Replacements[0].Name, Replacement: true}))
+			Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: cmd.Replacements[0].Name, Replacement: true, PodsRecorded: true}))
 		})
 
 		It("waits for it under every policy while it launches", func() {
@@ -317,7 +325,7 @@ var _ = Describe("Disruption Sync Policy", func() {
 		})
 
 		It("waits for it under Strict and IgnoreFailedOrDeferred", func() {
-			applyUnlaunched(backlogNodePool, nil)
+			applyUnlaunched(backlogNodePool, nil, backlogPods...)
 			for _, policy := range []options.DisruptionSyncPolicy{options.DisruptionSyncPolicyStrict, options.DisruptionSyncPolicyIgnoreFailedOrDeferred} {
 				withPolicy(policy)
 				ExpectSingletonReconciled(ctx, disruptionController)
@@ -327,15 +335,15 @@ var _ = Describe("Disruption Sync Policy", func() {
 		})
 		It("drifts the node under IgnoreNonReplacements without launching capacity for the backlog again", func() {
 			withPolicy(options.DisruptionSyncPolicyIgnoreNonReplacements)
-			inFlight := applyUnlaunched(backlogNodePool, nil)
+			inFlight := applyUnlaunched(backlogNodePool, nil, backlogPods...)
 
 			ExpectSingletonReconciled(ctx, disruptionController)
 			ExpectMetricCounterValue(disruption.UnlaunchedNodeClaimSyncChecksTotal, 1, checks("in_flight", "proceeded"))
-			// The simulation saw the backlog as pending, as it sees any pod without launched capacity, and
-			// opened claims for it. Those host no disrupted pod, so the command does not own them.
+			// The backlog is left out of the simulation: its NodeClaim is already launching.
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Replacements).To(HaveLen(1))
+			Expect(lo.Map(cmds[0].Replacements[0].Pods, func(p *corev1.Pod, _ int) string { return p.Name })).To(ConsistOf(pod.Name))
 			backlogClaims := lo.Filter(ExpectNodeClaims(ctx, env.Client), func(nc *v1.NodeClaim, _ int) bool {
 				return nc.Labels[v1.NodePoolLabelKey] == backlogNodePool.Name
 			})

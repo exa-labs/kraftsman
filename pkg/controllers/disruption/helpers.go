@@ -80,6 +80,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
 	pods = excludeUnprovisionablePods(ctx, cluster, clk, pods)
+	// Pods the provisioner is already launching capacity for, on a NodeClaim the pass's sync check
+	// skipped, are left out: a simulation that saw them would launch that capacity again.
+	pods, excludedPending := withoutCapacityInFlight(ctx, cluster, pods)
 
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
@@ -105,6 +108,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
 	}
+	deletingNodePods, excludedDeleting := withoutCapacityInFlight(ctx, cluster, deletingNodePods)
+	SimulationPendingPods.Set(float64(len(excludedPending)+len(excludedDeleting)), map[string]string{dispositionLabel: simulationPodsDispositionCapacityInFlight})
 	pods = append(pods, deletingNodePods...)
 	endPodGather()
 

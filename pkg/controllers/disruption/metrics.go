@@ -459,7 +459,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "simulation_pending_pods",
-			Help:      "Number of pending pods the latest disruption scheduling simulation received from the provisioning backlog, by disposition: simulated pods entered the solve; excluded_unprovisionable pods were left out because the provisioner's most recent simulation found every NodePool incompatible with them, independent of cluster state, and that verdict is younger than DISRUPTION_UNPROVISIONABLE_POD_TTL.",
+			Help:      "Number of pending pods the latest disruption scheduling simulation received from the provisioning backlog, by disposition: simulated pods entered the solve; excluded_unprovisionable pods were left out because the provisioner's most recent simulation found every NodePool incompatible with them, independent of cluster state, and that verdict is younger than DISRUPTION_UNPROVISIONABLE_POD_TTL; excluded_capacity_in_flight pods, pending or on deleting nodes, were left out because a NodeClaim the pass's sync check skipped is already launching for them.",
 		},
 		[]string{dispositionLabel},
 	)

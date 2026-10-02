@@ -73,7 +73,10 @@ type Cluster struct {
 	podsSchedulableTimes            sync.Map // pod namespaced name -> time when it was first marked as able to fit to a node
 	podHealthyNodePoolScheduledTime sync.Map // pod namespaced name -> time when pod scheduled to a nodePool that has NodeRegistrationHealthy=true, is marked as able to fit to a node
 	podToNodeClaim                  sync.Map // pod namespaced name -> nodeClaim name
-	podsUnprovisionableTimes        sync.Map // pod namespaced name -> time of the latest provisioning simulation that found every NodePool incompatible with it
+	// nodeClaimPodsRecorded holds the name of every NodeClaim whose pod mapping UpdatePodToNodeClaimMapping
+	// has finished writing. It is stored after the claim's pods, so a reader that sees it sees them all.
+	nodeClaimPodsRecorded    sync.Map // nodeClaim name -> struct{}
+	podsUnprovisionableTimes sync.Map // pod namespaced name -> time of the latest provisioning simulation that found every NodePool incompatible with it
 
 	clusterStateMu sync.RWMutex // Separate mutex as this is called in some places that mu is held
 	// A monotonically increasing timestamp representing the time state of the
@@ -247,6 +250,10 @@ type UnlaunchedNodeClaim struct {
 	// launching: a cloud provider deferral or a failed launch, both retried later. It is empty until
 	// the first attempt answers.
 	LaunchAttemptReason string
+	// PodsRecorded is set once the pods the NodeClaim was created for are recorded in the pod to
+	// NodeClaim mapping (PodNodeClaimMapping). The provisioner records them when it creates the
+	// NodeClaim; the record lives in memory, so a NodeClaim created before a restart has none.
+	PodsRecorded bool
 }
 
 // newUnlaunchedNodeClaim records the launch progress of a NodeClaim without a provider ID. It reads
@@ -290,6 +297,7 @@ func (c *Cluster) UnlaunchedNodeClaims() []UnlaunchedNodeClaim {
 			// carries no evidence that its launch has stopped, and no caller may skip it on that basis.
 			u = UnlaunchedNodeClaim{Name: name}
 		}
+		_, u.PodsRecorded = c.nodeClaimPodsRecorded.Load(name)
 		unlaunched = append(unlaunched, u)
 	}
 	return unlaunched
@@ -622,6 +630,8 @@ func (c *Cluster) MarkPodSchedulingDecisions(ctx context.Context, podErrors map[
 	c.UpdatePodToNodeClaimMapping(ncPods)
 }
 
+// UpdatePodToNodeClaimMapping records the NodeClaim each pod was scheduled against, and then that
+// each NodeClaim's pods are recorded.
 func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 	for ncName, pods := range ncPods {
 		for _, p := range pods {
@@ -629,6 +639,7 @@ func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 			c.podToNodeClaim.Store(nn, ncName)
 			c.podsUnprovisionableTimes.Delete(nn)
 		}
+		c.nodeClaimPodsRecorded.Store(ncName, struct{}{})
 	}
 }
 
@@ -772,6 +783,7 @@ func (c *Cluster) Reset() {
 	c.podsSchedulingAttempted = sync.Map{}
 	c.podsSchedulableTimes = sync.Map{}
 	c.podsUnprovisionableTimes = sync.Map{}
+	c.nodeClaimPodsRecorded = sync.Map{}
 	c.bufferPodCounts = map[string]int{}
 }
 
@@ -868,6 +880,7 @@ func (c *Cluster) cleanupNodeClaim(name string) {
 	// this is cleaned up.
 	delete(c.nodeClaimNameToProviderID, name)
 	delete(c.unlaunchedNodeClaims, name)
+	c.nodeClaimPodsRecorded.Delete(name)
 
 	// Delete the NodeClaim that is tracked in NodePoolState
 	c.NodePoolState.Cleanup(name)
