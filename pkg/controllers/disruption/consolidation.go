@@ -400,7 +400,7 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 			if !simOpts.silent {
 				ObserveConsolidationODToSpotRetry(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
 			}
-			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, nil) {
+			if c.retrySpotOnlyReplacements(consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget, options.FromContext(ctx).SpotReplacementLaunchCap(), nil) {
 				cmd := Command{
 					Candidates:            candidates,
 					Replacements:          replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -488,7 +488,7 @@ func (c *consolidation) shadowODToSpotRetry(ctx context.Context, consolidationTy
 	ObserveConsolidationODToSpotShadow(consolidationType, candidates, ODToSpotRetryOutcomeArmed)
 	silentOpts := simOpts
 	silentOpts.silent = true
-	if c.retrySpotOnlyReplacements(consolidationType, silentOpts, candidates, newNodeClaims, snapshots, budget, options.FromContext(ctx).SpotToSpotMinInstanceTypes, func(outcome string) {
+	if c.retrySpotOnlyReplacements(consolidationType, silentOpts, candidates, newNodeClaims, snapshots, budget, options.FromContext(ctx).SpotReplacementLaunchCap(), func(outcome string) {
 		ObserveConsolidationODToSpotShadow(consolidationType, candidates, lo.Ternary(outcome == ODToSpotRetryOutcomeAdmitted, ODToSpotShadowOutcomeWouldAdmit, outcome))
 	}) {
 		log.FromContext(ctx).WithValues(
@@ -727,8 +727,11 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 	// If we had restricted instance types to min flexibility at launch at step (1) i.e CreateInstanceFromTypes(A,B,C), we would have received the instance type part of the list preventing immediate consolidation.
 	// The launch cap therefore follows the same configured minimum as the flexibility gate above: the launched
 	// instance is always within the cheapest set of that size, so it can never be immediately consolidated again.
+	// SPOT_TO_SPOT_LAUNCH_INSTANCE_TYPES may raise the cap above the minimum, trading that guarantee for launches
+	// that survive the cheapest type running out of spot capacity; every option kept still clears the savings margin.
+	launchCap := options.FromContext(ctx).SpotReplacementLaunchCap()
 	for _, nc := range results.NewNodeClaims {
-		truncateSpotInstanceTypeOptions(nc, minInstanceTypes)
+		truncateSpotInstanceTypeOptions(nc, launchCap)
 	}
 
 	cmd := Command{

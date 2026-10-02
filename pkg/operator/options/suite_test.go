@@ -72,6 +72,7 @@ var _ = Describe("Options", func() {
 		"SPOT_TO_SPOT_MIN_INSTANCE_TYPES",
 		"SPOT_TO_SPOT_MIN_NODE_AGE",
 		"SPOT_TO_SPOT_MIN_SAVINGS",
+		"SPOT_TO_SPOT_LAUNCH_INSTANCE_TYPES",
 		"CONSOLIDATION_REPLACE_MIN_SAVINGS",
 		"CONSOLIDATION_SPLIT_SHADOW",
 		"CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS",
@@ -436,6 +437,32 @@ var _ = Describe("Options", func() {
 
 		It("should fail validation when spot-to-spot-min-instance-types is below 1", func() {
 			Expect(opts.Parse(fs, "--spot-to-spot-min-instance-types=0")).ToNot(Succeed())
+		})
+
+		It("should cap spot replacement launches at spot-to-spot-min-instance-types by default", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-min-instance-types=2")).To(Succeed())
+			Expect(opts.SpotToSpotLaunchInstanceTypes).To(BeZero())
+			Expect(opts.SpotReplacementLaunchCap()).To(Equal(2))
+		})
+
+		It("should raise the spot replacement launch cap via the environment variable", func() {
+			os.Setenv("SPOT_TO_SPOT_MIN_INSTANCE_TYPES", "1")
+			os.Setenv("SPOT_TO_SPOT_LAUNCH_INSTANCE_TYPES", "5")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.SpotReplacementLaunchCap()).To(Equal(5))
+		})
+
+		It("should never cap spot replacement launches below spot-to-spot-min-instance-types", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-min-instance-types=4", "--spot-to-spot-launch-instance-types=2")).To(Succeed())
+			Expect(opts.SpotReplacementLaunchCap()).To(Equal(4))
+		})
+
+		It("should fail validation when spot-to-spot-launch-instance-types is negative", func() {
+			Expect(opts.Parse(fs, "--spot-to-spot-launch-instance-types=-1")).ToNot(Succeed())
 		})
 
 		It("should default spot-to-spot-min-node-age and spot-to-spot-min-savings to 0", func() {
