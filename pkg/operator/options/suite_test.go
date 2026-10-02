@@ -73,6 +73,7 @@ var _ = Describe("Options", func() {
 		"SPOT_TO_SPOT_MIN_NODE_AGE",
 		"SPOT_TO_SPOT_MIN_SAVINGS",
 		"CONSOLIDATION_REPLACE_MIN_SAVINGS",
+		"CONSOLIDATION_REPLACE_MIN_SAVINGS_PER_HOUR",
 		"CONSOLIDATION_SPLIT_SHADOW",
 		"CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS",
 		"OD_TO_SPOT_CONSOLIDATION_SHADOW",
@@ -483,6 +484,27 @@ var _ = Describe("Options", func() {
 			}
 			opts.AddFlags(fs)
 			Expect(opts.Parse(fs)).ToNot(Succeed())
+		})
+
+		It("should default consolidation-replace-min-savings-per-hour to 0", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationReplaceMinSavingsPerHour).To(BeZero())
+		})
+
+		It("should set consolidation-replace-min-savings-per-hour via the environment variable and the CLI flag", func() {
+			os.Setenv("CONSOLIDATION_REPLACE_MIN_SAVINGS_PER_HOUR", "0.001")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationReplaceMinSavingsPerHour).To(Equal(0.001))
+			Expect(opts.Parse(fs, "--consolidation-replace-min-savings-per-hour=0.01")).To(Succeed())
+			Expect(opts.ConsolidationReplaceMinSavingsPerHour).To(Equal(0.01))
+		})
+
+		It("should fail validation when consolidation-replace-min-savings-per-hour is negative", func() {
+			Expect(opts.Parse(fs, "--consolidation-replace-min-savings-per-hour=-0.01")).ToNot(Succeed())
 		})
 
 		It("should default consolidation-replace-min-savings to 0", func() {

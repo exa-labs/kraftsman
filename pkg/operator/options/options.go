@@ -118,6 +118,7 @@ type Options struct {
 	ConsolidationSplitMaxAttempts           int
 	ConsolidationSplitMinSavings            float64
 	ConsolidationReplaceMinSavings          float64
+	ConsolidationReplaceMinSavingsPerHour   float64
 	SpotToSpotMinInstanceTypes              int
 	SpotToSpotMinNodeAge                    time.Duration
 	SpotToSpotMinSavings                    float64
@@ -193,6 +194,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.DurationVar(&o.ConsolidationNegativeCacheTTL, "consolidation-negative-cache-ttl", env.WithDefaultDuration("CONSOLIDATION_NEGATIVE_CACHE_TTL", 5*time.Minute), "How long a cached no-op consolidation verdict remains valid. The fingerprint covers the candidate's own inputs; the TTL bounds what it cannot see, chiefly capacity elsewhere in the fleet freeing up: a verdict older than the TTL is never served. A fully no-op pass marks the fleet consolidated for up to five minutes whether or not caching is enabled, so a TTL below that does not make rechecks more frequent - it only tightens which verdicts the recheck may reuse.")
 	fs.BoolVarWithEnv(&o.ODToSpotConsolidation, "od-to-spot-consolidation", "OD_TO_SPOT_CONSOLIDATION", true, "When set, a consolidation candidate running on-demand whose replacement found nothing cheaper is re-evaluated against spot offerings only, restricted to the zones whose spot price beats the candidate. The replacement launch is pinned to spot and those zones, so insufficient spot capacity fails the launch instead of falling back to on-demand. Enabled by default; set to false to opt out.")
 	fs.BoolVarWithEnv(&o.ODToSpotConsolidationShadow, "od-to-spot-consolidation-shadow", "OD_TO_SPOT_CONSOLIDATION_SHADOW", false, "When set while od-to-spot-consolidation is off, the same spot-only re-pricing retry still runs on candidates the ordinary price filter emptied, silently, and its verdict is counted in consolidation_od_to_spot_shadow_total instead of producing a command. The skip events a candidate would have gotten without the retry are still published. The evidence to collect before enabling od-to-spot-consolidation.")
+	fs.Float64Var(&o.ConsolidationReplaceMinSavingsPerHour, "consolidation-replace-min-savings-per-hour", env.WithDefaultFloat64("CONSOLIDATION_REPLACE_MIN_SAVINGS_PER_HOUR", 0), "The hourly amount, in the cloud provider's price units, that any consolidation replacement must save before it is accepted, on top of consolidation-replace-min-savings. A fractional floor cannot stop replacements between offerings priced near zero - reserved capacity is priced at a tiny fraction of on-demand so that it is always preferred, which makes one reservation look 40% cheaper than another while both are already paid for - and this one does. Applies wherever consolidation-replace-min-savings does; delete decisions are unaffected. 0 adds nothing.")
 	fs.Float64Var(&o.ConsolidationReplaceMinSavings, "consolidation-replace-min-savings", env.WithDefaultFloat64("CONSOLIDATION_REPLACE_MIN_SAVINGS", 0), "The fraction of the disrupted nodes' price that any consolidation replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. Applies to every replace decision, including spot-to-spot and the split fallback (which uses the larger of this and consolidation-split-min-savings); delete decisions are unaffected. Replacement launches are also restricted to instance types that meet the margin. 0 accepts any cheaper replacement.")
 	fs.Float64Var(&o.ConsolidationSplitMinSavings, "consolidation-split-min-savings", env.WithDefaultFloat64("CONSOLIDATION_SPLIT_MIN_SAVINGS", 0.05), "The fraction of a candidate's price that a split replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. Guards against churning a node into several nodes for a negligible price difference.")
 	fs.DurationVar(&o.NodeClaimInitializationTimeout, "nodeclaim-initialization-timeout", env.WithDefaultDuration("NODECLAIM_INITIALIZATION_TIMEOUT", 0), "The maximum time a registered NodeClaim may stay uninitialized before it is deleted. Registration only means the kubelet joined; a node whose startup taints are never removed, or whose requested extended resources never appear, stays registered and uninitialized indefinitely, holding an instance that runs no workload and that disruption still models with its full capacity. A bootstrap that fails every time replaces one stranded instance with a delete and reprovision once per timeout, as the registration timeout already does, so set it well above the slowest healthy bootstrap. 0 disables the timeout.")
@@ -221,7 +223,7 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if o.CPURequests <= 0 {
 		o.CPURequests = 1000
 	}
-	if err := errors.Join(o.validateLeaderElection(), o.validateConsolidation()); err != nil {
+	if err := errors.Join(o.validateLeaderElection(), o.validateConsolidation(), o.validateReplaceMinSavingsPerHour()); err != nil {
 		return err
 	}
 	if !lo.Contains([]TopologyCountCacheMode{TopologyCountCacheModeOff, TopologyCountCacheModeShadow, TopologyCountCacheModeOn}, TopologyCountCacheMode(o.topologyCountCacheModeRaw)) {
@@ -283,6 +285,13 @@ func (o *Options) validateConsolidation() error {
 		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS must be in [0, 1), got %f", o.ConsolidationReplaceMinSavings)
 	}
 	return o.validateNegativeCache()
+}
+
+func (o *Options) validateReplaceMinSavingsPerHour() error {
+	if math.IsNaN(o.ConsolidationReplaceMinSavingsPerHour) || o.ConsolidationReplaceMinSavingsPerHour < 0 {
+		return fmt.Errorf("validating cli flags / env vars, CONSOLIDATION_REPLACE_MIN_SAVINGS_PER_HOUR must be >= 0, got %f", o.ConsolidationReplaceMinSavingsPerHour)
+	}
+	return nil
 }
 
 func (o *Options) validateSpotToSpot() error {

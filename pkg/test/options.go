@@ -61,6 +61,7 @@ type OptionsFields struct {
 	ConsolidationSplitMaxAttempts           *int
 	ConsolidationSplitMinSavings            *float64
 	ConsolidationReplaceMinSavings          *float64
+	ConsolidationReplaceMinSavingsPerHour   *float64
 	SpotToSpotMinInstanceTypes              *int
 	SpotToSpotMinNodeAge                    *time.Duration
 	SpotToSpotMinSavings                    *float64
@@ -126,6 +127,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		ConsolidationSplitMaxAttempts:           lo.FromPtrOr(opts.ConsolidationSplitMaxAttempts, 50),
 		ConsolidationSplitMinSavings:            lo.FromPtrOr(opts.ConsolidationSplitMinSavings, 0.05),
 		ConsolidationReplaceMinSavings:          lo.FromPtrOr(opts.ConsolidationReplaceMinSavings, 0),
+		ConsolidationReplaceMinSavingsPerHour:   lo.FromPtrOr(opts.ConsolidationReplaceMinSavingsPerHour, 0),
 		SpotToSpotMinInstanceTypes:              lo.FromPtrOr(opts.SpotToSpotMinInstanceTypes, 15),
 		SpotToSpotMinNodeAge:                    lo.FromPtrOr(opts.SpotToSpotMinNodeAge, 0),
 		SpotToSpotMinSavings:                    lo.FromPtrOr(opts.SpotToSpotMinSavings, 0),
