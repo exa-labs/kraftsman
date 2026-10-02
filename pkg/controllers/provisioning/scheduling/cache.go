@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,7 +29,9 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	resourcehelper "k8s.io/component-helpers/resource"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -108,18 +111,15 @@ func DaemonOverheadCacheFromContext(ctx context.Context) *DaemonOverheadCache {
 	return cache
 }
 
+// daemonSetPodsGeneration fingerprints the daemon pod set the daemon caches are computed from. It
+// changes whenever an input those caches read can change, and stays put across the differences
+// between pods of one DaemonSet (see daemonPodGenerationInputs): getDaemonSetPods stands in the
+// newest running pod for each DaemonSet, so on a growing or churning cluster the pod object
+// changes with every node that joins while nothing the caches read does.
 func daemonSetPodsGeneration(daemonSetPods []*corev1.Pod) (string, bool) {
 	entries := make([]string, len(daemonSetPods))
 	for i, pod := range daemonSetPods {
-		content, err := json.Marshal(struct {
-			Namespace string
-			Name      string
-			Spec      corev1.PodSpec
-		}{
-			Namespace: pod.Namespace,
-			Name:      pod.Name,
-			Spec:      pod.Spec,
-		})
+		content, err := json.Marshal(newDaemonPodGenerationInputs(pod))
 		if err != nil {
 			return "", false
 		}
@@ -128,6 +128,91 @@ func daemonSetPodsGeneration(daemonSetPods []*corev1.Pod) (string, bool) {
 	sort.Strings(entries)
 	sum := sha256.Sum256([]byte(strings.Join(entries, "\x01")))
 	return hex.EncodeToString(sum[:]), true
+}
+
+// daemonPodGenerationInputs is the part of a daemon pod the daemon caches depend on. The caches read
+// a daemon pod's tolerations, node selector and required node affinity (compatibility), its
+// containers, init containers, overhead and pod-level resources (requests, sidecar-aware), the
+// container status resources and resize condition that requests honor during an in-place resize,
+// its host ports and its resource claims. Everything a DaemonSet's pods hold individually is left
+// out, because none of it is read:
+//   - the pod's name and node binding: spec.nodeName, and the matchFields node affinity term the
+//     DaemonSet controller pins each pod to its node with (requirements ignore matchFields);
+//   - per-pod volumes, such as the projected service account token volume admission names with a
+//     random suffix, and the container mounts that reference them;
+//   - ephemeral (debug) containers, which do not count towards requests.
+//
+// The pod is identified by its namespace and owning DaemonSet, which is stable across its pods, or
+// by its name when it has no controller (getDaemonSetPods names template pods after their DaemonSet).
+// Cached values that carry a pod name (host port usage, the cached daemon pod list) only use it as a
+// label, so serving them for another pod of the same DaemonSet is equivalent. A new input read from
+// daemon pods by any daemon cache must be added here.
+type daemonPodGenerationInputs struct {
+	Namespace          string
+	DaemonSet          string
+	Spec               *corev1.PodSpec
+	StatusResources    []daemonPodStatusResources
+	ResizeInfeasible   bool
+	PodStatusResources *corev1.ResourceRequirements
+	PodAllocated       corev1.ResourceList
+}
+
+type daemonPodStatusResources struct {
+	Name      string
+	Resources *corev1.ResourceRequirements
+	Allocated corev1.ResourceList
+}
+
+func newDaemonPodGenerationInputs(pod *corev1.Pod) daemonPodGenerationInputs {
+	owner := pod.Name
+	if ref := metav1.GetControllerOf(pod); ref != nil {
+		owner = ref.Kind + "/" + ref.Name
+	}
+	spec := pod.Spec // shallow: every field cleared below is replaced, never written through
+	spec.NodeName = ""
+	spec.Volumes = nil
+	spec.EphemeralContainers = nil
+	spec.Containers = withoutVolumeMounts(pod.Spec.Containers)
+	spec.InitContainers = withoutVolumeMounts(pod.Spec.InitContainers)
+	if a := spec.Affinity; a != nil && a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		terms := slices.Clone(a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms)
+		for i := range terms {
+			terms[i].MatchFields = nil
+		}
+		nodeAffinity := *a.NodeAffinity
+		nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{NodeSelectorTerms: terms}
+		affinity := *a
+		affinity.NodeAffinity = &nodeAffinity
+		spec.Affinity = &affinity
+	}
+	var statusResources []daemonPodStatusResources
+	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
+		for _, cs := range statuses {
+			if cs.Resources != nil || len(cs.AllocatedResources) > 0 {
+				statusResources = append(statusResources, daemonPodStatusResources{Name: cs.Name, Resources: cs.Resources, Allocated: cs.AllocatedResources})
+			}
+		}
+	}
+	sort.SliceStable(statusResources, func(i, j int) bool { return statusResources[i].Name < statusResources[j].Name })
+	return daemonPodGenerationInputs{
+		Namespace:          pod.Namespace,
+		DaemonSet:          owner,
+		Spec:               &spec,
+		StatusResources:    statusResources,
+		ResizeInfeasible:   resourcehelper.IsPodResizeInfeasible(pod),
+		PodStatusResources: pod.Status.Resources,
+		PodAllocated:       pod.Status.AllocatedResources,
+	}
+}
+
+// withoutVolumeMounts returns a copy of containers without their volume mounts and devices.
+func withoutVolumeMounts(containers []corev1.Container) []corev1.Container {
+	out := slices.Clone(containers)
+	for i := range out {
+		out[i].VolumeMounts = nil
+		out[i].VolumeDevices = nil
+	}
+	return out
 }
 
 func nodeCacheKey(node *state.StateNode, ignoreDRA bool) (string, bool) {
