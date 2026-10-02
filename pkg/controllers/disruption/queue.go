@@ -32,6 +32,7 @@ import (
 	"golang.org/x/time/rate"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -434,6 +435,23 @@ func (q *Queue) HasAny(ids ...string) bool {
 		}
 	}
 	return false
+}
+
+// ReplacementNames returns the names of the replacement NodeClaims of every in-flight command. A
+// command's replacements are named before the command enters the queue, under the queue's lock.
+func (q *Queue) ReplacementNames() sets.Set[string] {
+	q.RLock()
+	defer q.RUnlock()
+
+	names := sets.New[string]()
+	for _, cmd := range q.ProviderIDToCommand {
+		for _, r := range cmd.Replacements {
+			if r.Name != "" {
+				names.Insert(r.Name)
+			}
+		}
+	}
+	return names
 }
 
 // For TESTING ONLY

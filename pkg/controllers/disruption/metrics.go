@@ -233,6 +233,16 @@ var (
 		},
 		[]string{metrics.ReasonLabel, ConsolidationTypeLabel},
 	)
+	UnlaunchedNodeClaimSyncChecksTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "unlaunched_nodeclaim_sync_checks_total",
+			Help:      "Number of disruption loop sync checks that found a NodeClaim without a provider ID. The controller rechecks about once a second while it waits, so the waited count approximates seconds of stalled disruption. Labeled by reason, the class of unlaunched NodeClaim that needs the loosest disruption sync policy to skip (deleting, launch_failed, launch_deferred, in_flight, replacement, or not_hydrated before cluster state first syncs), and outcome, proceeded when the configured policy skipped every unlaunched NodeClaim present or waited otherwise.",
+		},
+		[]string{reasonLabel, outcomeLabel},
+	)
 	DecisionsPerformedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{
@@ -449,7 +459,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "simulation_pending_pods",
-			Help:      "Number of pending pods the latest disruption scheduling simulation received from the provisioning backlog, by disposition: simulated pods entered the solve; excluded_unprovisionable pods were left out because the provisioner's most recent simulation found every NodePool incompatible with them, independent of cluster state, and that verdict is younger than DISRUPTION_UNPROVISIONABLE_POD_TTL.",
+			Help:      "Number of pending pods the latest disruption scheduling simulation received from the provisioning backlog, by disposition: simulated pods entered the solve; excluded_unprovisionable pods were left out because the provisioner's most recent simulation found every NodePool incompatible with them, independent of cluster state, and that verdict is younger than DISRUPTION_UNPROVISIONABLE_POD_TTL; excluded_capacity_in_flight pods, pending or on deleting nodes, were left out because a NodeClaim the pass's sync check skipped is already launching for them.",
 		},
 		[]string{dispositionLabel},
 	)

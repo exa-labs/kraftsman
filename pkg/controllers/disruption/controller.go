@@ -140,9 +140,13 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// We need to ensure that our internal cluster state mechanism is synced before we proceed
 	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
 	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
-	if !c.cluster.Synced(ctx) {
+	// The disruption sync policy may skip unlaunched NodeClaims that are not pending replacements.
+	verdict := checkDisruptionSync(ctx, c.cluster, c.queue)
+	verdict.record()
+	if !verdict.Proceed {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
+	ctx = withCapacityInFlight(ctx, verdict)
 
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.

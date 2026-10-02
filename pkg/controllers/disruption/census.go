@@ -80,9 +80,13 @@ func (c *CensusController) Register(_ context.Context, m manager.Manager) error 
 
 func (c *CensusController) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-	if !c.method.cluster.Synced(ctx) {
+	// The census mirrors the disruption loop's gate so it measures the passes that loop can run. It
+	// does not record the verdict: the loop's own checks are the ones the counter measures.
+	verdict := checkDisruptionSync(ctx, c.method.cluster, c.method.queue)
+	if !verdict.Proceed {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
+	ctx = withCapacityInFlight(ctx, verdict)
 	candidates, _, err := GetCandidatesWithTotals(ctx, c.method.cluster, c.method.kubeClient, c.method.recorder, c.method.clock,
 		c.method.cloudProvider, c.method.ShouldDisrupt, c.method.Class(), c.method.queue, nil)
 	if err != nil {
