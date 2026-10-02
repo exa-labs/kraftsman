@@ -465,6 +465,127 @@ var _ = Describe("Batched Single-Node Consolidation", func() {
 		Expect(admissionFailures(disruption.AdmissionStageValidation, "scheduling")).To(Equal(rejected + 1))
 	})
 
+	// replaceThenDelete builds a pass that holds a replace followed by a delete. The first candidate
+	// is an expensive node whose pod fits nowhere but a replacement; the second is a small node whose
+	// pod fits on a spare node. Between the two admissions the replace's NodeClaim exists but has not
+	// launched, so cluster state models it with no allocatable capacity, and a delete validated in
+	// that window would have to open a new NodeClaim for the replaced node's pod.
+	replaceThenDelete := func() (*disruption.SingleNodeConsolidation, []*disruption.Candidate) {
+		GinkgoHelper()
+		expensiveClaim, expensiveNode := nodeClaims[0], nodes[0]
+		for k, v := range map[string]string{
+			corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+			v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+			corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+		} {
+			expensiveClaim.Labels[k] = v
+			expensiveNode.Labels[k] = v
+		}
+		smallClaim, smallNode := nodeClaims[1], nodes[1]
+		smallClaim.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourcePods: resource.MustParse("100")}
+		smallNode.Status.Allocatable = smallClaim.Status.Allocatable
+		spareClaim, spareNode := nodeClaims[2], nodes[2]
+		for i, cpu := range []string{"3", "1.5", "30"} {
+			pod := podOn(cpu)
+			ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i], pod)
+			ExpectManualBinding(ctx, env.Client, pod, nodes[i])
+		}
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			[]*corev1.Node{expensiveNode, smallNode, spareNode}, []*v1.NodeClaim{expensiveClaim, smallClaim, spareClaim})
+
+		real := newSingleNodeConsolidation(immediateValidator{
+			inner: disruption.NewSingleConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)),
+		})
+		candidates := lo.Filter(candidatesFor(real), func(c *disruption.Candidate, _ int) bool {
+			return c.ProviderID() != spareClaim.Status.ProviderID
+		})
+		Expect(candidates).To(HaveLen(2))
+		return real, candidates
+	}
+
+	// whileWaiting stands in for the NodeClaim lifecycle controller and the passage of time: whenever
+	// the pass is blocked on the suite's fake clock it optionally launches every NodeClaim that has
+	// not launched yet, then advances the clock. The returned function stops it.
+	whileWaiting := func(launch bool) (stop func()) {
+		done, stopped := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer GinkgoRecover()
+			defer close(stopped)
+			for {
+				select {
+				case <-done:
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+				if !env.Clock.HasWaiters() {
+					continue
+				}
+				for _, nc := range ExpectNodeClaims(ctx, env.Client) {
+					if !launch || nc.Status.ProviderID != "" {
+						continue
+					}
+					deployed, err := ExpectNodeClaimDeployedNoNode(ctx, env.Client, cloudProvider, nc)
+					Expect(err).To(Succeed())
+					cluster.UpdateNodeClaim(deployed)
+				}
+				env.Clock.Step(time.Second)
+			}
+		}()
+		return func() { close(done); <-stopped }
+	}
+
+	It("validates a proposal held behind a replace once the replacement has launched", func() {
+		real, candidates := replaceThenDelete()
+		stop := whileWaiting(true)
+		rejected := admissionFailures(disruption.AdmissionStageValidation, "scheduling")
+
+		cmds, err := real.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidates...)
+		stop()
+		Expect(err).To(Succeed())
+		// The replace sorts first, so the delete is the proposal validated behind it.
+		Expect(cmds).To(HaveLen(2))
+		Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+		Expect(cmds[1].Decision()).To(Equal(disruption.DeleteDecision))
+		Expect(queue.GetCommands()).To(HaveLen(2))
+		Expect(admissionFailures(disruption.AdmissionStageValidation, "scheduling")).To(Equal(rejected))
+	})
+
+	It("stops admitting when an earlier command's replacement does not launch within the admission budget", func() {
+		real, candidates := replaceThenDelete()
+		stop := whileWaiting(false)
+		unlaunched := admissionFailures(disruption.AdmissionStageDeadline, "replacements_not_launched")
+		rejected := admissionFailures(disruption.AdmissionStageValidation, "scheduling")
+
+		cmds, err := real.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidates...)
+		stop()
+		Expect(err).To(Succeed())
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+		// The delete is left for a later pass rather than judged against a NodeClaim with no capacity.
+		Expect(admissionFailures(disruption.AdmissionStageDeadline, "replacements_not_launched")).To(Equal(unlaunched + 1))
+		Expect(admissionFailures(disruption.AdmissionStageValidation, "scheduling")).To(Equal(rejected))
+	})
+
+	It("does not wait on NodeClaims the pass did not create", func() {
+		applyNodes(4, "1")
+		// A NodeClaim some other controller created and the cloud provider has not launched yet.
+		unrelated := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+		unrelated.Status.ProviderID = ""
+		cluster.UpdateNodeClaim(unrelated)
+		Expect(cluster.Synced(ctx)).To(BeFalse())
+		stop := whileWaiting(false)
+		unlaunched := admissionFailures(disruption.AdmissionStageDeadline, "replacements_not_launched")
+
+		// Every proposal is a delete, so the commands admitted ahead of each one launched nothing it
+		// would be judged against.
+		cmds, err := singleNode.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidatesFor(singleNode)...)
+		stop()
+		Expect(err).To(Succeed())
+		Expect(cmds).To(HaveLen(3))
+		Expect(admissionFailures(disruption.AdmissionStageDeadline, "replacements_not_launched")).To(Equal(unlaunched))
+		cluster.DeleteNodeClaim(unrelated.Name)
+	})
+
 	It("starts every command exactly once when the controller runs the pass", func() {
 		applyNodes(4, "1")
 		controller := disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
