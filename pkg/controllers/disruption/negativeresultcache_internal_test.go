@@ -448,6 +448,29 @@ func TestInstanceTypesContentHashCoversOverridesAndDevices(t *testing.T) {
 	}
 }
 
+// TestInstanceTypesContentHashOrderWithSharedNames pins order-insensitivity when several instance
+// types share a name, as a provider with one backend per region returns them, in whatever order
+// its backends answered.
+func TestInstanceTypesContentHashOrderWithSharedNames(t *testing.T) {
+	inZone := func(zone, cpu string) *cloudprovider.InstanceType {
+		return fake.NewInstanceType("shared-name",
+			fake.WithOfferings(cloudprovider.Offering{
+				Available:    true,
+				Price:        1,
+				Requirements: scheduling.NewLabelRequirements(map[string]string{corev1.LabelTopologyZone: zone, v1.CapacityTypeLabelKey: "spot"}),
+			}),
+			fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)}),
+		)
+	}
+	x, y := inZone("zone-1", "4"), inZone("zone-2", "8")
+	if mustContentHash(t, []*cloudprovider.InstanceType{x, y}) != mustContentHash(t, []*cloudprovider.InstanceType{y, x}) {
+		t.Fatal("the order of instance types sharing a name changed the hash")
+	}
+	if mustContentHash(t, []*cloudprovider.InstanceType{x, x}) == mustContentHash(t, []*cloudprovider.InstanceType{x}) {
+		t.Fatal("a repeated instance type canceled out of the hash")
+	}
+}
+
 func reversed(instanceTypes []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {
 	slices.Reverse(instanceTypes)
 	return instanceTypes

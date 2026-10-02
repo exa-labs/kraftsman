@@ -17,7 +17,6 @@ limitations under the License.
 package disruption
 
 import (
-	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -392,17 +391,17 @@ var instanceTypeContentSeed = maphash.MakeSeed()
 // instanceTypesContentHash hashes what a consolidation verdict depends on in a list of instance
 // types: each type's name, capacity, overhead, requirements, DRA device metadata, and offering
 // capacity and overhead overrides together with the requirements of the offering they apply to,
-// in name order. Offering prices and availability are left out, and so are the type-level
+// combined order-insensitively. Offering prices and availability are left out, and so are the type-level
 // requirement keys offerings also carry (zone, capacity type, reservation): providers derive
 // those from which offerings are available, so they move with availability, and their changes
 // are bounded by the entry TTL like price moves.
 func instanceTypesContentHash(instanceTypes []*cloudprovider.InstanceType) (uint64, bool) {
-	sorted := slices.SortedFunc(slices.Values(instanceTypes), func(a, b *cloudprovider.InstanceType) int {
-		return cmp.Compare(a.Name, b.Name)
-	})
-	var hash maphash.Hash
-	hash.SetSeed(instanceTypeContentSeed)
-	for _, instanceType := range sorted {
+	// Each type is hashed on its own and the per-type hashes are summed, so the result does not
+	// depend on list order even when several types share a name (one per region or backend).
+	var combined uint64
+	for _, instanceType := range instanceTypes {
+		var hash maphash.Hash
+		hash.SetSeed(instanceTypeContentSeed)
 		hash.WriteString(instanceType.Name)
 		hash.WriteByte(0)
 		// Requirement hashes cover their own key, so summing them is an order-insensitive
@@ -429,8 +428,9 @@ func instanceTypesContentHash(instanceTypes []*cloudprovider.InstanceType) (uint
 			hash.WriteString(dump.ForHash(instanceType.DynamicResources))
 		}
 		hash.WriteByte(5)
+		combined += hash.Sum64()
 	}
-	return hash.Sum64(), true
+	return maphash.Comparable(instanceTypeContentSeed, [2]uint64{combined, uint64(len(instanceTypes))}), true
 }
 
 // offeringOverridesHash combines, order-insensitively, each offering's capacity and overhead
