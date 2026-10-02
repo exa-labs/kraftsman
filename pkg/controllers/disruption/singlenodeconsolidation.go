@@ -134,14 +134,20 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	maxCommands := options.FromContext(ctx).MaxConsolidationCommandsPerPass
 	skipUnchangedNegatives := options.FromContext(ctx).ConsolidationSkipUnchangedNegatives
 	negativeCacheTTL := options.FromContext(ctx).ConsolidationNegativeCacheTTL
+	// clearOnCommand selects how executed commands invalidate stored verdicts: by dropping them all,
+	// or by leaving them to the TTL that already bounds every other fleet-wide change.
+	clearOnCommand := options.FromContext(ctx).ConsolidationNegativeCacheClear
 	fingerprints := newNegativeCacheFingerprints(s.kubeClient, s.cloudProvider)
 	// A verdict of "nothing cheaper existed" holds only for the fleet it was computed against.
 	// Commands from every disruption method — multi-node consolidation, drift, emptiness,
-	// expiration — run through the queue and can free capacity that is invisible to a candidate's
-	// own fingerprint, so any completed command since the last pass empties the cache.
+	// expiration — run through the queue and can change capacity that is invisible to a
+	// candidate's own fingerprint, so with clearOnCommand any completed command since the last
+	// pass empties the cache.
 	if completed := s.queue.CompletedCommandCount(); completed != s.completedCommandsSeen {
 		s.completedCommandsSeen = completed
-		s.negativeResults.Clear()
+		if clearOnCommand {
+			s.negativeResults.Clear()
+		}
 	}
 	// Nodes that left the fleet are never looked up again, so their entries only leave the map
 	// here. The sweep runs after the candidate walk so a lookup still sees — and reports as
@@ -280,9 +286,10 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			}
 			outcome = PassOutcomeCompleted
 			ObserveAcceptedCandidate(cmd, s.ConsolidationType(), i)
-			// The command frees capacity every stored verdict was computed without; none of them
-			// can be trusted against the fleet this command leaves behind.
-			s.negativeResults.Clear()
+			// The command changes capacity every stored verdict was computed against.
+			if clearOnCommand {
+				s.negativeResults.Clear()
+			}
 			return []Command{cmd}, nil
 		}
 
@@ -301,7 +308,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	if len(proposals) > 0 {
 		admitted, err := s.admitProposals(ctx, proposals)
-		if len(admitted) > 0 {
+		if len(admitted) > 0 && clearOnCommand {
 			// Executed commands change the free capacity every stored verdict was computed against.
 			s.negativeResults.Clear()
 		}
