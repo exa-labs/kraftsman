@@ -1183,15 +1183,27 @@ func (s *Scheduler) sortExistingNodes() {
 	// Order the existing nodes for scheduling with initialized nodes first
 	// This is done specifically for consolidation where we want to make sure we schedule to initialized nodes
 	// before we attempt to schedule uninitialized ones
-	sort.SliceStable(s.existingNodes, func(i, j int) bool {
-		if s.existingNodes[i].Initialized() && !s.existingNodes[j].Initialized() {
-			return true
+	// Initialized() and Name() are read once per node into contiguous arrays rather than through the node objects
+	// on every comparison: on a large cluster the comparisons run tens of thousands of times per scheduler
+	// construction. The permutation is sorted rather than the keyed records so swaps stay pointer-sized.
+	initialized := make([]bool, len(s.existingNodes))
+	names := make([]string, len(s.existingNodes))
+	order := make([]int, len(s.existingNodes))
+	for i, n := range s.existingNodes {
+		initialized[i], names[i], order[i] = n.Initialized(), n.Name(), i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		a, b := order[i], order[j]
+		if initialized[a] != initialized[b] {
+			return initialized[a]
 		}
-		if !s.existingNodes[i].Initialized() && s.existingNodes[j].Initialized() {
-			return false
-		}
-		return s.existingNodes[i].Name() < s.existingNodes[j].Name()
+		return names[a] < names[b]
 	})
+	sorted := make([]*ExistingNode, len(order))
+	for i, from := range order {
+		sorted[i] = s.existingNodes[from]
+	}
+	copy(s.existingNodes, sorted)
 }
 
 // computeEffectiveZoneFromPod calculates the effective zone constraint by intersecting
