@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -108,5 +109,86 @@ func TestTopologyCountCacheSeparatesNodeFilters(t *testing.T) {
 		if len(records) != 1 || string(records[0].uid) != "uid-"+family {
 			t.Fatalf("family=%s: got records %+v, want only uid-%s", family, records, family)
 		}
+	}
+}
+
+func spreadGroupWithSelector(spec corev1.PodSpec, selector *metav1.LabelSelector) *TopologyGroup {
+	owner := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "owner", Namespace: "default"}, Spec: spec}
+	return NewTopologyGroup(TopologyTypeSpread, corev1.LabelTopologyZone, owner, sets.New("default"), selector, 1, nil,
+		lo.ToPtr(corev1.NodeInclusionPolicyHonor), nil, NewTopologyDomainGroup())
+}
+
+// TestTopologyGroupHashDuplicatesDoNotCancel: a selector's values, a pod's tolerations and its
+// required node affinity terms are sets, and repeating an entry must not make it cancel out of the
+// group hash. Hashing them with SlicesAsSets combines entries by XOR, so a repeated entry erased
+// itself and `app In [x, x, y]` hashed like `app In [y]`.
+func TestTopologyGroupHashDuplicatesDoNotCancel(t *testing.T) {
+	in := func(values ...string) *metav1.LabelSelector {
+		return &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpIn, Values: values}}}
+	}
+	dedicated := corev1.Toleration{Key: "dedicated", Operator: corev1.TolerationOpExists}
+	gpu := corev1.Toleration{Key: "gpu", Operator: corev1.TolerationOpExists}
+	familyA := []corev1.NodeSelectorRequirement{{Key: "family", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}
+	familyB := []corev1.NodeSelectorRequirement{{Key: "family", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}}
+	matchA := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}}
+
+	for _, tc := range []struct {
+		name     string
+		a, b     *TopologyGroup
+		sameHash bool
+	}{
+		{"repeated selector value", spreadGroupWithSelector(corev1.PodSpec{}, in("x", "x", "y")), spreadGroupWithSelector(corev1.PodSpec{}, in("y")), false},
+		{"repeated selector value is the same set", spreadGroupWithSelector(corev1.PodSpec{}, in("x", "x", "y")), spreadGroupWithSelector(corev1.PodSpec{}, in("y", "x")), true},
+		{"repeated toleration", spreadGroupWithSelector(corev1.PodSpec{Tolerations: []corev1.Toleration{dedicated, dedicated, gpu}}, matchA),
+			spreadGroupWithSelector(corev1.PodSpec{Tolerations: []corev1.Toleration{gpu}}, matchA), false},
+		{"repeated toleration is the same set", spreadGroupWithSelector(corev1.PodSpec{Tolerations: []corev1.Toleration{dedicated, dedicated, gpu}}, matchA),
+			spreadGroupWithSelector(corev1.PodSpec{Tolerations: []corev1.Toleration{gpu, dedicated}}, matchA), true},
+		{"repeated affinity term", spreadGroupWithSelector(corev1.PodSpec{Affinity: requiredAffinity(familyA, familyA, familyB)}, matchA),
+			spreadGroupWithSelector(corev1.PodSpec{Affinity: requiredAffinity(familyB)}, matchA), false},
+		{"repeated affinity term is the same set", spreadGroupWithSelector(corev1.PodSpec{Affinity: requiredAffinity(familyA, familyA, familyB)}, matchA),
+			spreadGroupWithSelector(corev1.PodSpec{Affinity: requiredAffinity(familyB, familyA)}, matchA), true},
+	} {
+		if got := tc.a.Hash() == tc.b.Hash(); got != tc.sameHash {
+			t.Errorf("%s: equal hashes = %t, want %t", tc.name, got, tc.sameHash)
+		}
+	}
+}
+
+// TestTopologyCountCacheSeparatesRepeatedSelectorValues is the count-cache consequence: with the
+// cache on, a group selecting `app In [y]` must not replay the records of a group selecting
+// `app In [x, x, y]` scanned earlier in the pass.
+func TestTopologyCountCacheSeparatesRepeatedSelectorValues(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: map[string]string{corev1.LabelTopologyZone: "zone-1"}}}
+	podX := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-x", Namespace: "default", UID: "uid-x", Labels: map[string]string{"app": "x"}}, Spec: corev1.PodSpec{NodeName: "node-1"}}
+	podY := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-y", Namespace: "default", UID: "uid-y", Labels: map[string]string{"app": "y"}}, Spec: corev1.PodSpec{NodeName: "node-1"}}
+	kubeClient := fakecr.NewClientBuilder().WithObjects(node, podX, podY).Build()
+	ctx := karpopts.ToContext(WithTopologyPassCache(context.Background(), NewTopologyPassCache()),
+		test.Options(test.OptionsFields{TopologyCountCacheMode: toPtr(karpopts.TopologyCountCacheModeOn)}))
+
+	in := func(values ...string) *metav1.LabelSelector {
+		return &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "app", Operator: metav1.LabelSelectorOpIn, Values: values}}}
+	}
+	if records, err := topologyPodRecords(ctx, kubeClient, spreadGroupWithSelector(corev1.PodSpec{}, in("x", "x", "y"))); err != nil || len(records) != 2 {
+		t.Fatalf("app In [x, x, y]: got %+v, %v; want both pods", records, err)
+	}
+	records, err := topologyPodRecords(ctx, kubeClient, spreadGroupWithSelector(corev1.PodSpec{}, in("y")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].uid != "uid-y" {
+		t.Fatalf("app In [y]: got records %+v, want only uid-y", records)
+	}
+}
+
+func BenchmarkTopologyGroupHash(b *testing.B) {
+	tg := spreadGroupWithSelector(corev1.PodSpec{
+		Tolerations: []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}, {Key: "gpu", Operator: corev1.TolerationOpExists}},
+		Affinity:    requiredAffinity([]corev1.NodeSelectorRequirement{{Key: "family", Operator: corev1.NodeSelectorOpIn, Values: []string{"a", "b"}}}),
+	}, &metav1.LabelSelector{
+		MatchLabels:      map[string]string{"app": "a", "tier": "web"},
+		MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "rev", Operator: metav1.LabelSelectorOpIn, Values: []string{"1", "2", "3"}}},
+	})
+	for b.Loop() {
+		tg.Hash()
 	}
 }

@@ -17,9 +17,12 @@ limitations under the License.
 package scheduling
 
 import (
+	"cmp"
 	"fmt"
 	"hash/maphash"
 	"math"
+	"slices"
+	"strconv"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/mitchellh/hashstructure/v2"
@@ -212,7 +215,9 @@ var topologyNodeFilterHashSeed = maphash.MakeSeed()
 // exported fields, and scheduling.Requirement keeps its operator, values and bounds unexported, so
 // hashing the filter struct directly would make node filters that differ only in requirement
 // values (nodeSelector family=a vs family=b) collide. Each term's requirements are combined
-// order-insensitively from their content hashes, and the terms, which are OR'd, are hashed as a set.
+// order-insensitively from their content hashes. The terms, which are OR'd, and the tolerations are
+// hashed as deduplicated sorted lists rather than with SlicesAsSets, which combines entries by XOR
+// and so lets a repeated entry cancel itself out.
 func hashNodeFilter(f TopologyNodeFilter) uint64 {
 	terms := make([]uint64, 0, len(f.Requirements))
 	for _, requirements := range f.Requirements {
@@ -222,17 +227,42 @@ func hashNodeFilter(f TopologyNodeFilter) uint64 {
 		}
 		terms = append(terms, maphash.Comparable(topologyNodeFilterHashSeed, [2]uint64{combined, uint64(len(requirements))}))
 	}
+	tolerations := make([]uint64, 0, len(f.Tolerations))
+	for _, toleration := range f.Tolerations {
+		tolerations = append(tolerations, hashToleration(toleration))
+	}
 	return lo.Must(hashstructure.Hash(struct {
 		Terms          []uint64
 		TaintPolicy    corev1.NodeInclusionPolicy
 		AffinityPolicy corev1.NodeInclusionPolicy
-		Tolerations    []corev1.Toleration
+		Tolerations    []uint64
 	}{
-		Terms:          terms,
+		Terms:          sortedUnique(terms),
 		TaintPolicy:    f.TaintPolicy,
 		AffinityPolicy: f.AffinityPolicy,
-		Tolerations:    f.Tolerations,
-	}, hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true}))
+		Tolerations:    sortedUnique(tolerations),
+	}, hashstructure.FormatV2, nil))
+}
+
+// sortedUnique sorts s in place and drops repeated entries.
+func sortedUnique[T cmp.Ordered](s []T) []T {
+	slices.Sort(s)
+	return slices.Compact(s)
+}
+
+// hashToleration hashes every field of a toleration.
+func hashToleration(t corev1.Toleration) uint64 {
+	var h maphash.Hash
+	h.SetSeed(topologyNodeFilterHashSeed)
+	for _, field := range []string{t.Key, string(t.Operator), t.Value, string(t.Effect)} {
+		h.WriteString(field)
+		h.WriteByte(0)
+	}
+	if t.TolerationSeconds != nil {
+		h.WriteByte(1)
+		h.WriteString(strconv.FormatInt(*t.TolerationSeconds, 10))
+	}
+	return h.Sum64()
 }
 
 // hashSelector is a specialized hash function for a metav1.LabelSelector. Due to https://github.com/mitchellh/hashstructure/issues/36
@@ -241,12 +271,16 @@ func hashNodeFilter(f TopologyNodeFilter) uint64 {
 //
 // NOTE: Although repeated elements typically won't occur, they can occur on k8s 1.34+ when using matchLabelKeys since both Karpenter
 // and the API server inject an expression.
+//
+// An expression's values are a set too, and the same XOR combination would let a repeated value cancel itself out
+// (`app In [x, x, y]` hashing like `app In [y]`), so they are deduplicated and sorted before hashing.
 func hashSelector(selector *metav1.LabelSelector) uint64 {
 	expressionHashes := sets.New[uint64]()
 	var selectorHash uint64
 	if selector != nil {
-		for i := range selector.MatchExpressions {
-			expressionHashes.Insert(lo.Must(hashstructure.Hash(selector.MatchExpressions[i], hashstructure.FormatV2, &hashstructure.HashOptions{SlicesAsSets: true})))
+		for _, expression := range selector.MatchExpressions {
+			expression.Values = sortedUnique(slices.Clone(expression.Values))
+			expressionHashes.Insert(lo.Must(hashstructure.Hash(expression, hashstructure.FormatV2, nil)))
 		}
 		selectorHash = lo.Must(hashstructure.Hash(selector.MatchLabels, hashstructure.FormatV2, nil))
 	}
