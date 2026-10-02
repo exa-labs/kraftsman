@@ -24,6 +24,7 @@ package disruption
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -64,6 +65,9 @@ type ReplacementBackoff struct {
 	mu      sync.Mutex
 	clock   clock.Clock
 	entries map[string]*replacementBackoffEntry
+	// nextPrune is when a lookup next sweeps quiet entries, so candidates that left the fleet are
+	// dropped even when no further failure is recorded.
+	nextPrune time.Time
 }
 
 // NewReplacementBackoff returns an empty back-off.
@@ -78,17 +82,31 @@ func replacementBackoffDuration(base time.Duration, failures int) time.Duration 
 }
 
 // replacementBackoffFingerprint identifies the replacement problem a candidate posed: its node, its
-// NodePool's spec revision, and the pods that needed a new home.
+// NodePool's spec revision, and the pods that needed a new home with their resource requests, which
+// an in-place resize changes without changing the pod.
 func replacementBackoffFingerprint(c *Candidate) string {
-	uids := lo.Map(c.reschedulablePods, func(p *corev1.Pod, _ int) string { return string(p.UID) })
-	slices.Sort(uids)
+	pods := lo.Map(c.reschedulablePods, func(p *corev1.Pod, _ int) string { return string(p.UID) + "=" + podRequestsKey(p) })
+	slices.Sort(pods)
 	var b strings.Builder
 	b.WriteString(c.ProviderID())
 	if c.NodePool != nil {
 		b.WriteString("|" + string(c.NodePool.UID) + "/" + strconv.FormatInt(c.NodePool.Generation, 10))
 	}
-	b.WriteString("|" + strings.Join(uids, ","))
+	b.WriteString("|" + strings.Join(pods, ","))
 	return b.String()
+}
+
+// podRequestsKey renders a pod's container and init container resource requests in a stable order.
+func podRequestsKey(p *corev1.Pod) string {
+	var parts []string
+	for _, c := range slices.Concat(p.Spec.InitContainers, p.Spec.Containers) {
+		for _, name := range slices.Sorted(maps.Keys(c.Resources.Requests)) {
+			q := c.Resources.Requests[name]
+			parts = append(parts, string(name)+":"+q.String())
+		}
+		parts = append(parts, ";")
+	}
+	return strings.Join(parts, "")
 }
 
 // RecordFailure starts or extends the hold of every candidate of a command whose replacements did
@@ -119,11 +137,16 @@ func (b *ReplacementBackoff) RecordFailure(ctx context.Context, candidates []*Ca
 // Holds reports whether a candidate is still held off. A candidate whose fingerprint changed since
 // its failure is released, and its entry dropped.
 func (b *ReplacementBackoff) Holds(ctx context.Context, c *Candidate) bool {
-	if options.FromContext(ctx).ConsolidationReplacementFailureBackoff <= 0 {
+	base := options.FromContext(ctx).ConsolidationReplacementFailureBackoff
+	if base <= 0 {
 		return false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now := b.clock.Now()
+	if !now.Before(b.nextPrune) {
+		b.pruneLocked(now, base)
+	}
 	entry, ok := b.entries[c.ProviderID()]
 	if !ok {
 		return false
@@ -132,7 +155,7 @@ func (b *ReplacementBackoff) Holds(ctx context.Context, c *Candidate) bool {
 		delete(b.entries, c.ProviderID())
 		return false
 	}
-	return b.clock.Now().Before(entry.until)
+	return now.Before(entry.until)
 }
 
 // Forget drops the holds of candidates whose command succeeded.
@@ -148,6 +171,7 @@ func (b *ReplacementBackoff) Forget(candidates []*Candidate) {
 // left the fleet do not accumulate and a long-quiet candidate starts its doubling over.
 func (b *ReplacementBackoff) pruneLocked(now time.Time, base time.Duration) {
 	horizon := 2 * base * maxReplacementBackoffMultiple
+	b.nextPrune = now.Add(base * maxReplacementBackoffMultiple)
 	for providerID, entry := range b.entries {
 		if now.Sub(entry.lastFailure) > horizon {
 			delete(b.entries, providerID)

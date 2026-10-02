@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -104,8 +105,28 @@ func TestReplacementBackoffPrunesQuietEntries(t *testing.T) {
 	b := NewReplacementBackoff(clk)
 	b.RecordFailure(on, []*Candidate{backoffCandidate("gone")})
 	clk.Step(2*maxReplacementBackoffMultiple*time.Minute + time.Second)
-	b.RecordFailure(on, []*Candidate{backoffCandidate("a")})
+	// A lookup of any other candidate sweeps entries quiet for longer than twice the longest hold,
+	// so a candidate that left the fleet does not need a later failure to be dropped.
+	b.Holds(on, backoffCandidate("a"))
 	if _, ok := b.entries["gone"]; ok {
 		t.Fatal("expected an entry quiet for longer than twice the longest hold to be pruned")
+	}
+}
+
+func TestReplacementBackoffReleasesResizedPods(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Now())
+	on := options.ToContext(context.Background(), test.Options(test.OptionsFields{ConsolidationReplacementFailureBackoff: &[]time.Duration{time.Minute}[0]}))
+	b := NewReplacementBackoff(clk)
+	c := backoffCandidate("a", "pod-1")
+	c.reschedulablePods[0].Spec.Containers = []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}}}}
+	b.RecordFailure(on, []*Candidate{c})
+	if !b.Holds(on, c) {
+		t.Fatal("expected the candidate to be held")
+	}
+	// The same pod resized in place needs a different replacement.
+	resized := backoffCandidate("a", "pod-1")
+	resized.reschedulablePods[0].Spec.Containers = []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}}}}
+	if b.Holds(on, resized) {
+		t.Fatal("a candidate whose pod was resized must be released")
 	}
 }
