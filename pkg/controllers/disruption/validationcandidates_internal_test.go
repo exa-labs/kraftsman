@@ -182,26 +182,31 @@ func candidateNames(candidates []*Candidate) []string {
 	return names
 }
 
-func TestCurrentCandidatesMatchesGetCandidates(t *testing.T) {
-	f := newValidationFixture(t, 20, 3)
-	proposed := f.candidates[:4]
-	// Between the pass and its validation, one proposed node stops being consolidatable and
-	// another gains the do-not-disrupt annotation; both must drop out exactly as before.
-	byName := lo.KeyBy(proposed, func(c *Candidate) string { return c.Name() })
+// churn changes two proposed nodes between the pass and its validation: the first stops being
+// consolidatable and the second gains the do-not-disrupt annotation.
+func (f *validationFixture) churn(t *testing.T, notConsolidatable, doNotDisrupt string) {
+	t.Helper()
 	for i := range f.nodes {
 		switch f.nodes[i].Name {
-		case proposed[0].Name():
+		case notConsolidatable:
 			f.nodeClaims[i].StatusConditions().SetFalse(v1.ConditionTypeConsolidatable, "test", "test")
 			f.validator.cluster.UpdateNodeClaim(f.nodeClaims[i])
-		case proposed[1].Name():
+		case doNotDisrupt:
 			f.nodes[i].Annotations = lo.Assign(f.nodes[i].Annotations, map[string]string{v1.DoNotDisruptAnnotationKey: "true"})
 			if err := f.validator.cluster.UpdateNode(f.ctx, f.nodes[i]); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	if len(byName) != 4 {
-		t.Fatalf("expected 4 distinct proposed candidates, got %d", len(byName))
+}
+
+func TestCurrentCandidatesMatchesGetCandidates(t *testing.T) {
+	f := newValidationFixture(t, 20, 3)
+	proposed := f.candidates[:4]
+	// Both churned nodes must drop out exactly as before.
+	f.churn(t, proposed[0].Name(), proposed[1].Name())
+	if names := lo.Uniq(candidateNames(proposed)); len(names) != 4 {
+		t.Fatalf("expected 4 distinct proposed candidates, got %v", names)
 	}
 
 	want, err := f.allNodesThenMap(proposed)
