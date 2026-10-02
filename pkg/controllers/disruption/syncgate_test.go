@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -200,6 +201,9 @@ var _ = Describe("Disruption Sync Policy", func() {
 			// The provisioner records the replacement in cluster state as it creates it.
 			Expect(cluster.Synced(ctx)).To(BeFalse())
 			Expect(queue.ReplacementNames().Has(cmd.Replacements[0].Name)).To(BeTrue())
+			// The queue annotates the replacement before creating it, so cluster state knows it is one
+			// from its first record, before the command enters the queue.
+			Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: cmd.Replacements[0].Name, Replacement: true}))
 		})
 
 		It("waits for it under every policy while it launches", func() {
@@ -218,17 +222,43 @@ var _ = Describe("Disruption Sync Policy", func() {
 			Expect(ExpectStateNodeExistsForNodeClaim(cluster, candidateClaim).MarkedForDeletion()).To(BeTrue())
 			ExpectMetricCounterValue(disruption.UnlaunchedNodeClaimSyncChecksTotal, 1, checks("replacement", "waited"))
 
-			// Once the command times out, the leftover is a deleting NodeClaim like any other.
+			// The queue times the command out and unmarks the candidate. The leftover still carries its
+			// replacement annotation, so the pass keeps waiting until it is gone.
 			env.Clock.Step(30 * time.Minute)
 			ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(candidateClaim))
 			Expect(queue.GetCommands()).To(BeEmpty())
 			Expect(ExpectStateNodeExistsForNodeClaim(cluster, candidateClaim).MarkedForDeletion()).To(BeFalse())
+			ExpectSingletonReconciled(ctx, disruptionController)
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectMetricCounterValue(disruption.UnlaunchedNodeClaimSyncChecksTotal, 2, checks("replacement", "waited"))
+
+			ExpectFinalizersRemoved(ctx, env.Client, replacement)
+			ExpectNotFound(ctx, env.Client, replacement)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(replacement))
+			Expect(cluster.UnlaunchedNodeClaims()).To(BeEmpty())
 
 			ExpectSingletonReconciled(ctx, disruptionController)
-			ExpectMetricCounterValue(disruption.UnlaunchedNodeClaimSyncChecksTotal, 1, checks("deleting", "proceeded"))
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Candidates[0].NodeClaim.Name).To(Equal(emptyNodeClaim.Name))
+		})
+	})
+
+	Context("a replacement the queue has not registered yet", func() {
+		It("waits for it by its annotation", func() {
+			// The queue creates a command's replacements, and cluster state records them, before the
+			// command enters the queue.
+			withPolicy(options.DisruptionSyncPolicyIgnoreNonReplacements)
+			ExpectApplied(ctx, env.Client, nodePool, emptyNodeClaim, emptyNode)
+			expectHydrated([]*v1.NodeClaim{emptyNodeClaim}, []*corev1.Node{emptyNode})
+			replacement := applyUnlaunched(nodePool, func(nc *v1.NodeClaim) {
+				nc.Annotations = map[string]string{v1.NodeClaimReplacementOriginAnnotationKey: "underutilized:on-demand"}
+			})
+			Expect(queue.ReplacementNames().Has(replacement.Name)).To(BeFalse())
+
+			ExpectSingletonReconciled(ctx, disruptionController)
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectMetricCounterValue(disruption.UnlaunchedNodeClaimSyncChecksTotal, 1, checks("replacement", "waited"))
 		})
 	})
 

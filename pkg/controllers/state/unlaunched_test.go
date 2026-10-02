@@ -61,6 +61,12 @@ var _ = Describe("Unlaunched NodeClaims", func() {
 		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: nodeClaim.Name, Deleting: true}))
 	})
+	It("should record that a NodeClaim is a disruption replacement", func() {
+		nodeClaim := unlaunched()
+		nodeClaim.Annotations = map[string]string{v1.NodeClaimReplacementOriginAnnotationKey: "underutilized:spot"}
+		cluster.UpdateNodeClaim(nodeClaim)
+		Expect(cluster.UnlaunchedNodeClaims()).To(ConsistOf(state.UnlaunchedNodeClaim{Name: nodeClaim.Name, Replacement: true}))
+	})
 	It("should not mutate the conditions of the NodeClaim it reads", func() {
 		nodeClaim := unlaunched()
 		nodeClaim.Status.Conditions = nil

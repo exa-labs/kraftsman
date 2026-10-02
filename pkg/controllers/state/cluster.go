@@ -236,6 +236,10 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 // which is what decides whether a caller can act without waiting for it to launch.
 type UnlaunchedNodeClaim struct {
 	Name string
+	// Replacement is set when the NodeClaim carries the replacement-origin annotation: the disruption
+	// queue created it to replace a node. The annotation is on the object before it is created, so it
+	// identifies a replacement from the moment cluster state first sees it.
+	Replacement bool
 	// Deleting is set once the NodeClaim has a deletion timestamp. An unlaunched NodeClaim that is
 	// deleting will never become a node: an insufficient-capacity launch deletes its NodeClaim.
 	Deleting bool
@@ -253,6 +257,7 @@ func newUnlaunchedNodeClaim(nodeClaim *v1.NodeClaim) UnlaunchedNodeClaim {
 		Name:     nodeClaim.Name,
 		Deleting: !nodeClaim.DeletionTimestamp.IsZero(),
 	}
+	_, u.Replacement = nodeClaim.Annotations[v1.NodeClaimReplacementOriginAnnotationKey]
 	for _, cond := range nodeClaim.Status.Conditions {
 		if cond.Type != v1.ConditionTypeLaunched || cond.Status == metav1.ConditionTrue {
 			continue

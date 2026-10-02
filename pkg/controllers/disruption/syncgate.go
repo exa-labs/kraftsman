@@ -42,7 +42,8 @@ import (
 // Classes of unlaunched NodeClaims, from the one any policy waits on to the ones the narrowest
 // looser policy skips. They label voluntary_disruption_unlaunched_nodeclaim_sync_checks_total.
 const (
-	// unlaunchedReplacement is the replacement of an in-flight disruption command.
+	// unlaunchedReplacement is a disruption replacement: annotated with its origin by the queue, or
+	// named by an in-flight command.
 	unlaunchedReplacement = "replacement"
 	// unlaunchedInFlight is any other NodeClaim whose launch has not answered yet, usually the
 	// provisioner's.
@@ -93,10 +94,12 @@ func skippableUnder(policy options.DisruptionSyncPolicy, class string) bool {
 
 // classifyUnlaunched names the class of an unlaunched NodeClaim. Replacements come first: a deleting
 // replacement still has a command waiting on it, and that command's candidates stay marked for
-// deletion until the queue notices the replacement is gone.
+// deletion until the queue notices the replacement is gone. The annotation covers the window between
+// the queue creating a replacement and registering its command; the queue's names cover a
+// replacement created without the annotation.
 func classifyUnlaunched(nodeClaim state.UnlaunchedNodeClaim, replacements sets.Set[string]) string {
 	switch {
-	case replacements.Has(nodeClaim.Name):
+	case nodeClaim.Replacement || replacements.Has(nodeClaim.Name):
 		return unlaunchedReplacement
 	case nodeClaim.Deleting:
 		return unlaunchedDeleting

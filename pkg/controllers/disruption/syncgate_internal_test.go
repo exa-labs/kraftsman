@@ -37,6 +37,8 @@ func TestClassifyUnlaunched(t *testing.T) {
 		{"failed launch", state.UnlaunchedNodeClaim{Name: "a", LaunchAttemptReason: launchFailedReason}, unlaunchedLaunchFailed},
 		{"deleting after a failed launch", state.UnlaunchedNodeClaim{Name: "a", Deleting: true, LaunchAttemptReason: launchFailedReason}, unlaunchedDeleting},
 		{"replacement", state.UnlaunchedNodeClaim{Name: "replacement"}, unlaunchedReplacement},
+		{"annotated replacement the queue has not registered yet", state.UnlaunchedNodeClaim{Name: "a", Replacement: true}, unlaunchedReplacement},
+		{"deleting annotated replacement", state.UnlaunchedNodeClaim{Name: "a", Replacement: true, Deleting: true}, unlaunchedReplacement},
 		{"deferred replacement", state.UnlaunchedNodeClaim{Name: "replacement", LaunchAttemptReason: "CapacityEvidencePending"}, unlaunchedReplacement},
 		{"deleting replacement", state.UnlaunchedNodeClaim{Name: "replacement", Deleting: true}, unlaunchedReplacement},
 	} {
