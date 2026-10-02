@@ -68,6 +68,7 @@ type OptionsFields struct {
 	ConsolidationAttributeReplacements      *bool
 	ConsolidationSkipUnchangedNegatives     *bool
 	ConsolidationNegativeCacheTTL           *time.Duration
+	ConsolidationReplacementFailureBackoff  *time.Duration
 	DisruptionUnprovisionablePodTTL         *time.Duration
 	NodeClaimInitializationTimeout          *time.Duration
 	NodeClaimInitializationTimeoutShadow    *bool
@@ -131,16 +132,17 @@ func Options(overrides ...OptionsFields) *options.Options {
 		SpotToSpotMinSavings:                    lo.FromPtrOr(opts.SpotToSpotMinSavings, 0),
 		// Tests drive a fake clock, and a per-candidate deadline is wall-clock, so it is off by
 		// default here: a suite opts in when it is what is under test.
-		ConsolidationCandidateTimeout:        lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
-		ConsolidationAttributeReplacements:   lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
-		ConsolidationSkipUnchangedNegatives:  lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
-		ConsolidationNegativeCacheTTL:        lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
-		DisruptionUnprovisionablePodTTL:      lo.FromPtrOr(opts.DisruptionUnprovisionablePodTTL, 2*time.Minute),
-		NodeClaimInitializationTimeout:       lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
-		NodeClaimInitializationTimeoutShadow: lo.FromPtrOr(opts.NodeClaimInitializationTimeoutShadow, false),
-		ODToSpotConsolidation:                lo.FromPtrOr(opts.ODToSpotConsolidation, false),
-		ODToSpotConsolidationShadow:          lo.FromPtrOr(opts.ODToSpotConsolidationShadow, false),
-		TopologyCountCacheMode:               lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
+		ConsolidationCandidateTimeout:          lo.FromPtrOr(opts.ConsolidationCandidateTimeout, 0),
+		ConsolidationAttributeReplacements:     lo.FromPtrOr(opts.ConsolidationAttributeReplacements, true),
+		ConsolidationSkipUnchangedNegatives:    lo.FromPtrOr(opts.ConsolidationSkipUnchangedNegatives, false),
+		ConsolidationNegativeCacheTTL:          lo.FromPtrOr(opts.ConsolidationNegativeCacheTTL, 5*time.Minute),
+		ConsolidationReplacementFailureBackoff: lo.FromPtrOr(opts.ConsolidationReplacementFailureBackoff, 0),
+		DisruptionUnprovisionablePodTTL:        lo.FromPtrOr(opts.DisruptionUnprovisionablePodTTL, 2*time.Minute),
+		NodeClaimInitializationTimeout:         lo.FromPtrOr(opts.NodeClaimInitializationTimeout, 0),
+		NodeClaimInitializationTimeoutShadow:   lo.FromPtrOr(opts.NodeClaimInitializationTimeoutShadow, false),
+		ODToSpotConsolidation:                  lo.FromPtrOr(opts.ODToSpotConsolidation, false),
+		ODToSpotConsolidationShadow:            lo.FromPtrOr(opts.ODToSpotConsolidationShadow, false),
+		TopologyCountCacheMode:                 lo.FromPtrOr(opts.TopologyCountCacheMode, options.TopologyCountCacheModeOff),
 		FeatureGates: options.FeatureGates{
 			NodeRepair:              lo.FromPtrOr(opts.FeatureGates.NodeRepair, false),
 			ReservedCapacity:        lo.FromPtrOr(opts.FeatureGates.ReservedCapacity, true),

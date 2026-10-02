@@ -59,6 +59,7 @@ const (
 	policyLabel                  = "policy"
 	outcomeLabel                 = "outcome"
 	reasonLabel                  = "reason"
+	consecutiveFailuresLabel     = "consecutive_failures"
 	dispositionLabel             = "disposition"
 	replacementCountLabel        = "replacement_count"
 	capacityTypeTransitionLabel  = "capacity_type_transition"
@@ -156,6 +157,9 @@ const (
 	// an identical candidate - same node, claim, pods, pool and instance type revision - and found
 	// nothing worth doing, and that verdict has not yet expired.
 	CandidateSkipUnchangedNegative = "unchanged_negative_result"
+	// CandidateSkipReplacementBackoff marks a candidate held off because a recent command that
+	// would have replaced it failed to launch or initialize its replacement.
+	CandidateSkipReplacementBackoff = "replacement_failure_backoff"
 )
 
 // Negative-result cache lookup outcomes. The counter is observed on every lookup whether or not
@@ -483,6 +487,16 @@ var (
 			Help:      "Number of held consolidation proposals that did not become commands, by the stage that rejected them and the reason.",
 		},
 		[]string{ConsolidationTypeLabel, stageLabel, reasonLabel},
+	)
+	ConsolidationReplacementFailureBackoffsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_replacement_failure_backoffs_total",
+			Help:      "Number of consolidation candidates held off after a command that would have replaced them failed because a replacement did not launch or initialize, by NodePool and the candidate's consecutive failure count (1, 2, 3, 4+). Only counted while consolidation-replacement-failure-backoff is set; candidates skipped while held are counted in consolidation_candidate_skips_total with reason replacement_failure_backoff.",
+		},
+		[]string{metrics.NodePoolLabel, consecutiveFailuresLabel},
 	)
 	ConsolidationCandidateSkipsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
@@ -932,6 +946,15 @@ func orUnknown(value string) string {
 func ObserveConsolidationCommandsAdmitted(consolidationType string, admitted int) {
 	ConsolidationCommandsAdmittedPerPass.Observe(float64(admitted), map[string]string{
 		ConsolidationTypeLabel: consolidationType,
+	})
+}
+
+// ObserveReplacementFailureBackoff records a candidate held off after its consecutive failures-th
+// failed replacement launch.
+func ObserveReplacementFailureBackoff(nodePool string, failures int) {
+	ConsolidationReplacementFailureBackoffsTotal.Inc(map[string]string{
+		metrics.NodePoolLabel:    nodePool,
+		consecutiveFailuresLabel: lo.Ternary(failures >= 4, "4+", strconv.Itoa(failures)),
 	})
 }
 

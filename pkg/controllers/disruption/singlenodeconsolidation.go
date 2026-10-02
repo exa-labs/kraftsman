@@ -124,6 +124,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)
 	constrainedByBudgets := false
 	skippedOnNegativeCache := false
+	heldOffAfterFailedLaunch := false
 
 	unseenNodePools := sets.New(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })...)
 
@@ -212,6 +213,15 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
 			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipBudgetExhausted)
+			depth = i + 1
+			continue
+		}
+		// A candidate whose last replacement failed to launch is held off for a while rather than
+		// simulated, launched and torn down again; it is not evaluated, so it stays out of the
+		// coverage cycle and keeps the pass from declaring the fleet consolidated.
+		if s.queue.ReplacementBackoff().Holds(ctx, candidate) {
+			heldOffAfterFailedLaunch = true
+			observeCandidateSkip(s.ConsolidationType(), candidate, CandidateSkipReplacementBackoff)
 			depth = i + 1
 			continue
 		}
@@ -332,7 +342,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	// cannot declare the fleet consolidated: IsConsolidated would then suppress passes until some
 	// unrelated state change, holding the skipped entries past their TTL — expiry only runs when
 	// a pass looks the entries up. Mirrors how budget-constrained passes are handled.
-	if !constrainedByBudgets && !skippedOnNegativeCache {
+	if !constrainedByBudgets && !skippedOnNegativeCache && !heldOffAfterFailedLaunch {
 		// if there are no candidates because of a budget, don't mark
 		// as consolidated, as it's possible it should be consolidatable
 		// the next time we try to disrupt.
