@@ -85,9 +85,12 @@ func approx(t *testing.T, what string, got, want float64) {
 	}
 }
 
-// launchedNodeClaim is the NodeClaim object a replacement launched as.
-func launchedNodeClaim(name, instanceType, zone, capacityType string) *v1.NodeClaim {
-	return &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{
+// replacementName is the name the replacement NodeClaim of every command in these tests was created under.
+const replacementName = "replacement-1"
+
+// launchedNodeClaim is the NodeClaim object the replacement launched as.
+func launchedNodeClaim(instanceType, zone, capacityType string) *v1.NodeClaim {
+	return &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: replacementName, Labels: map[string]string{
 		corev1.LabelInstanceTypeStable: instanceType,
 		corev1.LabelTopologyZone:       zone,
 		v1.CapacityTypeLabelKey:        capacityType,
@@ -96,7 +99,7 @@ func launchedNodeClaim(name, instanceType, zone, capacityType string) *v1.NodeCl
 
 // spotReplacementCommand replaces one $1/h spot candidate with a spot claim allowed two types in two zones. Its
 // cheapest launchable option is a.large in zone-a at $0.20/h.
-func spotReplacementCommand(replacementName string) Command {
+func spotReplacementCommand() Command {
 	cheap := &cloudprovider.InstanceType{Name: "a.large", Offerings: cloudprovider.Offerings{
 		offering(v1.CapacityTypeSpot, "zone-a", 0.20),
 		offering(v1.CapacityTypeSpot, "zone-b", 0.60),
@@ -117,20 +120,20 @@ func spotReplacementCommand(replacementName string) Command {
 }
 
 func TestExecutedSavingsPricesTheOfferingTheReplacementLaunched(t *testing.T) {
-	cmd := spotReplacementCommand("replacement-1")
-	kubeClient := fake.NewClientBuilder().WithObjects(launchedNodeClaim("replacement-1", "b.large", "zone-b", v1.CapacityTypeSpot)).Build()
+	cmd := spotReplacementCommand()
+	kubeClient := fake.NewClientBuilder().WithObjects(launchedNodeClaim("b.large", "zone-b", v1.CapacityTypeSpot)).Build()
 	approx(t, "executedSavings", executedSavings(context.Background(), kubeClient, cmd), 0.30)
 }
 
 func TestExecutedSavingsFallsBackToTheEstimateWhenTheLaunchIsUnknown(t *testing.T) {
 	for name, kubeClient := range map[string]*fake.ClientBuilder{
 		"replacement NodeClaim not found": fake.NewClientBuilder(),
-		"launched type was never priced":  fake.NewClientBuilder().WithObjects(launchedNodeClaim("replacement-1", "c.large", "zone-a", v1.CapacityTypeSpot)),
-		"launched offering not offered":   fake.NewClientBuilder().WithObjects(launchedNodeClaim("replacement-1", "b.large", "zone-c", v1.CapacityTypeSpot)),
-		"not launched yet":                fake.NewClientBuilder().WithObjects(&v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "replacement-1"}}),
+		"launched type was never priced":  fake.NewClientBuilder().WithObjects(launchedNodeClaim("c.large", "zone-a", v1.CapacityTypeSpot)),
+		"launched offering not offered":   fake.NewClientBuilder().WithObjects(launchedNodeClaim("b.large", "zone-c", v1.CapacityTypeSpot)),
+		"not launched yet":                fake.NewClientBuilder().WithObjects(&v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: replacementName}}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			approx(t, "executedSavings", executedSavings(context.Background(), kubeClient.Build(), spotReplacementCommand("replacement-1")), 0.80)
+			approx(t, "executedSavings", executedSavings(context.Background(), kubeClient.Build(), spotReplacementCommand()), 0.80)
 		})
 	}
 }
@@ -138,8 +141,8 @@ func TestExecutedSavingsFallsBackToTheEstimateWhenTheLaunchIsUnknown(t *testing.
 func TestRealizedSavingsAndSavingsFractionUseTheLaunchedOffering(t *testing.T) {
 	ConsolidationRealizedSavingsDollarsPerHourTotal.Reset()
 	ConsolidationExecutedSavingsFraction.Reset()
-	cmd := spotReplacementCommand("replacement-1")
-	kubeClient := fake.NewClientBuilder().WithObjects(launchedNodeClaim("replacement-1", "b.large", "zone-b", v1.CapacityTypeSpot)).Build()
+	cmd := spotReplacementCommand()
+	kubeClient := fake.NewClientBuilder().WithObjects(launchedNodeClaim("b.large", "zone-b", v1.CapacityTypeSpot)).Build()
 
 	ObserveRealizedSavings(context.Background(), kubeClient, cmd)
 	ObserveExecutedCommandValue(context.Background(), kubeClient, testclock.NewFakeClock(time.Now()), cmd)
@@ -151,4 +154,43 @@ func TestRealizedSavingsAndSavingsFractionUseTheLaunchedOffering(t *testing.T) {
 		t.Fatalf("savings fraction observed %v times, want 1", fraction.GetSampleCount())
 	}
 	approx(t, "savings fraction", fraction.GetSampleSum(), 0.30)
+}
+
+func TestRealizedSavingsCountsAPricierLaunchAsACostIncrease(t *testing.T) {
+	ConsolidationRealizedSavingsDollarsPerHourTotal.Reset()
+	ConsolidationRealizedCostIncreaseDollarsPerHourTotal.Reset()
+	cmd := spotReplacementCommand()
+	cmd.Candidates[0].Price = 0.50
+	// b.large in zone-b costs $0.70/h: the replacement cost $0.20/h more than the $0.50/h node it replaced.
+	kubeClient := fake.NewClientBuilder().WithObjects(launchedNodeClaim("b.large", "zone-b", v1.CapacityTypeSpot)).Build()
+
+	ObserveRealizedSavings(context.Background(), kubeClient, cmd)
+
+	labels := map[string]string{"nodepool": "savings-pool", "decision": "replace", "capacity_type_transition": "spot->spot"}
+	approx(t, "realized savings", counterValue(t, "karpenter_voluntary_disruption_consolidation_realized_savings_dollars_per_hour_total", labels), 0)
+	approx(t, "realized cost increase", counterValue(t, "karpenter_voluntary_disruption_consolidation_realized_cost_increase_dollars_per_hour_total", labels), 0.20)
+}
+
+func TestExecutedSavingsPricesTheReservationTheReplacementLaunchedInto(t *testing.T) {
+	if cloudprovider.ReservationIDLabel == "" {
+		cloudprovider.ReservationIDLabel = "test.reservation-id"
+		defer func() { cloudprovider.ReservationIDLabel = "" }()
+	}
+	reservation := func(id string, price float64) *cloudprovider.Offering {
+		of := offering(v1.CapacityTypeReserved, "zone-a", price)
+		of.Requirements.Add(scheduling.NewRequirement(cloudprovider.ReservationIDLabel, corev1.NodeSelectorOpIn, id))
+		return of
+	}
+	it := &cloudprovider.InstanceType{Name: "g.xlarge", Offerings: cloudprovider.Offerings{reservation("r-a", 0.40), reservation("r-b", 0.70)}}
+	nc := claim(scheduling.NewRequirements(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeReserved)), it)
+	replacements := replacementsFromNodeClaims(nc)
+	replacements[0].Name = replacementName
+	cmd := Command{
+		Candidates:   []*Candidate{{Price: 1.00}},
+		Replacements: replacements,
+		Results:      pscheduling.Results{NewNodeClaims: []*pscheduling.NodeClaim{nc}},
+	}
+	launched := launchedNodeClaim("g.xlarge", "zone-a", v1.CapacityTypeReserved)
+	launched.Labels[cloudprovider.ReservationIDLabel] = "r-b"
+	approx(t, "executedSavings", executedSavings(context.Background(), fake.NewClientBuilder().WithObjects(launched).Build(), cmd), 0.30)
 }

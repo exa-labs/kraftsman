@@ -612,7 +612,17 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "consolidation_realized_savings_dollars_per_hour_total",
-			Help:      "Cumulative realized hourly savings from successful consolidation commands.",
+			Help:      "Cumulative realized hourly savings from successful consolidation commands: the replaced nodes' price less the price of the offerings the replacements launched as. Commands whose replacements launched pricier than the nodes they replaced add to consolidation_realized_cost_increase_dollars_per_hour_total instead; subtract it for the net.",
+		},
+		[]string{metrics.NodePoolLabel, decisionLabel, capacityTypeTransitionLabel},
+	)
+	ConsolidationRealizedCostIncreaseDollarsPerHourTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_realized_cost_increase_dollars_per_hour_total",
+			Help:      "Cumulative hourly cost added by successful consolidation commands whose replacements launched at a higher price than the nodes they replaced, by NodePool, decision, and capacity type transition. Subtract from consolidation_realized_savings_dollars_per_hour_total for the net.",
 		},
 		[]string{metrics.NodePoolLabel, decisionLabel, capacityTypeTransitionLabel},
 	)
@@ -1112,8 +1122,16 @@ func ObserveAcceptedCandidate(cmd Command, consolidationType string, position in
 func ObserveRealizedSavings(ctx context.Context, kubeClient client.Reader, cmd Command) {
 	transition := capacityTypeTransition(ctx, kubeClient, cmd)
 	savings := executedSavings(ctx, kubeClient, cmd)
+	// A counter cannot go down, and a replacement can launch pricier than the nodes it replaced (the cheap
+	// offerings it was priced against were out of capacity), so a loss goes to its own counter.
+	saved, added := max(savings, 0), max(-savings, 0)
 	for _, candidate := range cmd.Candidates {
-		ConsolidationRealizedSavingsDollarsPerHourTotal.Add(savings/float64(len(cmd.Candidates)), map[string]string{
+		ConsolidationRealizedCostIncreaseDollarsPerHourTotal.Add(added/float64(len(cmd.Candidates)), map[string]string{
+			metrics.NodePoolLabel:       candidate.NodePool.Name,
+			decisionLabel:               string(cmd.Decision()),
+			capacityTypeTransitionLabel: transition,
+		})
+		ConsolidationRealizedSavingsDollarsPerHourTotal.Add(saved/float64(len(cmd.Candidates)), map[string]string{
 			metrics.NodePoolLabel:       candidate.NodePool.Name,
 			decisionLabel:               string(cmd.Decision()),
 			capacityTypeTransitionLabel: transition,
@@ -1198,15 +1216,32 @@ func launchedOfferingPrice(ctx context.Context, kubeClient client.Reader, replac
 	if err := kubeClient.Get(ctx, types.NamespacedName{Name: replacement.Name}, nodeClaim); err != nil {
 		return 0, false
 	}
-	instanceTypeName, zone, capacityType := nodeClaim.Labels[corev1.LabelInstanceTypeStable], nodeClaim.Labels[corev1.LabelTopologyZone], nodeClaim.Labels[v1.CapacityTypeLabelKey]
-	if instanceTypeName == "" || zone == "" || capacityType == "" {
-		return 0, false
-	}
-	instanceType, ok := lo.Find(replacement.InstanceTypeOptions, func(it *cloudprovider.InstanceType) bool { return it.Name == instanceTypeName })
+	instanceType, ok := lo.Find(replacement.InstanceTypeOptions, func(it *cloudprovider.InstanceType) bool {
+		return it.Name == nodeClaim.Labels[corev1.LabelInstanceTypeStable]
+	})
 	if !ok {
 		return 0, false
 	}
-	return instanceType.OfferingPrice(zone, capacityType)
+	launched, ok := lo.Find(instanceType.Offerings, func(of *cloudprovider.Offering) bool { return launchedAs(nodeClaim, of) })
+	if !ok {
+		return 0, false
+	}
+	return launched.Price, true
+}
+
+// launchedAs reports whether a launched NodeClaim's zone and capacity type labels name the offering. Reservations of
+// one type in one zone are distinct offerings that may be priced differently, so a reserved launch must also carry
+// the offering's reservation ID.
+func launchedAs(nodeClaim *v1.NodeClaim, of *cloudprovider.Offering) bool {
+	zone, capacityType := nodeClaim.Labels[corev1.LabelTopologyZone], nodeClaim.Labels[v1.CapacityTypeLabelKey]
+	if zone == "" || capacityType == "" || of.Zone() != zone || of.CapacityType() != capacityType {
+		return false
+	}
+	if capacityType != v1.CapacityTypeReserved || cloudprovider.ReservationIDLabel == "" {
+		return true
+	}
+	reservationID := nodeClaim.Labels[cloudprovider.ReservationIDLabel]
+	return reservationID == "" || of.ReservationID() == reservationID
 }
 
 func capacityTypeTransition(ctx context.Context, kubeClient client.Reader, cmd Command) string {
