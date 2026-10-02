@@ -17,12 +17,12 @@ limitations under the License.
 package metrics
 
 import (
+	"maps"
 	"sync"
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
-	"k8s.io/apimachinery/pkg/api/equality"
 )
 
 // Store is a mapping from a key to a list of Metrics
@@ -54,9 +54,12 @@ func (s *Store) update(key string, metrics []*StoreMetric) {
 	// Cleanup old metrics if the old metric family has metrics that weren't updated by this round of metrics
 	if oldMetrics, ok := s.store[key]; ok {
 		for _, oldMetric := range oldMetrics {
-			if _, ok = lo.Find(metrics, func(m *StoreMetric) bool {
-				return oldMetric.GaugeMetric == m.GaugeMetric && equality.Semantic.DeepEqual(oldMetric.Labels, m.Labels)
-			}); !ok {
+			// prometheus.Labels is a map[string]string, so maps.Equal matches what a reflective deep equality would
+			// (nil and empty label sets compare equal under both) without reflection. This loop runs for every
+			// series of every key on each ReplaceAll, which is quadratic in the series per key.
+			if !lo.ContainsBy(metrics, func(m *StoreMetric) bool {
+				return oldMetric.GaugeMetric == m.GaugeMetric && maps.Equal(oldMetric.Labels, m.Labels)
+			}) {
 				oldMetric.Delete(oldMetric.Labels)
 			}
 		}
