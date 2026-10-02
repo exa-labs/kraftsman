@@ -67,7 +67,7 @@ func existingStateNode(name, nodePool, cpu string, taints ...corev1.Taint) *stat
 
 // solveFromDeletingNode solves one two-core pod bound to nodeName, with "draining" marked as deleting, against a
 // one-core node and a tainted four-core node, and returns the scheduler and the pod.
-func solveFromDeletingNode(t *testing.T, nodeName string) (*Scheduler, *corev1.Pod) {
+func solveFromDeletingNode(t *testing.T, nodeName string, opts ...Options) (*Scheduler, *corev1.Pod) {
 	t.Helper()
 	ctx := operatoroptions.ToContext(context.Background(), &operatoroptions.Options{})
 	client := fakecr.NewFakeClient()
@@ -94,7 +94,7 @@ func solveFromDeletingNode(t *testing.T, nodeName string) (*Scheduler, *corev1.P
 		t.Fatalf("creating topology: %v", err)
 	}
 	s := NewScheduler(ctx, client, []*v1.NodePool{nodePool}, cluster, stateNodes, topology, byNodePool, nil,
-		events.NewRecorder(&record.FakeRecorder{}), clock.RealClock{}, nil, nil)
+		events.NewRecorder(&record.FakeRecorder{}), clock.RealClock{}, nil, nil, opts...)
 	s.deletingNodeNames = sets.New("draining")
 	results, err := s.Solve(ctx, []*corev1.Pod{pod})
 	if err != nil || len(results.PodErrors) != 0 || len(results.NewNodeClaims) != 1 {
@@ -104,7 +104,7 @@ func solveFromDeletingNode(t *testing.T, nodeName string) (*Scheduler, *corev1.P
 }
 
 func TestPodFromDeletingNodeRecordsWhyExistingNodesRejectedIt(t *testing.T) {
-	s, pod := solveFromDeletingNode(t, "draining")
+	s, pod := solveFromDeletingNode(t, "draining", ExplainExistingNodeRejections)
 	rejections, ok := s.existingNodeRejections[pod.UID]
 	if !ok {
 		t.Fatal("a pod from a deleting node that needs new capacity must record why the existing nodes rejected it")
@@ -118,8 +118,17 @@ func TestPodFromDeletingNodeRecordsWhyExistingNodesRejectedIt(t *testing.T) {
 }
 
 func TestPodFromALiveNodeRecordsNothing(t *testing.T) {
-	s, pod := solveFromDeletingNode(t, "live")
+	s, pod := solveFromDeletingNode(t, "live", ExplainExistingNodeRejections)
 	if _, ok := s.existingNodeRejections[pod.UID]; ok {
 		t.Fatal("only pods from deleting nodes record existing-node rejections")
+	}
+}
+
+// A scheduler built without ExplainExistingNodeRejections, as every disruption simulation is, must not run the extra
+// CanAdd pass at all.
+func TestSchedulerWithoutTheOptionSkipsTheCheck(t *testing.T) {
+	s, _ := solveFromDeletingNode(t, "draining", IsConsolidationSimulation)
+	if s.existingNodeRejections != nil {
+		t.Fatalf("a scheduler without ExplainExistingNodeRejections must not evaluate rejections, got %v", s.existingNodeRejections)
 	}
 }
