@@ -62,6 +62,7 @@ type OptionsFields struct {
 	ConsolidationSplitMinSavings            *float64
 	ConsolidationReplaceMinSavings          *float64
 	SpotToSpotMinInstanceTypes              *int
+	SpotToSpotLaunchInstanceTypes           *int
 	SpotToSpotMinNodeAge                    *time.Duration
 	SpotToSpotMinSavings                    *float64
 	ConsolidationCandidateTimeout           *time.Duration
@@ -127,6 +128,7 @@ func Options(overrides ...OptionsFields) *options.Options {
 		ConsolidationSplitMinSavings:            lo.FromPtrOr(opts.ConsolidationSplitMinSavings, 0.05),
 		ConsolidationReplaceMinSavings:          lo.FromPtrOr(opts.ConsolidationReplaceMinSavings, 0),
 		SpotToSpotMinInstanceTypes:              lo.FromPtrOr(opts.SpotToSpotMinInstanceTypes, 15),
+		SpotToSpotLaunchInstanceTypes:           lo.FromPtrOr(opts.SpotToSpotLaunchInstanceTypes, 0),
 		SpotToSpotMinNodeAge:                    lo.FromPtrOr(opts.SpotToSpotMinNodeAge, 0),
 		SpotToSpotMinSavings:                    lo.FromPtrOr(opts.SpotToSpotMinSavings, 0),
 		// Tests drive a fake clock, and a per-candidate deadline is wall-clock, so it is off by

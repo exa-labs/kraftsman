@@ -119,6 +119,7 @@ type Options struct {
 	ConsolidationSplitMinSavings            float64
 	ConsolidationReplaceMinSavings          float64
 	SpotToSpotMinInstanceTypes              int
+	SpotToSpotLaunchInstanceTypes           int
 	SpotToSpotMinNodeAge                    time.Duration
 	SpotToSpotMinSavings                    float64
 	ConsolidationCandidateTimeout           time.Duration
@@ -184,6 +185,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.IntVar(&o.ConsolidationSplitShadowMaxReplacements, "consolidation-split-shadow-max-replacements", env.WithDefaultInt("CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS", 8), "The replacement cap the shadow split simulation evaluates, decoupled from max-consolidation-replacements so the live limit stays conservative while the shadow measures the intended one. Must be >= 2 since a split needs at least two replacements to exist.")
 	fs.IntVar(&o.ConsolidationSplitMaxAttempts, "consolidation-split-max-attempts", env.WithDefaultInt("CONSOLIDATION_SPLIT_MAX_ATTEMPTS", 50), "The maximum number of split fallback simulations a single consolidation pass may run. Each attempt costs an extra scheduling simulation, so this caps how much of the pass timeout the fallback can consume at the expense of candidate traversal depth. 0 disables the fallback.")
 	fs.IntVar(&o.SpotToSpotMinInstanceTypes, "spot-to-spot-min-instance-types", env.WithDefaultInt("SPOT_TO_SPOT_MIN_INSTANCE_TYPES", 15), "The minimum number of cheaper instance type options a replacement NodeClaim must have for spot-to-spot single-node consolidation to proceed. The upstream default of 15 assumes broad instance-type flexibility; a fleet whose pods pin a single small instance family can never present that many cheaper types and needs a lower minimum. Replacement launches are capped to this many cheapest options too (or the NodePool's minValues if greater), so the launched type is always within the priced set and cannot be immediately consolidated again.")
+	fs.IntVar(&o.SpotToSpotLaunchInstanceTypes, "spot-to-spot-launch-instance-types", env.WithDefaultInt("SPOT_TO_SPOT_LAUNCH_INSTANCE_TYPES", 0), "The number of cheapest instance type options a spot replacement launch may carry, when larger than spot-to-spot-min-instance-types; every option still saves at least the applicable savings margin. A launch of a single type fails whenever that type's spot capacity is exhausted in every zone the replacement allows, and a failed launch costs the whole command; more options let the launch fall back to the next cheapest type. The trade is that the launch may land on a type that is not the cheapest, which a later pass can replace again if the cheaper type clears the savings margin, so pair it with spot-to-spot-min-savings. 0 caps launches at spot-to-spot-min-instance-types.")
 	fs.DurationVar(&o.SpotToSpotMinNodeAge, "spot-to-spot-min-node-age", env.WithDefaultDuration("SPOT_TO_SPOT_MIN_NODE_AGE", 0), "The minimum age of a spot NodeClaim before spot-to-spot consolidation may replace it with another spot node. Spot prices move continuously, so a node that was the cheapest launchable option when it started is often undercut within minutes; without a floor the same pods are drained onto the new cheapest node on every price move, and workloads that take a while to start never finish. Only replacements of spot candidates by spot capacity are held back: deletes, on-demand candidates and on-demand replacements are unaffected, and so is consolidateAfter, which restarts on every pod event rather than counting from the node's creation. A NodePool overrides it with the karpenter.sh/spot-to-spot-min-node-age annotation. 0 disables the floor.")
 	fs.Float64Var(&o.SpotToSpotMinSavings, "spot-to-spot-min-savings", env.WithDefaultFloat64("SPOT_TO_SPOT_MIN_SAVINGS", 0), "The fraction of the disrupted spot nodes' price that a spot-to-spot consolidation replacement must save before it is accepted, on top of the usual cheaper-than-candidate check. The larger of this and consolidation-replace-min-savings applies to spot-to-spot replacements (and to the split fallback of a spot candidate); other replace decisions keep consolidation-replace-min-savings alone. Replacement launches are also restricted to instance types that meet the margin. A NodePool overrides it with the karpenter.sh/spot-to-spot-min-savings annotation. 0 adds nothing to the global margin.")
 	fs.DurationVar(&o.ConsolidationCandidateTimeout, "consolidation-candidate-timeout", env.WithDefaultDuration("CONSOLIDATION_CANDIDATE_TIMEOUT", 10*time.Second), "The maximum time a single consolidation candidate's scheduling simulation may run before it is abandoned and the walk moves on. The pass timeout bounds discovery in aggregate; this bounds one candidate, so a pass degrades into finding fewer commands rather than none. 0 disables the per-candidate bound.")
@@ -285,9 +287,18 @@ func (o *Options) validateConsolidation() error {
 	return o.validateNegativeCache()
 }
 
+// SpotReplacementLaunchCap is how many of a spot replacement's cheapest instance type options its launch carries:
+// SPOT_TO_SPOT_MIN_INSTANCE_TYPES, raised to SPOT_TO_SPOT_LAUNCH_INSTANCE_TYPES when that is larger.
+func (o *Options) SpotReplacementLaunchCap() int {
+	return max(o.SpotToSpotMinInstanceTypes, o.SpotToSpotLaunchInstanceTypes)
+}
+
 func (o *Options) validateSpotToSpot() error {
 	if o.SpotToSpotMinInstanceTypes < 1 {
 		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_INSTANCE_TYPES must be >= 1, got %d", o.SpotToSpotMinInstanceTypes)
+	}
+	if o.SpotToSpotLaunchInstanceTypes < 0 {
+		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_LAUNCH_INSTANCE_TYPES must be >= 0, got %d", o.SpotToSpotLaunchInstanceTypes)
 	}
 	if o.SpotToSpotMinNodeAge < 0 {
 		return fmt.Errorf("validating cli flags / env vars, SPOT_TO_SPOT_MIN_NODE_AGE must be >= 0, got %s", o.SpotToSpotMinNodeAge)
