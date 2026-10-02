@@ -22,6 +22,7 @@ package scheduling
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/samber/lo"
@@ -63,13 +64,13 @@ func packingNodePool(name string, policy PackingPolicy) *v1.NodePool {
 	return np
 }
 
-// cpuPod is a pod requesting millis of cpu, pinned to nodePool when it is not empty.
-func cpuPod(name string, millis int64, nodePool string) *corev1.Pod {
+// cpuPod is a pod requesting 1.5 cores, pinned to nodePool when it is not empty.
+func cpuPod(name string, nodePool string) *corev1.Pod {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(name)},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
 			Name:      "main",
-			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: *resource.NewMilliQuantity(millis, resource.DecimalSI)}},
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1500m")}},
 		}}},
 		Status: corev1.PodStatus{Phase: corev1.PodPending},
 	}
@@ -103,8 +104,8 @@ func newPackingTestScheduler(t *testing.T, nodePools []*v1.NodePool, instanceTyp
 func inflightFixture(t *testing.T) (ctx context.Context, s *Scheduler, pod *corev1.Pod, pricedA, flat, pricedB *NodeClaim) {
 	t.Helper()
 	priced, binpack := packingNodePool("priced", PackingPolicyMarginalCost), packingNodePool("flat", PackingPolicyBinpack)
-	seed := []*corev1.Pod{cpuPod("priced-a", 1500, priced.Name), cpuPod("flat", 1500, binpack.Name), cpuPod("priced-b", 1500, priced.Name)}
-	pod = cpuPod("incoming", 1500, "")
+	seed := []*corev1.Pod{cpuPod("priced-a", priced.Name), cpuPod("flat", binpack.Name), cpuPod("priced-b", priced.Name)}
+	pod = cpuPod("incoming", "")
 	ctx, s = newPackingTestScheduler(t, []*v1.NodePool{priced, binpack},
 		[]*cloudprovider.InstanceType{sizedInstanceType("small", 2, 1), sizedInstanceType("large", 8, 10)}, append(seed, pod))
 	results, err := s.Solve(ctx, seed)
@@ -151,26 +152,57 @@ func cheapestOf(placements []*inflightPlacement) *inflightPlacement {
 	return best
 }
 
+// firstZeroDelta is the index of the first placement that takes the pod at zero delta, or -1 when none does.
+func firstZeroDelta(placements []*inflightPlacement) int {
+	return lo.IndexOf(lo.Map(placements, func(p *inflightPlacement, _ int) bool { return p != nil && p.delta == 0 }), true)
+}
+
+// checkPlacementsAgainstReference fails unless got matches reference on every claim up to and including the first
+// zero-delta claim and holds nothing after it.
+func checkPlacementsAgainstReference(t *testing.T, label string, got, reference []*inflightPlacement) {
+	t.Helper()
+	zero := firstZeroDelta(reference)
+	for i := range reference {
+		evaluated := zero < 0 || i <= zero
+		switch {
+		case !evaluated && got[i] != nil:
+			t.Fatalf("%s: claim %d past the first zero-delta claim was returned", label, i)
+		case evaluated && (got[i] == nil) != (reference[i] == nil):
+			t.Fatalf("%s: claim %d evaluated differently from the reference", label, i)
+		case evaluated && got[i] != nil && (got[i].delta != reference[i].delta || got[i].unpriced != reference[i].unpriced):
+			t.Fatalf("%s: claim %d priced %v, reference %v", label, i, got[i].delta, reference[i].delta)
+		}
+	}
+}
+
+// sameNodeClaim reports whether two placements, either possibly nil, are onto the same NodeClaim.
+func sameNodeClaim(a, b *inflightPlacement) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.nodeClaim == b.nodeClaim
+}
+
 func TestInflightPlacementsStopAtTheFirstZeroDeltaClaim(t *testing.T) {
 	ctx, s, pod, pricedA, flat, pricedB := inflightFixture(t)
 	s.newNodeClaims = []*NodeClaim{pricedA, flat, pricedB}
 
 	reference := exhaustivePlacements(ctx, s, pod)
-	if lo.Count(reference, nil) != 0 {
-		t.Fatal("the incoming pod must fit every seeded NodeClaim")
+	deltas := lo.Map(reference, func(p *inflightPlacement, _ int) float64 {
+		if p == nil {
+			return -1
+		}
+		return p.delta
+	})
+	if !slices.Equal(deltas, []float64{9, 0, 9}) {
+		t.Fatalf("the incoming pod must fit every seeded NodeClaim at deltas [9 0 9], got %v", deltas)
 	}
-	if reference[0].delta != 9 || reference[1].delta != 0 || reference[2].delta != 9 {
-		t.Fatalf("expected deltas [9 0 9], got [%v %v %v]", reference[0].delta, reference[1].delta, reference[2].delta)
-	}
-
 	got := s.inflightPlacements(ctx, pod)
-	if got[0] == nil || got[0].nodeClaim != pricedA || got[1] == nil || got[1].nodeClaim != flat {
-		t.Fatal("the claims up to and including the first zero-delta claim must be evaluated")
-	}
 	if got[2] != nil {
 		t.Fatal("a claim after the first zero-delta claim cannot win and must not be evaluated")
 	}
-	if cheapest := s.cheapestInflightPlacement(ctx, pod); cheapest == nil || cheapest.nodeClaim != cheapestOf(reference).nodeClaim {
+	checkPlacementsAgainstReference(t, "[priced flat priced]", got, reference)
+	if !sameNodeClaim(s.cheapestInflightPlacement(ctx, pod), cheapestOf(reference)) {
 		t.Fatal("the cheapest placement must match an exhaustive evaluation")
 	}
 	firstFit, cheapest := s.firstAndCheapestInflight(ctx, pod)
@@ -190,25 +222,11 @@ func TestInflightPlacementsMatchAnExhaustiveEvaluationInEveryOrder(t *testing.T)
 		{},
 	} {
 		s.newNodeClaims = order
-		names := lo.Map(order, func(nc *NodeClaim, _ int) string { return nc.NodePoolName })
+		label := fmt.Sprint(lo.Map(order, func(nc *NodeClaim, _ int) string { return nc.NodePoolName }))
 		reference := exhaustivePlacements(ctx, s, pod)
-		got := s.inflightPlacements(ctx, pod)
-		zero := lo.IndexOf(lo.Map(reference, func(p *inflightPlacement, _ int) bool { return p != nil && p.delta == 0 }), true)
-		for i := range order {
-			evaluated := zero < 0 || i <= zero
-			if evaluated && (got[i] == nil) != (reference[i] == nil) {
-				t.Fatalf("order %v: claim %d evaluated differently from the reference", names, i)
-			}
-			if evaluated && got[i] != nil && (got[i].delta != reference[i].delta || got[i].unpriced != reference[i].unpriced) {
-				t.Fatalf("order %v: claim %d priced %v, reference %v", names, i, got[i].delta, reference[i].delta)
-			}
-			if !evaluated && got[i] != nil {
-				t.Fatalf("order %v: claim %d past the first zero-delta claim was returned", names, i)
-			}
-		}
-		want, have := cheapestOf(reference), s.cheapestInflightPlacement(ctx, pod)
-		if (want == nil) != (have == nil) || (want != nil && want.nodeClaim != have.nodeClaim) {
-			t.Fatalf("order %v: cheapest placement differs from the reference", names)
+		checkPlacementsAgainstReference(t, label, s.inflightPlacements(ctx, pod), reference)
+		if !sameNodeClaim(s.cheapestInflightPlacement(ctx, pod), cheapestOf(reference)) {
+			t.Fatalf("%s: cheapest placement differs from the reference", label)
 		}
 	}
 }
