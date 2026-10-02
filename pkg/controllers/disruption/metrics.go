@@ -34,6 +34,7 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
@@ -1110,8 +1111,9 @@ func ObserveAcceptedCandidate(cmd Command, consolidationType string, position in
 
 func ObserveRealizedSavings(ctx context.Context, kubeClient client.Reader, cmd Command) {
 	transition := capacityTypeTransition(ctx, kubeClient, cmd)
+	savings := executedSavings(ctx, kubeClient, cmd)
 	for _, candidate := range cmd.Candidates {
-		ConsolidationRealizedSavingsDollarsPerHourTotal.Add(cmd.EstimatedSavings()/float64(len(cmd.Candidates)), map[string]string{
+		ConsolidationRealizedSavingsDollarsPerHourTotal.Add(savings/float64(len(cmd.Candidates)), map[string]string{
 			metrics.NodePoolLabel:       candidate.NodePool.Name,
 			decisionLabel:               string(cmd.Decision()),
 			capacityTypeTransitionLabel: transition,
@@ -1145,8 +1147,9 @@ func ObserveExecutedCommandValue(ctx context.Context, kubeClient client.Reader, 
 	}
 	transition := capacityTypeTransition(ctx, kubeClient, cmd)
 	if sourceCost := cmd.SourceCost(); sourceCost > 0 {
+		savings := executedSavings(ctx, kubeClient, cmd)
 		for _, nodePoolName := range uniqueSorted(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })) {
-			ConsolidationExecutedSavingsFraction.Observe(cmd.EstimatedSavings()/sourceCost, map[string]string{
+			ConsolidationExecutedSavingsFraction.Observe(savings/sourceCost, map[string]string{
 				metrics.NodePoolLabel:       nodePoolName,
 				decisionLabel:               string(cmd.Decision()),
 				capacityTypeTransitionLabel: transition,
@@ -1163,6 +1166,47 @@ func ObserveExecutedCommandValue(ctx context.Context, kubeClient client.Reader, 
 			capacityTypeTransitionLabel: transition,
 		})
 	}
+}
+
+// executedSavings is the hourly saving a successfully executed command realized at decision-time prices: the
+// candidates' price less the price of the offering each replacement actually launched, read from the replacement
+// NodeClaim's instance type, zone and capacity type labels and priced from the instance type options consolidation
+// evaluated. A launch may land on any type and zone its requirements allow - a pricier zone when the cheap ones are
+// out of capacity, a pricier type among the launch options - so the cheapest option EstimatedSavings charges is only a
+// lower bound on what a replacement costs. When any replacement's launched offering cannot be resolved the command
+// keeps that estimate.
+func executedSavings(ctx context.Context, kubeClient client.Reader, cmd Command) float64 {
+	savings := cmd.SourceCost()
+	for _, replacement := range cmd.Replacements {
+		price, ok := launchedOfferingPrice(ctx, kubeClient, replacement)
+		if !ok {
+			return cmd.EstimatedSavings()
+		}
+		savings -= price
+	}
+	return savings
+}
+
+// launchedOfferingPrice prices the offering a replacement NodeClaim launched as. It reports false when the
+// NodeClaim cannot be read, has not been labeled by a launch, or launched an offering the replacement's options do
+// not carry.
+func launchedOfferingPrice(ctx context.Context, kubeClient client.Reader, replacement *Replacement) (float64, bool) {
+	if replacement == nil || replacement.NodeClaim == nil || replacement.Name == "" {
+		return 0, false
+	}
+	nodeClaim := &v1.NodeClaim{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: replacement.Name}, nodeClaim); err != nil {
+		return 0, false
+	}
+	instanceTypeName, zone, capacityType := nodeClaim.Labels[corev1.LabelInstanceTypeStable], nodeClaim.Labels[corev1.LabelTopologyZone], nodeClaim.Labels[v1.CapacityTypeLabelKey]
+	if instanceTypeName == "" || zone == "" || capacityType == "" {
+		return 0, false
+	}
+	instanceType, ok := lo.Find(replacement.InstanceTypeOptions, func(it *cloudprovider.InstanceType) bool { return it.Name == instanceTypeName })
+	if !ok {
+		return 0, false
+	}
+	return instanceType.OfferingPrice(zone, capacityType)
 }
 
 func capacityTypeTransition(ctx context.Context, kubeClient client.Reader, cmd Command) string {
