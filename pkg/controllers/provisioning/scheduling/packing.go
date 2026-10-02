@@ -20,12 +20,15 @@ limitations under the License.
 // opened only when none fits. Under "marginal-cost" the scheduler prices each option: growing an in-flight NodeClaim
 // costs the increase in its cheapest launch price (adding a pod can only remove instance types, so the increase is
 // never negative), opening a new NodeClaim costs that NodeClaim's cheapest launch price, and the pod takes the cheapest
-// option with ties going to the in-flight NodeClaim. Pools whose sizes scale price linearly therefore pack exactly as
-// under "binpack", while pools whose small sizes are cheaper per unit of the scarce resource split into several small
-// NodeClaims instead of one large one. The rule is greedy per pod: where a large size is cheaper per unit than the
-// small ones, the first pod that would step the in-flight NodeClaim up to it sees the whole step as its own cost and
-// opens a new small NodeClaim instead, so such volume discounts are only captured by pods that need the large size
-// outright.
+// option with ties going to the in-flight NodeClaim. Pools whose small sizes are cheaper per unit of the scarce
+// resource split into several small NodeClaims instead of one large one. The rule is greedy per pod: the first pod that
+// would step the in-flight NodeClaim up to a larger size sees the whole step as its own cost. Where a large size is
+// cheaper per unit than the small ones, that pod opens a new small NodeClaim instead, so such volume discounts are only
+// captured by pods that need the large size outright. Pools whose sizes scale price linearly do not pack as under
+// "binpack" either: on a doubling ladder the step costs as much as the NodeClaim already does, while a fresh NodeClaim
+// costs the smallest size that fits the pod, so NodeClaims stop growing at about twice that size, and the extra nodes
+// each pay for their own kubelet reservation and DaemonSets (TestMarginalCostSplitsLinearPriceLadders: 25% dearer).
+// Opt in only NodePools whose small sizes are cheaper per unit, such as accelerator families.
 //
 // The policy is per NodePool. A scheduler with no marginal-cost NodePool runs the original binpack code path
 // unchanged. Once any NodePool opts in, every pod is priced, but a NodeClaim of a binpack NodePool always has a
