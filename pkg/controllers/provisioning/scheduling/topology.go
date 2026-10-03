@@ -99,7 +99,7 @@ func NewTopology(
 	for i := range pods {
 		errs = multierr.Append(errs, t.Update(ctx, pods[i]))
 	}
-	ConstructionPhaseDurationSeconds.Observe(time.Since(updateStart).Seconds(), map[string]string{phaseLabel: phaseTopologyUpdate})
+	ConstructionPhaseDurationSeconds.Observe(time.Since(updateStart).Seconds(), constructionPhaseLabels(ctx, phaseTopologyUpdate))
 	if errs != nil {
 		return nil, errs
 	}

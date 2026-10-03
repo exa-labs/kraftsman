@@ -80,7 +80,7 @@ func DomainGroupCacheFromContext(ctx context.Context) *DomainGroupCache {
 func domainGroupsWithCache(ctx context.Context, nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) map[string]TopologyDomainGroup {
 	start := time.Now()
 	defer func() {
-		ConstructionPhaseDurationSeconds.Observe(time.Since(start).Seconds(), map[string]string{phaseLabel: phaseDomainGroups})
+		ConstructionPhaseDurationSeconds.Observe(time.Since(start).Seconds(), constructionPhaseLabels(ctx, phaseDomainGroups))
 	}()
 	cache := DomainGroupCacheFromContext(ctx)
 	if cache == nil {

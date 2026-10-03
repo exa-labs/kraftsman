@@ -17,11 +17,14 @@ limitations under the License.
 package scheduling
 
 import (
+	"context"
+
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/injection"
 )
 
 const (
@@ -132,10 +135,11 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: schedulerSubsystem,
 			Name:      "construction_phase_duration_seconds",
-			Help:      "Duration of individual scheduler construction phases, labeled by phase.",
+			Help:      "Duration of individual scheduler construction phases, labeled by phase and by the controller that built the scheduler (the provisioner, or the disruption controllers' simulations).",
 			Buckets:   []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 		},
 		[]string{
+			ControllerLabel,
 			phaseLabel,
 		},
 	)
@@ -253,9 +257,10 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: schedulerSubsystem,
 			Name:      "packing_decisions_total",
-			Help:      "Number of pods placed by the marginal-cost packing policy by outcome (inflight: joined an in-flight NodeClaim, new: opened a new NodeClaim because that was cheaper than growing an in-flight one, new_no_inflight: opened a new NodeClaim because no in-flight NodeClaim fit, inflight_unpriced: joined an in-flight NodeClaim because a launch price was unavailable).",
+			Help:      "Number of pods placed by the marginal-cost packing policy by outcome (inflight: joined an in-flight NodeClaim, new: opened a new NodeClaim because that was cheaper than growing an in-flight one, new_no_inflight: opened a new NodeClaim because no in-flight NodeClaim fit, inflight_unpriced: joined an in-flight NodeClaim because a launch price was unavailable). Labeled by the controller that built the scheduler: disruption simulations pack their pods too, and their decisions are never launched as such.",
 		},
 		[]string{
+			ControllerLabel,
 			metrics.NodePoolLabel,
 			outcomeLabel,
 		},
@@ -266,9 +271,10 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: schedulerSubsystem,
 			Name:      "packing_shadow_decisions_total",
-			Help:      "Per-pod counterfactual of the marginal-cost-shadow packing policy: the decision marginal-cost would have made for the pod compared against what binpack actually did (same_new: both open a NodeClaim, same_inflight: both join the same in-flight NodeClaim, would_join_other_inflight: marginal-cost would have joined a different in-flight NodeClaim, would_open_new: marginal-cost would have opened a new NodeClaim where binpack joined an in-flight one). Labeled by the NodePool of the marginal-cost choice. Emitted only while no live marginal-cost NodePool exists; with one present every pod is genuinely priced and the verdicts land in packing_decisions_total.",
+			Help:      "Per-pod counterfactual of the marginal-cost-shadow packing policy: the decision marginal-cost would have made for the pod compared against what binpack actually did (same_new: both open a NodeClaim, same_inflight: both join the same in-flight NodeClaim, would_join_other_inflight: marginal-cost would have joined a different in-flight NodeClaim, would_open_new: marginal-cost would have opened a new NodeClaim where binpack joined an in-flight one). Labeled by the NodePool of the marginal-cost choice. Emitted only while no live marginal-cost NodePool exists; with one present every pod is genuinely priced and the verdicts land in packing_decisions_total. Labeled by the controller that built the scheduler.",
 		},
 		[]string{
+			ControllerLabel,
 			metrics.NodePoolLabel,
 			outcomeLabel,
 		},
@@ -287,3 +293,15 @@ var (
 		},
 	)
 )
+
+// constructionPhaseLabels labels a construction phase observation with the phase and the controller
+// that built the scheduler, as scheduling_duration_seconds is labeled.
+func constructionPhaseLabels(ctx context.Context, phase string) map[string]string {
+	return map[string]string{ControllerLabel: injection.GetControllerName(ctx), phaseLabel: phase}
+}
+
+// packingLabels labels a packing decision with the controller that built the scheduler, the NodePool
+// of the placement and its outcome.
+func packingLabels(ctx context.Context, nodePool, outcome string) map[string]string {
+	return map[string]string{ControllerLabel: injection.GetControllerName(ctx), metrics.NodePoolLabel: nodePool, outcomeLabel: outcome}
+}
