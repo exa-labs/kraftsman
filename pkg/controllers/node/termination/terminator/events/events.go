@@ -53,7 +53,7 @@ func DisruptPodDelete(pod *corev1.Pod, gracePeriodSeconds *int64, nodeGracePerio
 // SurgeEvictionIsolated is published when a pod is released from its ReplicaSet so that the ReplicaSet starts its
 // replacement while the pod keeps running.
 func SurgeEvictionIsolated(pod *corev1.Pod, replicaSet string) events.Event {
-	return surgeEviction(pod, corev1.EventTypeNormal, "isolated", fmt.Sprintf("Released pod from ReplicaSet %s so it starts a replacement; the pod is deleted once the ReplicaSet is fully available", replicaSet))
+	return surgeEviction(pod, corev1.EventTypeNormal, "isolated", fmt.Sprintf("Released pod from ReplicaSet %s so it starts a replacement; the pod is evicted once the ReplicaSet is fully available again", replicaSet))
 }
 
 // SurgeEvictionCompleted is published when a pod released for surge eviction is handed to the eviction queue.
