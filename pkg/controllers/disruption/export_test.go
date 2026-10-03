@@ -16,6 +16,11 @@ limitations under the License.
 
 package disruption
 
+import (
+	"context"
+	"time"
+)
+
 // EvaluatedCycleSize exposes the coverage-cycle cursor's size to the external test package.
 func (s *SingleNodeConsolidation) EvaluatedCycleSize() int {
 	return s.evaluatedThisCycle.Len()
@@ -25,4 +30,14 @@ func (s *SingleNodeConsolidation) EvaluatedCycleSize() int {
 // external test package stage a partially-covered cycle.
 func (s *SingleNodeConsolidation) SeedEvaluatedCycle(providerIDs ...string) {
 	s.evaluatedThisCycle.Insert(providerIDs...)
+}
+
+// AdmitHeldProposals runs batched admission over commands the walk computed at the given times,
+// letting the external test package stage proposals of different ages.
+func (s *SingleNodeConsolidation) AdmitHeldProposals(ctx context.Context, cmds []Command, foundAt []time.Time) ([]Command, error) {
+	proposals := make([]consolidationProposal, len(cmds))
+	for i := range cmds {
+		proposals[i] = consolidationProposal{cmd: cmds[i], position: i, foundAt: foundAt[i]}
+	}
+	return s.admitProposals(ctx, proposals)
 }

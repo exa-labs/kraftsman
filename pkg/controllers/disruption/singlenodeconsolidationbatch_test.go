@@ -40,7 +40,8 @@ import (
 )
 
 // scriptedValidator answers Validate from a fixed script, one entry per call, so a test can
-// place a rejection at an exact position in a batch. Calls past the script are accepted.
+// place a rejection at an exact position in a batch. Calls past the script are accepted. Like the
+// real validator, it spends the validation period it is given, on the suite's fake clock.
 type scriptedValidator struct {
 	errs  []error
 	calls int
@@ -51,6 +52,7 @@ type scriptedValidator struct {
 
 func (v *scriptedValidator) Validate(_ context.Context, cmd disruption.Command, period time.Duration) (disruption.Command, error) {
 	v.periods = append(v.periods, period)
+	env.Clock.Step(period)
 	i := v.calls
 	v.calls++
 	if i < len(v.errs) && v.errs[i] != nil {
@@ -289,6 +291,37 @@ var _ = Describe("Batched Single-Node Consolidation", func() {
 		Expect(validator.periods).To(Equal([]time.Duration{15 * time.Second, 0, 0}))
 	})
 
+	It("counts walk time after a proposal was found toward its settling window", func() {
+		applyNodes(4, "1")
+		candidates := candidatesFor(singleNode)
+		cmds := lo.Map(candidates[:3], func(c *disruption.Candidate, _ int) disruption.Command {
+			return disruption.Command{Candidates: []*disruption.Candidate{c}}
+		})
+		now := env.Clock.Now()
+		// Found 20s, 10s and 0s before the walk ended. The first is past its window and validates
+		// at once; the second waits out the 5s it has left; the third has 10s left once the second's
+		// wait has run.
+		admitted, err := singleNode.AdmitHeldProposals(ctx, cmds, []time.Time{now.Add(-20 * time.Second), now.Add(-10 * time.Second), now})
+		Expect(err).To(Succeed())
+		Expect(admitted).To(HaveLen(3))
+		Expect(validator.periods).To(Equal([]time.Duration{0, 5 * time.Second, 10 * time.Second}))
+		// No proposal is validated sooner than the settling window after it was found.
+		Expect(env.Clock.Now()).To(Equal(now.Add(15 * time.Second)))
+	})
+
+	It("does not wait when every proposal was found a full settling window before the walk ended", func() {
+		applyNodes(4, "1")
+		candidates := candidatesFor(singleNode)
+		cmds := lo.Map(candidates[:2], func(c *disruption.Candidate, _ int) disruption.Command {
+			return disruption.Command{Candidates: []*disruption.Candidate{c}}
+		})
+		now := env.Clock.Now()
+		admitted, err := singleNode.AdmitHeldProposals(ctx, cmds, []time.Time{now.Add(-time.Minute), now.Add(-15 * time.Second)})
+		Expect(err).To(Succeed())
+		Expect(admitted).To(HaveLen(2))
+		Expect(validator.periods).To(Equal([]time.Duration{0, 0}))
+	})
+
 	It("keeps the one-command-per-pass behavior when the cap is 1", func() {
 		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{MaxConsolidationCommandsPerPass: lo.ToPtr(1)}))
 		applyNodes(4, "1")
@@ -420,7 +453,7 @@ var _ = Describe("Batched Single-Node Consolidation", func() {
 		applyNodes(5, "1")
 		// A clock that advances as the walk reads it runs the pass past its timeout with proposals
 		// in hand; the walk breaks out, and admission's own budget covers all of them.
-		disruption.SingleNodeConsolidationTimeoutDuration = 3 * time.Second
+		disruption.SingleNodeConsolidationTimeoutDuration = 5 * time.Second
 		method := disruption.NewSingleNodeConsolidation(
 			disruption.MakeConsolidation(&steppingClock{FakeClock: env.Clock, step: time.Second}, cluster, env.Client, prov, cloudProvider, recorder, queue),
 			disruption.WithValidator(validator),

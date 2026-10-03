@@ -66,6 +66,16 @@ type consolidationProposal struct {
 	// position is the candidate's index in the sorted candidate list, recorded so accepted
 	// commands still report the traversal depth they were found at.
 	position int
+	// foundAt is when the walk computed the command. Its settling window runs from here, so
+	// walk time spent after it counts toward the window.
+	foundAt time.Time
+}
+
+// remainingValidationDelay is how much of a command's settling window is still to run when its
+// validation is about to start: the window is commandValidationDelay long and opens when the
+// command was computed, exactly as for a command validated the moment it was found.
+func remainingValidationDelay(foundAt, now time.Time) time.Duration {
+	return max(0, foundAt.Add(commandValidationDelay).Sub(now))
 }
 
 // SingleNodeConsolidation evaluates one node at a time for consolidation.
@@ -298,7 +308,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			return []Command{cmd}, nil
 		}
 
-		proposals = append(proposals, consolidationProposal{cmd: cmd, position: i})
+		proposals = append(proposals, consolidationProposal{cmd: cmd, position: i, foundAt: s.clock.Now()})
 		for _, held := range cmd.Candidates {
 			claimedProviderIDs.Insert(held.ProviderID())
 		}
@@ -378,9 +388,6 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 	// Admission runs on its own budget, so a pass that walked right up to its timeout - or past it,
 	// having broken out of the walk holding proposals - still admits what it paid to find.
 	deadline := s.clock.Now().Add(admissionBudget(len(proposals)))
-	// The settling window observes churn in the pass as a whole, so only the first validation
-	// waits it out; the rest inherit the elapsed time, as they do within one multi-node command.
-	validationDelay := commandValidationDelay
 	// The first proposal is always attempted, since a pass has always been allowed to validate
 	// the command it found. Every proposal after it costs another re-simulation, so the reserve
 	// gates them whether or not the attempts before them produced a command.
@@ -396,10 +403,16 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "replacements_not_launched")
 			continue
 		}
+		// Each proposal is validated no sooner than commandValidationDelay after it was computed,
+		// the same guarantee a command validated as soon as it is found gets. Walk time after a
+		// proposal was found, and the waits and validations of the proposals before it, already
+		// count toward its window, so only what is left of it is waited out.
+		validationDelay := remainingValidationDelay(proposal.foundAt, s.clock.Now())
 		if validationDelay == 0 {
-			// The validator only drops pass-scoped reads when it waits. Commands admitted before
-			// this one moved pods and launched replacements, so drop them here as well: this
-			// proposal has to be judged against the cluster those commands left behind.
+			// The validator only drops pass-scoped reads when it waits. The walk pinned them before
+			// this proposal's window elapsed, and commands admitted before this one moved pods and
+			// launched replacements, so drop them here as well: this proposal has to be judged
+			// against the cluster as it stands now.
 			ctx = scheduling.WithTopologyPassCache(ctx, scheduling.NewTopologyPassCache())
 			ctx = scheduling.WithInverseAffinityCache(ctx, scheduling.NewInverseAffinityCache())
 			ctx = WithPassReads(ctx, NewPassReads())
@@ -408,7 +421,6 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 			}
 		}
 		_, err := s.validator.Validate(ctx, proposal.cmd, validationDelay)
-		validationDelay = 0
 		attempted = true
 		if err != nil {
 			if !IsValidationError(err) {
