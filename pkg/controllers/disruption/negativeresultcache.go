@@ -18,10 +18,15 @@ package disruption
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"hash/maphash"
+	"maps"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +34,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/dump"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -50,9 +56,12 @@ import (
 // requirements, budgets - spec only, so the counter patches of ordinary node churn don't
 // invalidate entries), the set of reschedulable pods at their own resourceVersions (a pod that
 // gains a toleration or resizes its requests changes what the simulation would do), and the
-// NodePool's instance type revision. That revision hashes instance type names and requirements
-// only: a Spot price move or an offering becoming (un)available does not change it, so cheaper
-// prices are picked up on TTL expiry, not fingerprint change. The fingerprint also cannot see the
+// content of the NodePool's instance types: names, capacity, overhead, and the requirements their
+// offerings do not carry. Offerings are left out, so a Spot price move or an offering becoming
+// (un)available does not change the fingerprint, and cheaper prices are picked up on TTL expiry.
+// The provider's instance type revision cannot stand in for that content: its contract requires
+// it to change whenever anything returned can differ, offerings included, so on a fleet where
+// offering availability moves every few minutes it changes between nearly every pair of passes. The fingerprint also cannot see the
 // rest of the fleet's pods - capacity another node frees can turn "pods did not schedule" into a
 // delete - which the same TTL bounds, and the cache is dropped entirely whenever the pass admits
 // a command.
@@ -166,14 +175,21 @@ func (d *noOpDurability) Conclusive() bool {
 	return !d.inconclusive.Load()
 }
 
-// negativeCacheFingerprints resolves fingerprints for a pass's candidates. Instance type
-// revisions are looked up once per NodePool per pass, and the fleet component once per pass.
+// negativeCacheFingerprints resolves fingerprints for a pass's candidates. Instance type content
+// is resolved once per NodePool per pass, and the fleet component once per pass.
 type negativeCacheFingerprints struct {
 	kubeClient       client.Client
 	cloudProvider    cloudprovider.CloudProvider
 	revisionProvider cloudprovider.InstanceTypeRevisionProvider
-	revisions        map[string]uint64
+	contents         map[string]instanceTypeContent
 	fleet            *string
+}
+
+// instanceTypeContent is a NodePool's resolved instance type content hash; ok is false when it
+// could not be resolved, which makes every fingerprint depending on it unresolvable.
+type instanceTypeContent struct {
+	hash uint64
+	ok   bool
 }
 
 func newNegativeCacheFingerprints(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider) *negativeCacheFingerprints {
@@ -182,7 +198,7 @@ func newNegativeCacheFingerprints(kubeClient client.Client, cloudProvider cloudp
 		kubeClient:       kubeClient,
 		cloudProvider:    cloudProvider,
 		revisionProvider: revisionProvider,
-		revisions:        map[string]uint64{},
+		contents:         map[string]instanceTypeContent{},
 	}
 }
 
@@ -192,7 +208,7 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 	if candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
 		return ""
 	}
-	revision, ok := f.instanceTypeRevision(ctx, candidate.NodePool)
+	instanceTypes, ok := f.instanceTypeContent(ctx, candidate.NodePool)
 	if !ok {
 		return ""
 	}
@@ -226,8 +242,7 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 	// The NodePool is fingerprinted by UID and generation, not resourceVersion: its status counters
 	// are patched on every node join/leave, so resourceVersion churns continuously on a busy fleet
 	// while only spec changes can alter what the simulation would do with this candidate. The UID
-	// covers a delete/recreate under the same name, which resets generation and, per the
-	// InstanceTypesRevisionProvider contract, may reuse a revision for different content. The
+	// covers a delete/recreate under the same name, which resets generation. The
 	// spot-to-spot stability annotations steer the decision from metadata, which generation does
 	// not track, so their raw values are carried explicitly.
 	return fmt.Sprintf("%s|%s|%s:%d|%d|%s|%s|%s|%s",
@@ -235,7 +250,7 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 		nodeClaim,
 		candidate.NodePool.UID,
 		candidate.NodePool.Generation,
-		revision,
+		instanceTypes,
 		strings.Join(podUIDs, ","),
 		candidate.NodePool.Annotations[v1.NodePoolSpotToSpotMinNodeAgeAnnotationKey],
 		candidate.NodePool.Annotations[v1.NodePoolSpotToSpotMinSavingsAnnotationKey],
@@ -315,7 +330,7 @@ func contentHash(value any) (string, bool) {
 }
 
 // fleetComponent is the fingerprint's view of every NodePool a replacement could be templated
-// from: each ready managed pool's name, UID, generation, and instance type revision, resolved once
+// from: each ready managed pool's name, UID, generation, and instance type content, resolved once
 // per pass. Only ready pools are included, so a pool's Ready condition flipping changes the
 // component by changing the set. It fails closed — no fleet component, no fingerprint — when the
 // pools cannot be listed or any pool's offerings cannot be versioned.
@@ -334,12 +349,12 @@ func (f *negativeCacheFingerprints) fleetComponent(ctx context.Context) (string,
 		if !nodePool.StatusConditions().IsTrue(status.ConditionReady) {
 			continue
 		}
-		revision, ok := f.instanceTypeRevision(ctx, nodePool)
+		instanceTypes, ok := f.instanceTypeContent(ctx, nodePool)
 		if !ok {
 			f.fleet = &failed
 			return "", false
 		}
-		parts = append(parts, fmt.Sprintf("%s:%s:%d:%d", nodePool.Name, nodePool.UID, nodePool.Generation, revision))
+		parts = append(parts, fmt.Sprintf("%s:%s:%d:%d", nodePool.Name, nodePool.UID, nodePool.Generation, instanceTypes))
 	}
 	sort.Strings(parts)
 	fleet := "{" + strings.Join(parts, ";") + "}"
@@ -347,22 +362,127 @@ func (f *negativeCacheFingerprints) fleetComponent(ctx context.Context) (string,
 	return fleet, true
 }
 
-// instanceTypeRevision returns the revision of the candidate NodePool's instance type list,
-// without materializing the list. The revision covers instance type identity and requirements: a
-// provider that cannot version them at all makes every fingerprint unresolvable, while price and
-// offering-availability changes are invisible to the revision by design and are bounded by the
-// entry TTL instead.
-func (f *negativeCacheFingerprints) instanceTypeRevision(ctx context.Context, nodePool *v1.NodePool) (uint64, bool) {
-	if f.revisionProvider == nil {
-		return 0, false
+// instanceTypeContent returns the hash of the NodePool's instance types as a verdict depends on
+// them (see instanceTypesContentHash), resolved once per pass. It fails closed when the provider
+// reports no stable instance type revision, as a provider that cannot version its instance types
+// gives no assurance that two lists fetched a pass apart describe the same fleet, and when the
+// list cannot be fetched.
+func (f *negativeCacheFingerprints) instanceTypeContent(ctx context.Context, nodePool *v1.NodePool) (uint64, bool) {
+	if content, ok := f.contents[nodePool.Name]; ok {
+		return content.hash, content.ok
 	}
-	if revision, ok := f.revisions[nodePool.Name]; ok {
-		return revision, revision != 0
+	content := instanceTypeContent{}
+	if f.revisionProvider != nil {
+		if revision, err := f.revisionProvider.InstanceTypeRevision(ctx, nodePool); err == nil && revision != 0 {
+			if instanceTypes, err := f.cloudProvider.GetInstanceTypes(ctx, nodePool); err == nil {
+				hash, ok := instanceTypesContentHash(instanceTypes)
+				content = instanceTypeContent{hash: hash, ok: ok}
+			}
+		}
 	}
-	revision, err := f.revisionProvider.InstanceTypeRevision(ctx, nodePool)
-	if err != nil {
-		revision = 0
+	f.contents[nodePool.Name] = content
+	return content.hash, content.ok
+}
+
+// instanceTypeContentSeed seeds the content hashes. Verdicts live in memory only, so a hash needs
+// to be stable for the life of the process and no longer.
+var instanceTypeContentSeed = maphash.MakeSeed()
+
+// instanceTypesContentHash hashes what a consolidation verdict depends on in a list of instance
+// types: each type's name, capacity, overhead, requirements, DRA device metadata, and offering
+// capacity and overhead overrides together with the requirements of the offering they apply to,
+// combined order-insensitively. Offering prices and availability are left out, and so are the type-level
+// requirement keys offerings also carry (zone, capacity type, reservation): providers derive
+// those from which offerings are available, so they move with availability, and their changes
+// are bounded by the entry TTL like price moves.
+func instanceTypesContentHash(instanceTypes []*cloudprovider.InstanceType) (uint64, bool) {
+	// Each type is hashed on its own and the per-type hashes are summed, so the result does not
+	// depend on list order even when several types share a name (one per region or backend).
+	var combined uint64
+	for _, instanceType := range instanceTypes {
+		var hash maphash.Hash
+		hash.SetSeed(instanceTypeContentSeed)
+		hash.WriteString(instanceType.Name)
+		hash.WriteByte(0)
+		// Requirement hashes cover their own key, so summing them is an order-insensitive
+		// combination that needs neither a sort nor an allocation.
+		var requirements uint64
+		for key, requirement := range instanceType.Requirements {
+			if !carriedByOfferings(instanceType.Offerings, key) {
+				requirements += requirement.ContentHash64(instanceTypeContentSeed)
+			}
+		}
+		writeUint64(&hash, requirements)
+		hash.WriteByte(1)
+		writeResources(&hash, instanceType.Capacity)
+		hash.WriteByte(2)
+		if instanceType.Overhead != nil {
+			writeResources(&hash, instanceType.Overhead.Total())
+		}
+		hash.WriteByte(3)
+		writeUint64(&hash, offeringOverridesHash(instanceType.Offerings))
+		hash.WriteByte(4)
+		if len(instanceType.DynamicResources.ResourceSliceTemplates) > 0 || len(instanceType.DynamicResources.AttributeBindings) > 0 {
+			// The device metadata holds interned handles that JSON encodes as empty objects, so
+			// it is dumped by content, following pointers and sorting map keys.
+			hash.WriteString(dump.ForHash(instanceType.DynamicResources))
+		}
+		hash.WriteByte(5)
+		combined += hash.Sum64()
 	}
-	f.revisions[nodePool.Name] = revision
-	return revision, revision != 0
+	return maphash.Comparable(instanceTypeContentSeed, [2]uint64{combined, uint64(len(instanceTypes))}), true
+}
+
+// offeringOverridesHash combines, order-insensitively, each offering's capacity and overhead
+// overrides with the requirements of the offering they apply to, so moving an override from one
+// zone to another changes it. Offerings without overrides contribute nothing, which keeps
+// availability and price out of it.
+func offeringOverridesHash(offerings cloudprovider.Offerings) uint64 {
+	var combined uint64
+	for _, offering := range offerings {
+		if offering.CapacityOverride == nil && offering.OverheadOverride == nil {
+			continue
+		}
+		var hash maphash.Hash
+		hash.SetSeed(instanceTypeContentSeed)
+		var requirements uint64
+		for _, requirement := range offering.Requirements {
+			requirements += requirement.ContentHash64(instanceTypeContentSeed)
+		}
+		writeUint64(&hash, requirements)
+		writeResources(&hash, offering.CapacityOverride)
+		hash.WriteByte(0)
+		if offering.OverheadOverride != nil {
+			writeResources(&hash, offering.OverheadOverride.Total())
+		}
+		combined += hash.Sum64()
+	}
+	return combined
+}
+
+// carriedByOfferings reports whether any of the offerings constrains the requirement key.
+func carriedByOfferings(offerings cloudprovider.Offerings, key string) bool {
+	for _, offering := range offerings {
+		if _, ok := offering.Requirements[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func writeUint64(hash *maphash.Hash, value uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], value)
+	_, _ = hash.Write(buf[:])
+}
+
+func writeResources(hash *maphash.Hash, resources corev1.ResourceList) {
+	for _, name := range slices.Sorted(maps.Keys(resources)) {
+		quantity := resources[name]
+		hash.WriteString(string(name))
+		hash.WriteByte(0)
+		var buf [20]byte
+		_, _ = hash.Write(strconv.AppendInt(buf[:0], quantity.MilliValue(), 10))
+		hash.WriteByte(0)
+	}
 }

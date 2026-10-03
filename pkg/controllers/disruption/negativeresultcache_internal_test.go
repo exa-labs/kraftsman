@@ -19,10 +19,13 @@ package disruption
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,8 +34,10 @@ import (
 	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 func TestNegativeResultCacheLifecycle(t *testing.T) {
@@ -111,12 +116,19 @@ func TestNoOpDurability(t *testing.T) {
 	markNoOpInconclusive(context.Background())
 }
 
-// fakeRevisionProvider wraps the fake cloud provider with a fixed instance type revision.
+// fakeRevisionProvider wraps the fake cloud provider with a fixed instance type revision and
+// counts revision and instance type lookups.
 type fakeRevisionProvider struct {
 	*fake.CloudProvider
 	revision uint64
 	err      error
 	calls    int
+	getCalls int
+}
+
+func (f *fakeRevisionProvider) GetInstanceTypes(ctx context.Context, nodePool *v1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	f.getCalls++
+	return f.CloudProvider.GetInstanceTypes(ctx, nodePool)
 }
 
 func (f *fakeRevisionProvider) InstanceTypeRevision(_ context.Context, _ *v1.NodePool) (uint64, error) {
@@ -242,9 +254,6 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 			t.Fatalf("changing the %s did not change the fingerprint", name)
 		}
 	}
-	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: fake.NewCloudProvider(), revision: 8}).fingerprint(ctx, base); got == baseFingerprint {
-		t.Fatal("changing the instance type revision did not change the fingerprint")
-	}
 
 	// The simulation searches every ready NodePool for a replacement, so a change to any other
 	// pool — not just the candidate's — must change the fingerprint.
@@ -303,6 +312,177 @@ func TestNegativeCacheFingerprintIgnoresHeartbeats(t *testing.T) {
 	}
 }
 
+// TestNegativeCacheFingerprintFollowsInstanceTypeContent pins that the instance type component
+// follows content, not the provider's revision.
+func TestNegativeCacheFingerprintFollowsInstanceTypeContent(t *testing.T) {
+	ctx := context.Background()
+	base := fingerprintCandidate("n1", "c1", 1, "uid-a")
+	baseFingerprint := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: fake.NewCloudProvider(), revision: 7}).fingerprint(ctx, base)
+	if baseFingerprint == "" {
+		t.Fatal("a fully versioned candidate must fingerprint")
+	}
+	// A provider bumps its revision whenever anything it returns can differ, offerings included;
+	// a bump over unchanged instance types must not invalidate verdicts.
+	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: fake.NewCloudProvider(), revision: 8}).fingerprint(ctx, base); got != baseFingerprint {
+		t.Fatal("a revision bump over unchanged instance types changed the fingerprint")
+	}
+	changedTypes := fake.NewCloudProvider()
+	changedTypes.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType("only-instance-type")}
+	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: changedTypes, revision: 7}).fingerprint(ctx, base); got == baseFingerprint {
+		t.Fatal("changing the NodePool's instance types did not change the fingerprint")
+	}
+}
+
+// TestInstanceTypesContentHash pins what the instance type component of a fingerprint covers:
+// names, capacity, and requirements, but not offerings or the requirement keys offerings carry,
+// whose changes are price and availability moves the entry TTL bounds.
+func TestInstanceTypesContentHash(t *testing.T) {
+	offering := func(zone, capacityType string, price float64, available bool) cloudprovider.Offering {
+		return cloudprovider.Offering{
+			Available: available,
+			Price:     price,
+			Requirements: scheduling.NewLabelRequirements(map[string]string{
+				corev1.LabelTopologyZone: zone,
+				v1.CapacityTypeLabelKey:  capacityType,
+			}),
+		}
+	}
+	instanceTypes := func(price float64, available bool, zones []string, arch string, cpu string) []*cloudprovider.InstanceType {
+		offerings := lo.Map(zones, func(zone string, _ int) cloudprovider.Offering { return offering(zone, "spot", price, available) })
+		return []*cloudprovider.InstanceType{
+			fake.NewInstanceType("type-b"),
+			fake.NewInstanceType("type-a",
+				fake.WithOfferings(offerings...),
+				fake.WithArchitecture(arch),
+				fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)}),
+			),
+		}
+	}
+	base := mustContentHash(t, instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4"))
+
+	for name, unchanged := range map[string][]*cloudprovider.InstanceType{
+		"an offering price move":               instanceTypes(0.5, true, []string{"zone-1", "zone-2"}, "amd64", "4"),
+		"an offering becoming unavailable":     instanceTypes(1.0, false, []string{"zone-1", "zone-2"}, "amd64", "4"),
+		"a zone's offering disappearing":       instanceTypes(1.0, true, []string{"zone-1"}, "amd64", "4"),
+		"the list arriving in another order":   reversed(instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4")),
+		"the same content built a second time": instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4"),
+	} {
+		if got := mustContentHash(t, unchanged); got != base {
+			t.Fatalf("%s changed the instance type content hash", name)
+		}
+	}
+	for name, changed := range map[string][]*cloudprovider.InstanceType{
+		"a requirement offerings do not carry": instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "arm64", "4"),
+		"capacity":                             instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "8"),
+		"the set of instance types":            instanceTypes(1.0, true, []string{"zone-1", "zone-2"}, "amd64", "4")[1:],
+	} {
+		if got := mustContentHash(t, changed); got == base {
+			t.Fatalf("changing %s did not change the instance type content hash", name)
+		}
+	}
+}
+
+// mustContentHash returns the fingerprint of a fixed candidate whose NodePool offers the given
+// instance types, at an unchanging provider revision. Going through the fingerprint rather than
+// the hash helper keeps these tests meaningful against fingerprints that ignore instance type
+// content: there, every "must change" case fails.
+func mustContentHash(t *testing.T, instanceTypes []*cloudprovider.InstanceType) string {
+	t.Helper()
+	provider := fake.NewCloudProvider()
+	provider.InstanceTypes = instanceTypes
+	fingerprint := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: provider, revision: 7}).
+		fingerprint(context.Background(), fingerprintCandidate("n1", "c1", 1, "uid-a"))
+	if fingerprint == "" {
+		t.Fatal("the candidate could not be fingerprinted")
+	}
+	return fingerprint
+}
+
+// TestInstanceTypesContentHashCoversOverridesAndDevices pins that offering resource overrides,
+// keyed to the offering they apply to, and DRA device metadata are part of the content.
+func TestInstanceTypesContentHashCoversOverridesAndDevices(t *testing.T) {
+	zoneOffering := func(zone string, available bool, gpus string) cloudprovider.Offering {
+		o := cloudprovider.Offering{
+			Available: available,
+			Price:     1,
+			Requirements: scheduling.NewLabelRequirements(map[string]string{
+				corev1.LabelTopologyZone: zone,
+				v1.CapacityTypeLabelKey:  "on-demand",
+			}),
+		}
+		if gpus != "" {
+			o.CapacityOverride = corev1.ResourceList{"example.com/gpu": resource.MustParse(gpus)}
+		}
+		return o
+	}
+	withOfferings := func(offerings ...cloudprovider.Offering) []*cloudprovider.InstanceType {
+		return []*cloudprovider.InstanceType{fake.NewInstanceType("type-a", fake.WithOfferings(offerings...))}
+	}
+	base := mustContentHash(t, withOfferings(zoneOffering("zone-1", true, "1"), zoneOffering("zone-2", true, "")))
+
+	if got := mustContentHash(t, withOfferings(zoneOffering("zone-1", false, "1"), zoneOffering("zone-2", true, ""))); got != base {
+		t.Fatal("an overridden offering becoming unavailable changed the hash")
+	}
+	for name, changed := range map[string][]*cloudprovider.InstanceType{
+		"an offering's capacity override":       withOfferings(zoneOffering("zone-1", true, "2"), zoneOffering("zone-2", true, "")),
+		"which offering an override applies to": withOfferings(zoneOffering("zone-1", true, ""), zoneOffering("zone-2", true, "1")),
+		"the instance type's DRA device metadata": func() []*cloudprovider.InstanceType {
+			instanceTypes := withOfferings(zoneOffering("zone-1", true, "1"), zoneOffering("zone-2", true, ""))
+			template := fake.ResourceSliceTemplate("gpu.example.com", "pool", fake.Devices("gpu-0")...)
+			instanceTypes[0].DynamicResources.ResourceSliceTemplates = []*cloudprovider.ResourceSliceTemplate{&template}
+			return instanceTypes
+		}(),
+	} {
+		if got := mustContentHash(t, changed); got == base {
+			t.Fatalf("changing %s did not change the hash", name)
+		}
+	}
+
+	// Device metadata is hashed by content: the same templates rebuilt are the same, and a
+	// different driver name, held in an interned handle, is different.
+	withDriver := func(driver string) []*cloudprovider.InstanceType {
+		instanceTypes := withOfferings(zoneOffering("zone-1", true, "1"), zoneOffering("zone-2", true, ""))
+		template := fake.ResourceSliceTemplate(driver, "pool", fake.Devices("gpu-0")...)
+		instanceTypes[0].DynamicResources.ResourceSliceTemplates = []*cloudprovider.ResourceSliceTemplate{&template}
+		return instanceTypes
+	}
+	withGPU := mustContentHash(t, withDriver("gpu.example.com"))
+	if rebuilt := mustContentHash(t, withDriver("gpu.example.com")); rebuilt != withGPU {
+		t.Fatal("rebuilding identical device metadata changed the hash")
+	}
+	if mustContentHash(t, withDriver("other.example.com")) == withGPU {
+		t.Fatal("changing a device driver did not change the hash")
+	}
+}
+
+// TestInstanceTypesContentHashOrderWithSharedNames pins order-insensitivity when several instance
+// types share a name, as a provider with one backend per region returns them, in whatever order
+// its backends answered.
+func TestInstanceTypesContentHashOrderWithSharedNames(t *testing.T) {
+	inZone := func(zone, cpu string) *cloudprovider.InstanceType {
+		return fake.NewInstanceType("shared-name",
+			fake.WithOfferings(cloudprovider.Offering{
+				Available:    true,
+				Price:        1,
+				Requirements: scheduling.NewLabelRequirements(map[string]string{corev1.LabelTopologyZone: zone, v1.CapacityTypeLabelKey: "spot"}),
+			}),
+			fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(cpu)}),
+		)
+	}
+	x, y := inZone("zone-1", "4"), inZone("zone-2", "8")
+	if mustContentHash(t, []*cloudprovider.InstanceType{x, y}) != mustContentHash(t, []*cloudprovider.InstanceType{y, x}) {
+		t.Fatal("the order of instance types sharing a name changed the hash")
+	}
+	if mustContentHash(t, []*cloudprovider.InstanceType{x, x}) == mustContentHash(t, []*cloudprovider.InstanceType{x}) {
+		t.Fatal("a repeated instance type canceled out of the hash")
+	}
+}
+
+func reversed(instanceTypes []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {
+	slices.Reverse(instanceTypes)
+	return instanceTypes
+}
+
 func managedNodePool(generation int64, ready bool) *v1.NodePool {
 	const name = "pool-other"
 	nodePool := &v1.NodePool{
@@ -339,6 +519,11 @@ func TestNegativeCacheFingerprintFailsClosed(t *testing.T) {
 	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: fake.NewCloudProvider(), revision: 0}).fingerprint(ctx, base); got != "" {
 		t.Fatal("a zero revision must not fingerprint")
 	}
+	unlistable := fake.NewCloudProvider()
+	unlistable.ErrorsForNodePool[base.NodePool.Name] = errors.New("unavailable")
+	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(), &fakeRevisionProvider{CloudProvider: unlistable, revision: 7}).fingerprint(ctx, base); got != "" {
+		t.Fatal("a NodePool whose instance types cannot be listed must not fingerprint")
+	}
 
 	incomplete := fingerprintCandidate("n1", "c1", 1, "uid-a")
 	incomplete.NodePool = nil
@@ -360,7 +545,24 @@ func TestNegativeCacheFingerprintMemoizesRevisionPerPool(t *testing.T) {
 
 	fingerprints.fingerprint(ctx, fingerprintCandidate("n1", "c1", 1, "uid-a"))
 	fingerprints.fingerprint(ctx, fingerprintCandidate("n2", "c2", 1, "uid-b"))
-	if provider.calls != 1 {
-		t.Fatalf("expected one revision lookup per NodePool per pass, got %d", provider.calls)
+	if provider.calls != 1 || provider.getCalls != 1 {
+		t.Fatalf("expected one revision and one instance type lookup per NodePool per pass, got %d and %d", provider.calls, provider.getCalls)
+	}
+}
+
+// BenchmarkInstanceTypesContentHash measures the per-NodePool, per-pass cost of the instance type
+// component of the fingerprint for a list the size a large cloud provider returns.
+func BenchmarkInstanceTypesContentHash(b *testing.B) {
+	instanceTypes := make([]*cloudprovider.InstanceType, 0, 700)
+	for i := range 700 {
+		instanceTypes = append(instanceTypes, fake.NewInstanceType(fmt.Sprintf("instance-type-%d", i)))
+	}
+	provider := fake.NewCloudProvider()
+	provider.InstanceTypes = instanceTypes
+	revisionProvider := &fakeRevisionProvider{CloudProvider: provider, revision: 7}
+	candidate := fingerprintCandidate("n1", "c1", 1, "uid-a")
+	b.ReportAllocs()
+	for b.Loop() {
+		newNegativeCacheFingerprints(fakecr.NewFakeClient(), revisionProvider).fingerprint(context.Background(), candidate)
 	}
 }
