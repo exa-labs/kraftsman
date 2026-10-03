@@ -327,6 +327,93 @@ var _ = Describe("Negative Result Skip Cache", func() {
 		Expect(lookups(disruption.NegativeCacheLookupAbsent)).To(BeNumerically(">", absent))
 	})
 
+	It("keeps stored verdicts across another method's command when command clears are disabled", func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+			ConsolidationSkipUnchangedNegatives: lo.ToPtr(true),
+			ConsolidationNegativeCacheTTL:       lo.ToPtr(5 * time.Minute),
+			ConsolidationNegativeCacheClear:     lo.ToPtr(false),
+		}))
+		runPass()
+		absent := lookups(disruption.NegativeCacheLookupAbsent)
+		hit := lookups(disruption.NegativeCacheLookupHit)
+
+		// The completed command is left to the TTL, so the unchanged candidate is still served
+		// from its stored verdict instead of being simulated afresh.
+		queue.CompleteCommand(&disruption.Command{Succeeded: true})
+
+		runPass()
+		Expect(lookups(disruption.NegativeCacheLookupHit)).To(BeNumerically(">", hit))
+		Expect(lookups(disruption.NegativeCacheLookupAbsent)).To(Equal(absent))
+	})
+
+	It("keeps stored verdicts across an admitted command when command clears are disabled", func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
+			ConsolidationSkipUnchangedNegatives: lo.ToPtr(true),
+			ConsolidationNegativeCacheTTL:       lo.ToPtr(5 * time.Minute),
+			ConsolidationNegativeCacheClear:     lo.ToPtr(false),
+		}))
+		runPass()
+
+		// A second node whose small pod fits on the first is a real delete.
+		extraClaim, extraNode := test.NodeClaimAndNode(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey:            nodePool.Name,
+					corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+					v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+					corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+				},
+			},
+			Status: v1.NodeClaimStatus{
+				Allocatable: map[corev1.ResourceName]resource.Quantity{
+					corev1.ResourceCPU:  resource.MustParse("32"),
+					corev1.ResourcePods: resource.MustParse("100"),
+				},
+			},
+		})
+		extraClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		extraPod := test.Pod(test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: labels,
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion:         "apps/v1",
+					Kind:               "ReplicaSet",
+					Name:               rs.Name,
+					UID:                rs.UID,
+					Controller:         lo.ToPtr(true),
+					BlockOwnerDeletion: lo.ToPtr(true),
+				}},
+			},
+			ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+			},
+		})
+		ExpectApplied(ctx, env.Client, extraClaim, extraNode, extraPod)
+		ExpectManualBinding(ctx, env.Client, extraPod, extraNode)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{extraNode}, []*v1.NodeClaim{extraClaim})
+
+		env.Clock.Step(time.Second)
+		cluster.MarkUnconsolidated()
+		cmds, err := singleNode.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, candidates()...)
+		Expect(err).To(Succeed())
+		Expect(cmds).To(HaveLen(1))
+		absent := lookups(disruption.NegativeCacheLookupAbsent)
+		hit := lookups(disruption.NegativeCacheLookupHit)
+
+		// The admitted command did not drop the original candidate's verdict: the next pass
+		// serves it from the cache rather than simulating it afresh. The admitted delete is not
+		// executed here, so the pass is handed only the original candidate; otherwise it could
+		// return on the delete before reaching it.
+		env.Clock.Step(time.Second)
+		cluster.MarkUnconsolidated()
+		original := lo.Filter(candidates(), func(c *disruption.Candidate, _ int) bool { return c.Name() == node.Name })
+		Expect(original).To(HaveLen(1))
+		_, err = singleNode.ComputeCommands(ctx, map[string]int{nodePool.Name: 100}, original...)
+		Expect(err).To(Succeed())
+		Expect(lookups(disruption.NegativeCacheLookupHit)).To(BeNumerically(">", hit))
+		Expect(lookups(disruption.NegativeCacheLookupAbsent)).To(Equal(absent))
+	})
+
 	It("never skips a candidate when the provider cannot version its offerings", func() {
 		cloudProvider.InstanceTypesRevision = 0
 		absent := lookups(disruption.NegativeCacheLookupAbsent)

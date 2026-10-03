@@ -63,8 +63,8 @@ import (
 // it to change whenever anything returned can differ, offerings included, so on a fleet where
 // offering availability moves every few minutes it changes between nearly every pair of passes. The fingerprint also cannot see the
 // rest of the fleet's pods - capacity another node frees can turn "pods did not schedule" into a
-// delete - which the same TTL bounds, and the cache is dropped entirely whenever the pass admits
-// a command.
+// delete - which the same TTL bounds. Unless ConsolidationNegativeCacheClear is unset, the cache is
+// also dropped entirely whenever a command completes or the pass admits one.
 type NegativeResultCache struct {
 	mu      sync.Mutex
 	clk     clock.Clock
@@ -125,8 +125,9 @@ func (c *NegativeResultCache) StoreNegative(providerID, fingerprint string, ttl 
 	c.entries[providerID] = negativeEntry{fingerprint: fingerprint, expiresAt: c.clk.Now().Add(ttl)}
 }
 
-// Clear drops every entry. Called when a pass admits a command: an executed command changes the
-// free capacity every stored verdict was computed against, and the fingerprint cannot see that.
+// Clear drops every entry. Called, when ConsolidationNegativeCacheClear is set, when a command
+// completes or a pass admits one: an executed command changes the capacity every stored verdict
+// was computed against, and the fingerprint cannot see that.
 func (c *NegativeResultCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
