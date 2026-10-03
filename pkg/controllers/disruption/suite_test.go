@@ -176,6 +176,7 @@ var _ = AfterEach(func() {
 	disruption.DecisionsPerformedTotal.Reset()
 	disruption.NodepoolDecisionsPerformed.Reset()
 	disruption.ConsolidationODToSpotRetryTotal.Reset()
+	disruption.ConsolidationOnDemandZoneRetryTotal.Reset()
 })
 
 var _ = Describe("Simulate Scheduling", func() {
