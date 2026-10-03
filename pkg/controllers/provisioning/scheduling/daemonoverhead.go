@@ -38,6 +38,7 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -65,39 +66,115 @@ func candidateRequirements(nct *NodeClaimTemplate, it *cloudprovider.InstanceTyp
 	return candidate
 }
 
-// daemonAlternatives returns the node selection alternatives under which a daemon pod schedules onto a node
-// satisfying candidate. Kubernetes ORs the RequiredDuringScheduling node selector terms, so each term compatible with
-// candidate, combined with the pod's nodeSelector, is one alternative. Falls back to the pod's strict requirements
-// (its first term) when no term is compatible, which is how the caller established compatibility.
-func daemonAlternatives(candidate scheduling.Requirements, p *corev1.Pod) []scheduling.Requirements {
+// daemonNodeSelection holds what decides the node selection alternatives under which a daemon pod schedules onto a
+// node satisfying a candidate, built once per pod: each required node affinity term combined with the pod's
+// nodeSelector (or the nodeSelector alone when the pod has no terms), and the pod's strict requirements. Its
+// requirement sets are shared by every candidate and are only ever read.
+type daemonNodeSelection struct {
+	// terms holds one requirement set per required node affinity term, or the nodeSelector alone when hasTerms is false.
+	terms    []scheduling.Requirements
+	hasTerms bool
+	strict   scheduling.Requirements
+}
+
+func newDaemonNodeSelection(p *corev1.Pod) daemonNodeSelection {
 	labels := scheduling.NewLabelRequirements(p.Spec.NodeSelector)
 	var terms []corev1.NodeSelectorTerm
 	if affinity := p.Spec.Affinity; affinity != nil && affinity.NodeAffinity != nil && affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
 		terms = affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 	}
 	if len(terms) == 0 {
-		return []scheduling.Requirements{labels}
+		return daemonNodeSelection{terms: []scheduling.Requirements{labels}}
 	}
-	alternatives := lo.FilterMap(terms, func(term corev1.NodeSelectorTerm, _ int) (scheduling.Requirements, bool) {
-		alternative := scheduling.NewRequirements(labels.Values()...)
-		alternative.Add(scheduling.NewNodeSelectorRequirements(term.MatchExpressions...).Values()...)
-		return alternative, candidate.IsCompatible(alternative, scheduling.AllowUndefinedWellKnownLabels)
+	return daemonNodeSelection{
+		terms: lo.Map(terms, func(term corev1.NodeSelectorTerm, _ int) scheduling.Requirements {
+			alternative := scheduling.NewRequirements(labels.Values()...)
+			alternative.Add(scheduling.NewNodeSelectorRequirements(term.MatchExpressions...).Values()...)
+			return alternative
+		}),
+		hasTerms: true,
+		strict:   scheduling.NewStrictPodRequirements(p),
+	}
+}
+
+// alternatives returns the node selection alternatives under which the pod schedules onto a node satisfying
+// candidate. Kubernetes ORs the RequiredDuringScheduling node selector terms, so each term compatible with candidate,
+// combined with the pod's nodeSelector, is one alternative. Falls back to the pod's strict requirements (its first
+// term) when no term is compatible, which is how the caller established compatibility.
+func (s daemonNodeSelection) alternatives(candidate scheduling.Requirements) []scheduling.Requirements {
+	if !s.hasTerms {
+		return s.terms
+	}
+	alternatives := lo.Filter(s.terms, func(alternative scheduling.Requirements, _ int) bool {
+		return candidate.IsCompatible(alternative, scheduling.AllowUndefinedWellKnownLabels)
 	})
 	if len(alternatives) == 0 {
-		return []scheduling.Requirements{scheduling.NewStrictPodRequirements(p)}
+		return []scheduling.Requirements{s.strict}
 	}
 	return alternatives
+}
+
+// daemonPodMemo memoizes the per-pod inputs of computeDaemonOverhead for one overhead group build: each daemon pod's
+// effective requests (resources.Ceiling) and its node selection. Every instance type of a template walks the same
+// daemon pods, summing their requests once per label realization, and recomputing these per instance type and per
+// realization dominated the build. Neither depends on the instance type or the realization, so the memo returns
+// exactly what recomputing them would.
+type daemonPodMemo struct {
+	requests  map[*corev1.Pod]corev1.ResourceList
+	selection map[*corev1.Pod]daemonNodeSelection
+}
+
+func newDaemonPodMemo() *daemonPodMemo {
+	return &daemonPodMemo{requests: map[*corev1.Pod]corev1.ResourceList{}, selection: map[*corev1.Pod]daemonNodeSelection{}}
+}
+
+// requestsOf returns the effective requests of p. The returned list is shared and must not be mutated.
+func (m *daemonPodMemo) requestsOf(p *corev1.Pod) corev1.ResourceList {
+	if requests, ok := m.requests[p]; ok {
+		return requests
+	}
+	requests := resources.Ceiling(p).Requests
+	m.requests[p] = requests
+	return requests
+}
+
+// sum returns resources.RequestsForPods(pods...), merging the memoized per-pod requests in the same order.
+func (m *daemonPodMemo) sum(pods []*corev1.Pod) corev1.ResourceList {
+	lists := make([]corev1.ResourceList, len(pods))
+	for i, p := range pods {
+		lists[i] = m.requestsOf(p)
+	}
+	merged := resources.Merge(lists...)
+	merged[corev1.ResourcePods] = *resource.NewQuantity(int64(len(pods)), resource.DecimalExponent)
+	return merged
+}
+
+// alternatives returns the node selection alternatives of p for candidate from the memoized node selection of p.
+func (m *daemonPodMemo) alternatives(candidate scheduling.Requirements, p *corev1.Pod) []scheduling.Requirements {
+	selection, ok := m.selection[p]
+	if !ok {
+		selection = newDaemonNodeSelection(p)
+		m.selection[p] = selection
+	}
+	return selection.alternatives(candidate)
 }
 
 // computeDaemonOverhead returns the resources a node satisfying candidate must reserve for daemonPods, every one of
 // which is individually compatible with candidate. See the file header for the model. truncated reports that the
 // realization space exceeded daemonOverheadRealizationLimit and the plain sum was reserved instead.
 func computeDaemonOverhead(candidate scheduling.Requirements, daemonPods []*corev1.Pod) (overhead corev1.ResourceList, truncated bool) {
+	return computeDaemonOverheadWithMemo(candidate, daemonPods, newDaemonPodMemo())
+}
+
+// computeDaemonOverheadWithMemo is computeDaemonOverhead reading per-pod inputs through a memo shared by the caller.
+// Realizations that accept a set of daemon pods an earlier realization already accepted are skipped: the element-wise
+// maximum already covers that set's sum, so folding it in again cannot change the result.
+func computeDaemonOverheadWithMemo(candidate scheduling.Requirements, daemonPods []*corev1.Pod, memo *daemonPodMemo) (overhead corev1.ResourceList, truncated bool) {
 	if len(daemonPods) == 0 {
 		return nil, false
 	}
 	alternatives := lo.Map(daemonPods, func(p *corev1.Pod, _ int) []scheduling.Requirements {
-		return daemonAlternatives(candidate, p)
+		return memo.alternatives(candidate, p)
 	})
 	daemonRequirements := lo.Flatten(alternatives)
 	var keys []string
@@ -110,27 +187,33 @@ func computeDaemonOverhead(candidate scheduling.Requirements, daemonPods []*core
 		}
 		realizations *= len(domain)
 		if realizations > daemonOverheadRealizationLimit {
-			return resources.RequestsForPods(daemonPods...), true
+			return memo.sum(daemonPods), true
 		}
 		keys = append(keys, key)
 		domains = append(domains, domain)
 	}
 	if len(keys) == 0 {
-		return resources.RequestsForPods(daemonPods...), false
+		return memo.sum(daemonPods), false
 	}
 	realization := make([]labelValue, len(keys))
 	overhead = corev1.ResourceList{}
+	folded := sets.New[string]()
+	acceptedKey := make([]byte, len(daemonPods))
 	var walk func(depth int)
 	walk = func(depth int) {
 		if depth == len(keys) {
 			accepted := lo.Filter(daemonPods, func(_ *corev1.Pod, i int) bool {
-				return lo.SomeBy(alternatives[i], func(alternative scheduling.Requirements) bool {
+				ok := lo.SomeBy(alternatives[i], func(alternative scheduling.Requirements) bool {
 					return acceptsRealization(alternative, keys, realization)
 				})
+				acceptedKey[i] = lo.Ternary[byte](ok, 1, 0)
+				return ok
 			})
-			if len(accepted) != 0 {
-				overhead = resources.MaxResources(overhead, resources.RequestsForPods(accepted...))
+			if len(accepted) == 0 || folded.Has(string(acceptedKey)) {
+				return
 			}
+			folded.Insert(string(acceptedKey))
+			overhead = resources.MaxResources(overhead, memo.sum(accepted))
 			return
 		}
 		for _, value := range domains[depth] {
