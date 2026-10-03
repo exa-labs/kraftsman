@@ -58,6 +58,20 @@ var _ = Describe("ExemptPods", func() {
 		Expect(limits.IsCurrentlyReschedulable(exempt, env.Clock, nil, exemption)).To(BeTrue())
 		Expect(limits.IsCurrentlyReschedulable(other, env.Clock, nil, exemption)).To(BeFalse())
 	})
+	It("evaluates the exemption only for pods a PDB blocks", func() {
+		unblocked := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"other": "value"}}})
+		ExpectApplied(ctx, env.Client, unblocked)
+		var calls int
+		counting := pdb.ExemptPods(func(*v1.Pod) bool { calls++; return false })
+		_, canEvict := limits.CanEvictPods([]*v1.Pod{unblocked}, env.Clock, nil, counting)
+		Expect(canEvict).To(BeTrue())
+		Expect(limits.IsCurrentlyReschedulable(unblocked, env.Clock, nil, counting)).To(BeTrue())
+		Expect(calls).To(BeZero())
+
+		_, canEvict = limits.CanEvictPods([]*v1.Pod{other}, env.Clock, nil, counting)
+		Expect(canEvict).To(BeFalse())
+		Expect(calls).To(Equal(1))
+	})
 	It("still applies the do-not-disrupt annotation to exempt pods", func() {
 		exempt.Annotations = map[string]string{karpenterv1.DoNotDisruptAnnotationKey: "true"}
 		Expect(limits.IsCurrentlyReschedulable(exempt, env.Clock, nil, exemption)).To(BeFalse())

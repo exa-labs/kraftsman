@@ -1398,7 +1398,7 @@ var _ = Describe("Candidate Filtering", func() {
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
 	})
 	DescribeTable("should exempt surge-evictable pods from PDBs that allow no disruptions",
-		func(poolAnnotation, podAnnotation string, expectCandidate bool) {
+		func(poolAnnotation, podAnnotation string, replicas int32, expectCandidate bool) {
 			if poolAnnotation != "" {
 				nodePool.Annotations = lo.Assign(nodePool.Annotations, map[string]string{v1.SurgeEvictionAnnotationKey: poolAnnotation})
 			}
@@ -1412,9 +1412,11 @@ var _ = Describe("Candidate Filtering", func() {
 					},
 				},
 			})
-			rs := test.ReplicaSet()
-			ExpectApplied(ctx, env.Client, rs)
 			podLabels := map[string]string{"test": "value"}
+			// The pod is its ReplicaSet's only available replica: with more replicas the ReplicaSet is degraded.
+			rs := test.ReplicaSet(test.ReplicaSetOptions{Selector: lo.Assign(podLabels, map[string]string{"pod-template-hash": "5d8f7c9b4"})})
+			rs.Spec.Replicas = new(replicas)
+			ExpectApplied(ctx, env.Client, rs)
 			pod := test.Pod(test.PodOptions{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: lo.Assign(podLabels, map[string]string{"pod-template-hash": "5d8f7c9b4"}),
@@ -1422,6 +1424,7 @@ var _ = Describe("Candidate Filtering", func() {
 						{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: new(true), BlockOwnerDeletion: new(true)},
 					},
 				},
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(env.Clock.Now().Add(-time.Minute))}},
 			})
 			if podAnnotation != "" {
 				pod.Annotations = map[string]string{v1.SurgeEvictionAnnotationKey: podAnnotation}
@@ -1448,10 +1451,11 @@ var _ = Describe("Candidate Filtering", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(Equal(fmt.Sprintf(`pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget))))
 		},
-		Entry("when the NodePool enables surge eviction", "true", "", true),
-		Entry("when the pod enables surge eviction", "", "true", true),
-		Entry("unless the pod disables surge eviction", "true", "false", false),
-		Entry("unless surge eviction is enabled", "", "", false),
+		Entry("when the NodePool enables surge eviction", "true", "", int32(1), true),
+		Entry("when the pod enables surge eviction", "", "true", int32(1), true),
+		Entry("unless the pod disables surge eviction", "true", "false", int32(1), false),
+		Entry("unless surge eviction is enabled", "", "", int32(1), false),
+		Entry("unless the ReplicaSet is missing an available replica", "true", "", int32(2), false),
 	)
 	It("should not consider candidates that have fully blocking PDBs on daemonset pods", func() {
 		daemonSet := test.DaemonSet()

@@ -17,6 +17,8 @@ limitations under the License.
 package termination_test
 
 import (
+	"context"
+	"errors"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -24,7 +26,10 @@ import (
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -35,6 +40,31 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	podutil "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
+
+// faultyClient fails the reads and writes its funcs pick and passes everything else through.
+type faultyClient struct {
+	client.Client
+	get   func(client.Object) error
+	patch func(client.Object) error
+}
+
+func (c *faultyClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if c.get != nil {
+		if err := c.get(obj); err != nil {
+			return err
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+func (c *faultyClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	if c.patch != nil {
+		if err := c.patch(obj); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
 
 // envtest runs no ReplicaSet controller, so these tests play its part: they release an isolated pod (drop its
 // controller reference) and create its replacement themselves.
@@ -104,6 +134,20 @@ var _ = Describe("SurgeEviction", func() {
 		Expect(queue.Has(pod)).To(BeFalse())
 		return pod
 	}
+	// expectEvicted expects the pod in the eviction queue and evicts it through the eviction API.
+	expectEvicted := func(pods ...*corev1.Pod) {
+		GinkgoHelper()
+		for _, pod := range pods {
+			Expect(queue.Has(pod)).To(BeTrue())
+			ExpectObjectReconciled(ctx, env.Client, queue, pod)
+			EventuallyExpectTerminating(ctx, env.Client, pod)
+		}
+	}
+	// faultyController drains through a client that fails the calls the funcs pick.
+	faultyController := func(c *faultyClient) *termination.Controller {
+		c.Client = env.Client
+		return termination.NewController(env.Clock, c, cloudProvider, terminator.NewTerminator(env.Clock, c, queue, recorder), recorder)
+	}
 	expectUntouched := func(pod *corev1.Pod) *corev1.Pod {
 		GinkgoHelper()
 		pod = ExpectExists(ctx, env.Client, pod)
@@ -145,7 +189,7 @@ var _ = Describe("SurgeEviction", func() {
 		}
 	})
 
-	It("should start the replacement before deleting the pod and then finish terminating the node", func() {
+	It("should start the replacement before evicting the pod and then finish terminating the node", func() {
 		pod := rsPod(node.Name, ready())
 		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
 
@@ -160,9 +204,10 @@ var _ = Describe("SurgeEviction", func() {
 
 		env.Clock.Step(2 * termination.MinDrainTime)
 		reconcileDrain()
-		EventuallyExpectTerminating(ctx, env.Client, pod)
+		expectEvicted(pod)
 		Expect(queue.Has(pod)).To(BeFalse())
 		ExpectExists(ctx, env.Client, replacement)
+		reconcileDrain()
 		ExpectMetricCounterValue(terminator.PodsSurgeEvictionsTotal, 1, map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeCompleted})
 
 		// The kubelet finishes terminating the pod.
@@ -171,7 +216,7 @@ var _ = Describe("SurgeEviction", func() {
 		ExpectNotRequeued(ExpectObjectReconciled(ctx, env.Client, terminationController, node)) // InstanceTerminationValidation
 		ExpectNotFound(ctx, env.Client, node)
 	})
-	It("should not delete the isolated pod while its replacement is not ready", func() {
+	It("should not evict the isolated pod while its replacement is not ready", func() {
 		pod := rsPod(node.Name, ready())
 		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
 		startDrain()
@@ -191,9 +236,9 @@ var _ = Describe("SurgeEviction", func() {
 		replacement.Status.Conditions = []corev1.PodCondition{ready()}
 		Expect(env.Client.Status().Update(ctx, replacement)).To(Succeed())
 		reconcileDrain()
-		EventuallyExpectTerminating(ctx, env.Client, pod)
+		expectEvicted(pod)
 	})
-	It("should not delete the isolated pod until the ReplicaSet has released it", func() {
+	It("should not evict the isolated pod until the ReplicaSet has released it", func() {
 		pod := rsPod(node.Name, ready())
 		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
 		startDrain()
@@ -209,7 +254,7 @@ var _ = Describe("SurgeEviction", func() {
 
 		release(pod)
 		reconcileDrain()
-		EventuallyExpectTerminating(ctx, env.Client, pod)
+		expectEvicted(pod)
 	})
 	It("should keep the node draining and leave the isolated pod alone across repeated reconciles", func() {
 		pod := rsPod(node.Name, ready())
@@ -258,7 +303,7 @@ var _ = Describe("SurgeEviction", func() {
 		pod = ExpectExists(ctx, env.Client, pod)
 		Expect(pod.Labels).To(HaveKeyWithValue(podutil.PodTemplateHashLabelKey, hash))
 	})
-	It("should delete the isolated pod at once when the ReplicaSet is scaled to zero", func() {
+	It("should evict the isolated pod at once when the ReplicaSet is scaled to zero", func() {
 		pod := rsPod(node.Name, ready())
 		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
 		startDrain()
@@ -267,9 +312,9 @@ var _ = Describe("SurgeEviction", func() {
 		rs.Spec.Replicas = new(int32(0))
 		ExpectApplied(ctx, env.Client, rs)
 		reconcileDrain()
-		EventuallyExpectTerminating(ctx, env.Client, pod)
+		expectEvicted(pod)
 	})
-	It("should delete the isolated pod at once when the ReplicaSet is deleted", func() {
+	It("should evict the isolated pod at once when the ReplicaSet is deleted", func() {
 		pod := rsPod(node.Name, ready())
 		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
 		startDrain()
@@ -277,7 +322,7 @@ var _ = Describe("SurgeEviction", func() {
 
 		Expect(env.Client.Delete(ctx, rs)).To(Succeed())
 		reconcileDrain()
-		EventuallyExpectTerminating(ctx, env.Client, pod)
+		expectEvicted(pod)
 	})
 	It("should evict through the eviction API when the ReplicaSet is already scaled to zero", func() {
 		rs.Spec.Replicas = new(int32(0))
@@ -340,8 +385,12 @@ var _ = Describe("SurgeEviction", func() {
 		startDrain()
 		expectIsolated(pod)
 	})
-	It("should surge evict the pod even when a PodDisruptionBudget allows no disruptions", func() {
-		budget := test.PodDisruptionBudget(test.PDBOptions{Labels: appLabels, MaxUnavailable: new(intstr.FromInt32(0))})
+	It("should isolate despite a PodDisruptionBudget that allows no disruptions and let it arbitrate the eviction", func() {
+		budget := test.PodDisruptionBudget(test.PDBOptions{
+			Labels:         appLabels,
+			MaxUnavailable: new(intstr.FromInt32(0)),
+			Status:         &policyv1.PodDisruptionBudgetStatus{ObservedGeneration: 1, DisruptionsAllowed: 0, CurrentHealthy: 1, DesiredHealthy: 1, ExpectedPods: 1},
+		})
 		pod := rsPod(node.Name, ready())
 		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod, budget)
 		startDrain()
@@ -350,7 +399,30 @@ var _ = Describe("SurgeEviction", func() {
 		release(pod)
 		ExpectApplied(ctx, env.Client, rsPod(otherNode.Name, ready()))
 		reconcileDrain()
-		EventuallyExpectTerminating(ctx, env.Client, pod)
+		Expect(queue.Has(pod)).To(BeTrue())
+
+		// The budget has not caught up with the replacement yet, so the eviction is refused and the pod keeps serving.
+		ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, queue, pod))
+		// Past the timeout the ReplicaSet is still fully available, so the surge is not rolled back.
+		env.Clock.Step(11 * time.Minute)
+		for range 2 {
+			reconcileDrain()
+		}
+		pod = ExpectExists(ctx, env.Client, pod)
+		Expect(pod.DeletionTimestamp.IsZero()).To(BeTrue())
+		Expect(pod.Annotations).To(HaveKey(v1.SurgeEvictionStartedAnnotationKey))
+		Expect(pod.Annotations).ToNot(HaveKey(v1.SurgeEvictionAbortedAnnotationKey))
+		Expect(queue.Has(pod)).To(BeTrue())
+		ExpectMetricCounterValue(terminator.PodsSurgeEvictionsTotal, 1, map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeCompleted})
+		ExpectNodeWithNodeClaimDraining(env.Client, node.Name)
+
+		// The disruption controller counts the released pod as healthy and leaves it out of the expected count.
+		budget = ExpectExists(ctx, env.Client, budget)
+		budget.Status.DisruptionsAllowed = 1
+		budget.Status.CurrentHealthy = 2
+		Expect(env.Client.Status().Update(ctx, budget)).To(Succeed())
+		expectEvicted(pod)
+		ExpectMetricCounterValue(terminator.PodsSurgeEvictionsTotal, 1, map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeCompleted})
 	})
 	It("should still force-delete an isolated pod when the NodeClaim's terminationGracePeriod expires", func() {
 		nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: 300 * time.Second}
@@ -367,5 +439,113 @@ var _ = Describe("SurgeEviction", func() {
 		env.Clock.Step(250 * time.Second)
 		reconcileDrain()
 		EventuallyExpectTerminating(ctx, env.Client, pod)
+	})
+	It("should wait until every isolated pod of the ReplicaSet has an available replacement", func() {
+		rs.Spec.Replicas = new(int32(2))
+		ExpectApplied(ctx, env.Client, rs)
+		pods := []*corev1.Pod{rsPod(node.Name, ready()), rsPod(node.Name, ready())}
+		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pods[0], pods[1])
+		startDrain()
+		for i := range pods {
+			pods[i] = expectIsolated(pods[i])
+			release(pods[i])
+		}
+		replacements := []*corev1.Pod{rsPod(otherNode.Name, ready()), rsPod(otherNode.Name, notReady())}
+		ExpectApplied(ctx, env.Client, replacements[0], replacements[1])
+		for range 2 {
+			reconcileDrain()
+		}
+		for i := range pods {
+			pods[i] = expectIsolated(pods[i])
+		}
+
+		replacements[1].Status.Conditions = []corev1.PodCondition{ready()}
+		Expect(env.Client.Status().Update(ctx, replacements[1])).To(Succeed())
+		reconcileDrain()
+		expectEvicted(pods...)
+		ExpectMetricCounterValue(terminator.PodsSurgeEvictionsTotal, 2, map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeCompleted})
+	})
+	It("should wait for the replacement to be ready for minReadySeconds", func() {
+		rs.Spec.MinReadySeconds = 30
+		ExpectApplied(ctx, env.Client, rs)
+		pod := rsPod(node.Name, ready())
+		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
+		startDrain()
+		pod = expectIsolated(pod)
+		release(pod)
+		ExpectApplied(ctx, env.Client, rsPod(otherNode.Name, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(env.Clock.Now())}))
+
+		env.Clock.Step(29 * time.Second)
+		reconcileDrain()
+		pod = expectIsolated(pod)
+
+		env.Clock.Step(2 * time.Second)
+		reconcileDrain()
+		expectEvicted(pod)
+	})
+	It("should evict through the eviction API when the ReplicaSet does not select on pod-template-hash", func() {
+		Expect(env.Client.Delete(ctx, rs)).To(Succeed())
+		rs = test.ReplicaSet(test.ReplicaSetOptions{Selector: appLabels})
+		rs.Spec.Replicas = new(int32(1))
+		ExpectApplied(ctx, env.Client, rs)
+		pod := rsPod(node.Name, ready())
+		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, pod)
+		startDrain()
+		pod = expectUntouched(pod)
+		Expect(pod.Labels).To(HaveKeyWithValue(podutil.PodTemplateHashLabelKey, hash))
+		Expect(queue.Has(pod)).To(BeTrue())
+		ExpectMetricCounterValue(terminator.PodsSurgeEvictionsTotal, 1, map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeFallback})
+	})
+	It("should evict through the eviction API when the API server refuses to release the pod", func() {
+		controller := faultyController(&faultyClient{patch: func(obj client.Object) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				return apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, obj.GetName(), errors.New("patch is not allowed"))
+			}
+			return nil
+		}})
+		pod := rsPod(node.Name, ready())
+		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, pod)
+
+		Expect(env.Client.Delete(ctx, node)).To(Succeed())
+		node = ExpectNodeExists(ctx, env.Client, node.Name)
+		ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, controller, node))
+		pod = expectUntouched(pod)
+		Expect(pod.Labels).To(HaveKeyWithValue(podutil.PodTemplateHashLabelKey, hash))
+		Expect(queue.Has(pod)).To(BeTrue())
+		ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, controller, node))
+		ExpectMetricCounterValue(terminator.PodsSurgeEvictionsTotal, 1, map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeFallback})
+
+		expectEvicted(pod)
+		ExpectDeleted(ctx, env.Client, pod)
+		env.Clock.Step(2 * termination.MinDrainTime)
+		node = ExpectNodeExists(ctx, env.Client, node.Name)
+		ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, controller, node))    // DrainValidation, VolumeDetachment, InstanceTerminationInitiation
+		ExpectNotRequeued(ExpectObjectReconciled(ctx, env.Client, controller, node)) // InstanceTerminationValidation
+		ExpectNotFound(ctx, env.Client, node)
+	})
+	It("should roll back after the timeout while the ReplicaSet cannot be read", func() {
+		pod := rsPod(node.Name, ready())
+		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
+		startDrain()
+		pod = expectIsolated(pod)
+		release(pod)
+
+		controller := faultyController(&faultyClient{get: func(obj client.Object) error {
+			if _, ok := obj.(*appsv1.ReplicaSet); ok {
+				return apierrors.NewServiceUnavailable("replicasets are unavailable")
+			}
+			return nil
+		}})
+		node = ExpectNodeExists(ctx, env.Client, node.Name)
+		Expect(ExpectObjectReconcileFailed(ctx, env.Client, controller, node)).To(MatchError(ContainSubstring("replicasets are unavailable")))
+		pod = expectIsolated(pod)
+
+		env.Clock.Step(11 * time.Minute)
+		ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, controller, node))
+		pod = ExpectExists(ctx, env.Client, pod)
+		Expect(pod.Labels).To(HaveKeyWithValue(podutil.PodTemplateHashLabelKey, hash))
+		Expect(pod.Annotations).To(HaveKey(v1.SurgeEvictionAbortedAnnotationKey))
+		Expect(pod.Annotations).ToNot(HaveKey(v1.SurgeEvictionStartedAnnotationKey))
+		ExpectMetricCounterValue(terminator.PodsSurgeEvictionsTotal, 1, map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeAborted})
 	})
 })

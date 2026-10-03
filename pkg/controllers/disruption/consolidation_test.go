@@ -4333,8 +4333,16 @@ var _ = Describe("Consolidation", func() {
 								BlockOwnerDeletion: new(true),
 							},
 						}}})
-				// only pods[2] is covered by the PDB, and it is the only pod on nodes[1]
+				// only pods[2] is covered by the PDB, and it is the only pod on nodes[1] and the only, available, replica of
+				// its own ReplicaSet
 				pods[2].Labels = lo.Assign(labels, map[string]string{"pod-template-hash": "5d8f7c9b4"})
+				surgeRS := test.ReplicaSet(test.ReplicaSetOptions{Selector: pods[2].Labels})
+				surgeRS.Spec.Replicas = new(int32(1))
+				ExpectApplied(ctx, env.Client, surgeRS)
+				pods[2].OwnerReferences = []metav1.OwnerReference{
+					{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: surgeRS.Name, UID: surgeRS.UID, Controller: new(true), BlockOwnerDeletion: new(true)},
+				}
+				pods[2].Status.Conditions = append(pods[2].Status.Conditions, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue})
 				pdb := test.PodDisruptionBudget(test.PDBOptions{
 					Labels:         labels,
 					MaxUnavailable: fromInt(0),

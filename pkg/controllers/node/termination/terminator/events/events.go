@@ -56,9 +56,9 @@ func SurgeEvictionIsolated(pod *corev1.Pod, replicaSet string) events.Event {
 	return surgeEviction(pod, corev1.EventTypeNormal, "isolated", fmt.Sprintf("Released pod from ReplicaSet %s so it starts a replacement; the pod is deleted once the ReplicaSet is fully available", replicaSet))
 }
 
-// SurgeEvictionCompleted is published when a pod released for surge eviction is deleted.
+// SurgeEvictionCompleted is published when a pod released for surge eviction is handed to the eviction queue.
 func SurgeEvictionCompleted(pod *corev1.Pod, reason string) events.Event {
-	return surgeEviction(pod, corev1.EventTypeNormal, "completed", "Deleted pod released for surge eviction: "+reason)
+	return surgeEviction(pod, corev1.EventTypeNormal, "completed", "Evicting pod released for surge eviction: "+reason)
 }
 
 // SurgeEvictionAborted is published when a surge is rolled back because its ReplicaSet did not become fully available in time.

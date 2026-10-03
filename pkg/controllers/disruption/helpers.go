@@ -93,7 +93,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	// replacement capacity, mirroring how pods on already-deleting nodes are treated.
 	var candidatePods []*corev1.Pod
 	for _, n := range candidates {
-		exemption := surgeEvictionExemption(n.NodePool, clk)
+		exemption := surgeEvictionExemption(ctx, kubeClient, n.NodePool, clk)
 		currentlyReschedulablePods := lo.Filter(n.reschedulablePods, func(p *corev1.Pod, _ int) bool {
 			return pdbs.IsCurrentlyReschedulable(p, clk, recorder, exemption)
 		})
