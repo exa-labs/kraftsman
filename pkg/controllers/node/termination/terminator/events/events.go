@@ -50,6 +50,37 @@ func DisruptPodDelete(pod *corev1.Pod, gracePeriodSeconds *int64, nodeGracePerio
 	}
 }
 
+// SurgeEvictionIsolated is published when a pod is released from its ReplicaSet so that the ReplicaSet starts its
+// replacement while the pod keeps running.
+func SurgeEvictionIsolated(pod *corev1.Pod, replicaSet string) events.Event {
+	return surgeEviction(pod, corev1.EventTypeNormal, "isolated", fmt.Sprintf("Released pod from ReplicaSet %s so it starts a replacement; the pod is deleted once the ReplicaSet is fully available", replicaSet))
+}
+
+// SurgeEvictionCompleted is published when a pod released for surge eviction is deleted.
+func SurgeEvictionCompleted(pod *corev1.Pod, reason string) events.Event {
+	return surgeEviction(pod, corev1.EventTypeNormal, "completed", "Deleted pod released for surge eviction: "+reason)
+}
+
+// SurgeEvictionAborted is published when a surge is rolled back because its ReplicaSet did not become fully available in time.
+func SurgeEvictionAborted(pod *corev1.Pod, reason string) events.Event {
+	return surgeEviction(pod, corev1.EventTypeWarning, "aborted", "Restored pod to its ReplicaSet, it drains through the eviction API: "+reason)
+}
+
+// SurgeEvictionFallback is published when a pod eligible for surge eviction drains through the eviction API instead.
+func SurgeEvictionFallback(pod *corev1.Pod, reason string) events.Event {
+	return surgeEviction(pod, corev1.EventTypeNormal, "fallback", "Draining pod through the eviction API instead of surge eviction: "+reason)
+}
+
+func surgeEviction(pod *corev1.Pod, eventType, outcome, message string) events.Event {
+	return events.Event{
+		InvolvedObject: pod,
+		Type:           eventType,
+		Reason:         events.SurgeEviction,
+		Message:        message,
+		DedupeValues:   []string{pod.Name, outcome},
+	}
+}
+
 func NodeFailedToDrain(node *corev1.Node, err error) events.Event {
 	return events.Event{
 		InvolvedObject: node,

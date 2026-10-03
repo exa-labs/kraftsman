@@ -29,6 +29,14 @@ const (
 	CodeLabel = "code"
 	// ReasonLabel for pod draining
 	ReasonLabel = "reason"
+	// OutcomeLabel for surge evictions
+	OutcomeLabel = "outcome"
+
+	// Surge eviction outcomes
+	SurgeEvictionOutcomeIsolated  = "isolated"
+	SurgeEvictionOutcomeCompleted = "completed"
+	SurgeEvictionOutcomeAborted   = "aborted"
+	SurgeEvictionOutcomeFallback  = "fallback"
 )
 
 var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
@@ -40,6 +48,17 @@ var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
 		Help:      "The total number of pod eviction requests made by Karpenter, labeled by response code",
 	},
 	[]string{CodeLabel},
+)
+
+var PodsSurgeEvictionsTotal = opmetrics.NewPrometheusCounter(
+	crmetrics.Registry,
+	prometheus.CounterOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: metrics.PodSubsystem,
+		Name:      "surge_evictions_total",
+		Help:      "The total number of surge eviction steps taken by Karpenter while draining nodes, labeled by outcome: isolated (released from its ReplicaSet), completed (released pod deleted), aborted (surge rolled back after the timeout) and fallback (eligible pod drained through the eviction API instead).",
+	},
+	[]string{OutcomeLabel},
 )
 
 var PodsDrainedTotal = opmetrics.NewPrometheusCounter(
