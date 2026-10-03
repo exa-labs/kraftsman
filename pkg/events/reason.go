@@ -47,6 +47,7 @@ const (
 	FailedDraining                 = "FailedDraining"
 	TerminationGracePeriodExpiring = "TerminationGracePeriodExpiring"
 	TerminationFailed              = "FailedTermination"
+	SurgeEviction                  = "SurgeEviction"
 
 	// nodeclaim/consistency
 	FailedConsistencyCheck = "FailedConsistencyCheck"

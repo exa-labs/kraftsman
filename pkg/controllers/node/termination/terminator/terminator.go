@@ -40,6 +40,7 @@ type Terminator struct {
 	kubeClient    client.Client
 	evictionQueue *Queue
 	recorder      events.Recorder
+	surge         *surgeEvictor
 }
 
 func NewTerminator(clk clock.Clock, kubeClient client.Client, eq *Queue, recorder events.Recorder) *Terminator {
@@ -48,6 +49,7 @@ func NewTerminator(clk clock.Clock, kubeClient client.Client, eq *Queue, recorde
 		kubeClient:    kubeClient,
 		evictionQueue: eq,
 		recorder:      recorder,
+		surge:         &surgeEvictor{clock: clk, kubeClient: kubeClient, recorder: recorder},
 	}
 }
 
@@ -109,7 +111,13 @@ func (t *Terminator) Drain(ctx context.Context, node *corev1.Node, nodeGracePeri
 	for _, group := range podGroups {
 		if len(group) > 0 {
 			// Only add pods to the eviction queue that haven't been evicted yet
-			t.evictionQueue.Add(lo.Filter(group, func(p *corev1.Pod, _ int) bool { return podutil.IsEvictable(p, t.clock, t.recorder) })...)
+			evictable := lo.Filter(group, func(p *corev1.Pod, _ int) bool { return podutil.IsEvictable(p, t.clock, t.recorder) })
+			// Surge evicted pods leave through their ReplicaSet instead of the eviction queue
+			toEvict, err := t.surge.drain(ctx, node, group, evictable, t.evictionQueue.Has)
+			t.evictionQueue.Add(toEvict...)
+			if err != nil {
+				return fmt.Errorf("surge evicting pods, %w", err)
+			}
 			return NewNodeDrainError(fmt.Errorf("%d pods are waiting to be evicted", lo.SumBy(podGroups, func(pods []*corev1.Pod) int { return len(pods) })))
 		}
 	}

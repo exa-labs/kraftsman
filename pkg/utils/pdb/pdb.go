@@ -42,6 +42,36 @@ const (
 // Limits is used to evaluate if evicting a list of pods is possible.
 type Limits []*pdbItem
 
+// Option adjusts how Limits evaluates pods.
+type Option func(*evaluation)
+
+type evaluation struct {
+	exempt func(*v1.Pod) bool
+}
+
+// ExemptPods makes Limits ignore a PodDisruptionBudget that blocks a pod today for pods that are evicted only after
+// their workload has gained one healthy pod, as surge eviction does: the predicate accepts such pods. The exemption
+// holds only when that later eviction will be admitted (see admitsEvictionAfterSurge): exactly one budget matches the
+// pod and it is not short of healthy pods. Every other check still applies. The predicate is evaluated last, only for
+// pods a budget would otherwise block, so it may read the cluster without slowing down the common case.
+func ExemptPods(exempt func(*v1.Pod) bool) Option {
+	return func(e *evaluation) {
+		e.exempt = exempt
+	}
+}
+
+func newEvaluation(opts []Option) evaluation {
+	e := evaluation{}
+	for _, opt := range opts {
+		opt(&e)
+	}
+	return e
+}
+
+func (e evaluation) isExempt(pod *v1.Pod) bool {
+	return e.exempt != nil && e.exempt(pod)
+}
+
 func NewLimits(ctx context.Context, kubeClient client.Client) (Limits, error) {
 	pdbs := []*pdbItem{}
 
@@ -63,9 +93,10 @@ func NewLimits(ctx context.Context, kubeClient client.Client) (Limits, error) {
 // CanEvictPods returns true if every pod in the list is evictable. They may not all be evictable simultaneously, but
 // for every PDB that controls the pods at least one pod can be evicted.
 // nolint:gocyclo
-func (l Limits) CanEvictPods(pods []*v1.Pod, clk clock.Clock, recorder events.Recorder) ([]client.ObjectKey, bool) {
+func (l Limits) CanEvictPods(pods []*v1.Pod, clk clock.Clock, recorder events.Recorder, opts ...Option) ([]client.ObjectKey, bool) {
+	e := newEvaluation(opts)
 	for _, pod := range pods {
-		pdbs, evictable := l.isEvictable(pod, clk, recorder, zeroDisruptions)
+		pdbs, evictable := l.isEvictable(pod, clk, recorder, zeroDisruptions, e)
 
 		if !evictable {
 			return pdbs, false
@@ -75,8 +106,8 @@ func (l Limits) CanEvictPods(pods []*v1.Pod, clk clock.Clock, recorder events.Re
 }
 
 // isFullyBlocked returns true if the given pod is fully blocked by a PDB.
-func (l Limits) isFullyBlocked(pod *v1.Pod, clk clock.Clock, recorder events.Recorder) ([]client.ObjectKey, bool) {
-	pdbs, evictable := l.isEvictable(pod, clk, recorder, fullyBlockingPDBs)
+func (l Limits) isFullyBlocked(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, e evaluation) ([]client.ObjectKey, bool) {
+	pdbs, evictable := l.isEvictable(pod, clk, recorder, fullyBlockingPDBs, e)
 
 	if !evictable {
 		return pdbs, true
@@ -84,17 +115,43 @@ func (l Limits) isFullyBlocked(pod *v1.Pod, clk clock.Clock, recorder events.Rec
 	return []client.ObjectKey{}, false
 }
 
-// nolint:gocyclo
-func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, evictionBlocker evictionBlocker) ([]client.ObjectKey, bool) {
+func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, evictionBlocker evictionBlocker, e evaluation) ([]client.ObjectKey, bool) {
 	// If the pod isn't eligible for being evicted, then the predicate doesn't matter
 	// This is due to the fact that we won't call the eviction API on these pods when we are disrupting the node
 	if !podutil.IsEvictable(pod, clk, recorder) {
 		return []client.ObjectKey{}, true
 	}
+	keys, evictable := l.pdbBlockers(pod, evictionBlocker)
+	// The exemption is evaluated only for pods a PDB blocks, and the pod-side predicate last, since it may read the cluster
+	if !evictable && e.exempt != nil && l.admitsEvictionAfterSurge(pod) && e.isExempt(pod) {
+		return []client.ObjectKey{}, true
+	}
+	return keys, evictable
+}
 
-	matchingPDBs := lo.Filter(l, func(pdb *pdbItem, _ int) bool {
+// admitsEvictionAfterSurge reports whether the eviction API will admit evicting the pod once its workload has gained
+// one healthy pod, even though its PodDisruptionBudget blocks the eviction today. During a surge the released pod
+// stays healthy and its replacement adds one more healthy pod, while the budget's desired count does not change: an
+// integer minAvailable is fixed, and percentages and maxUnavailable are computed from the controller's scale, which
+// leaves out the released pod. So the eviction is admitted exactly when the budget was whole before the surge:
+// currentHealthy >= desiredHealthy. A budget shared with another, degraded workload stays short and keeps blocking.
+// More than one matching budget is refused by the eviction API whatever their status.
+func (l Limits) admitsEvictionAfterSurge(pod *v1.Pod) bool {
+	matchingPDBs := l.matching(pod)
+	return len(matchingPDBs) == 1 && matchingPDBs[0].currentHealthy >= matchingPDBs[0].desiredHealthy
+}
+
+// matching returns the PDBs whose selector matches the pod.
+func (l Limits) matching(pod *v1.Pod) []*pdbItem {
+	return lo.Filter(l, func(pdb *pdbItem, _ int) bool {
 		return pdb.key.Namespace == pod.Namespace && pdb.selector.Matches(labels.Set(pod.Labels))
 	})
+}
+
+// pdbBlockers returns the PDBs that block evicting the pod and false, or no PDBs and true when none blocks it.
+// nolint:gocyclo
+func (l Limits) pdbBlockers(pod *v1.Pod, evictionBlocker evictionBlocker) ([]client.ObjectKey, bool) {
+	matchingPDBs := l.matching(pod)
 
 	// Regardless of whether the PDBs allow disruptions, Kubernetes doesn't support multiple PDBs on a single pod:
 	// https://github.com/kubernetes/kubernetes/blob/84cacae7046df93c1f6f8ea97c912d948e1ad06a/pkg/registry/core/pod/storage/eviction.go#L226
@@ -135,10 +192,11 @@ func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Record
 // - Does not have fully blocking PDBs which would prevent the pod from being evicted
 // The way this is different from IsReschedulable is that this also considers non-permanent conditions which prevent a pod from being rescheduled
 // to a different node like the "do-not-disrupt" annotation or fully blocking PDBs.
-func (l Limits) IsCurrentlyReschedulable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder) bool {
+// Pods accepted by an ExemptPods option are not checked against PDBs.
+func (l Limits) IsCurrentlyReschedulable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, opts ...Option) bool {
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until these pods are evicted is wasteful.
-	_, isFullyBlocked := l.isFullyBlocked(pod, clk, recorder)
+	_, isFullyBlocked := l.isFullyBlocked(pod, clk, recorder, newEvaluation(opts))
 
 	return podutil.IsReschedulable(pod) &&
 		podutil.IsDisruptable(pod, clk, recorder) &&
@@ -149,6 +207,8 @@ type pdbItem struct {
 	key                         client.ObjectKey
 	selector                    labels.Selector
 	disruptionsAllowed          int32
+	currentHealthy              int32
+	desiredHealthy              int32
 	isFullyBlocking             bool
 	canAlwaysEvictUnhealthyPods bool
 }
@@ -165,6 +225,8 @@ func newPdb(pdb policyv1.PodDisruptionBudget) (*pdbItem, error) {
 		key:                client.ObjectKeyFromObject(&pdb),
 		selector:           selector,
 		disruptionsAllowed: pdb.Status.DisruptionsAllowed,
+		currentHealthy:     pdb.Status.CurrentHealthy,
+		desiredHealthy:     pdb.Status.DesiredHealthy,
 		isFullyBlocking: (pdb.Spec.MaxUnavailable != nil && pdb.Spec.MaxUnavailable.Type == intstr.Int && pdb.Spec.MaxUnavailable.IntVal == 0) ||
 			(pdb.Spec.MaxUnavailable != nil && pdb.Spec.MaxUnavailable.Type == intstr.String && pdb.Spec.MaxUnavailable.StrVal == "0%") ||
 			(pdb.Spec.MinAvailable != nil && pdb.Spec.MinAvailable.Type == intstr.String && pdb.Spec.MinAvailable.StrVal == "100%"),

@@ -186,7 +186,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	// We only care if instanceType in non-empty consolidation to do price-comparison.
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
-	if pods, err = node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder); err != nil {
+	if pods, err = node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder, surgeEvictionExemption(ctx, kubeClient, nodePool, clk)); err != nil {
 		// If the NodeClaim has a TerminationGracePeriod set and the disruption class is eventual, the node should be
 		// considered a candidate even if there's a pod that will block eviction. Other error types should still cause
 		// failure creating the candidate.
@@ -449,4 +449,16 @@ func (c Command) LogValues() []any {
 		"disrupted-nodes", candidateNodes,
 		"replacement-nodes", replacementNodes,
 	}
+}
+
+// surgeEvictionExemption exempts from PodDisruptionBudgets the pods the termination controller drains by surge eviction
+// under the given NodePool and whose surge can complete now: their ReplicaSet would release them and has all of its
+// replicas available counting the pod itself. Such a pod is evicted only after its replacement is available, when the
+// PodDisruptionBudget allows it, so it leaves its workload as available as it was. A pod of a degraded ReplicaSet is not
+// exempt: its surge would roll back into an eviction the same PodDisruptionBudget blocks.
+func surgeEvictionExemption(ctx context.Context, kubeClient client.Client, nodePool *v1.NodePool, clk clock.Clock) pdb.Option {
+	return pdb.ExemptPods(func(p *corev1.Pod) bool {
+		// The caller evaluates the do-not-disrupt annotation with its own recorder, so no events are published here.
+		return pod.IsSurgeEvictable(p, nodePool, clk, nil) && pod.CanCompleteSurgeEviction(ctx, kubeClient, p, clk.Now())
+	})
 }

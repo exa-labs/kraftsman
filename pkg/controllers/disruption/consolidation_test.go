@@ -4159,6 +4159,74 @@ var _ = Describe("Consolidation", func() {
 			// eviction
 			ExpectNotFound(ctx, env.Client, nodeClaims[0], nodes[0])
 		})
+		DescribeTable("can delete nodes, exempts surge-evictable pods from PDBs",
+			func(surgeEviction bool) {
+				if surgeEviction {
+					nodePool.Annotations = lo.Assign(nodePool.Annotations, map[string]string{v1.SurgeEvictionAnnotationKey: "true"})
+				}
+				rs := test.ReplicaSet()
+				ExpectApplied(ctx, env.Client, rs)
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+
+				pods := test.Pods(3, test.PodOptions{
+					ObjectMeta: metav1.ObjectMeta{
+						OwnerReferences: []metav1.OwnerReference{
+							{
+								APIVersion:         "apps/v1",
+								Kind:               "ReplicaSet",
+								Name:               rs.Name,
+								UID:                rs.UID,
+								Controller:         new(true),
+								BlockOwnerDeletion: new(true),
+							},
+						}}})
+				// only pods[2] is covered by the PDB, and it is the only pod on nodes[1] and the only, available, replica of
+				// its own ReplicaSet
+				pods[2].Labels = lo.Assign(labels, map[string]string{"pod-template-hash": "5d8f7c9b4"})
+				surgeRS := test.ReplicaSet(test.ReplicaSetOptions{Selector: pods[2].Labels})
+				surgeRS.Spec.Replicas = new(int32(1))
+				ExpectApplied(ctx, env.Client, surgeRS)
+				pods[2].OwnerReferences = []metav1.OwnerReference{
+					{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: surgeRS.Name, UID: surgeRS.UID, Controller: new(true), BlockOwnerDeletion: new(true)},
+				}
+				pods[2].Status.Conditions = append(pods[2].Status.Conditions, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue})
+				pdb := test.PodDisruptionBudget(test.PDBOptions{
+					Labels:         labels,
+					MaxUnavailable: fromInt(0),
+					Status: &policyv1.PodDisruptionBudgetStatus{
+						ObservedGeneration: 1,
+						DisruptionsAllowed: 0,
+						CurrentHealthy:     1,
+						DesiredHealthy:     1,
+						ExpectedPods:       1,
+					},
+				})
+				ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool, pdb)
+				ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+				ExpectManualBinding(ctx, env.Client, pods[1], nodes[0])
+				ExpectManualBinding(ctx, env.Client, pods[2], nodes[1])
+
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
+				ExpectSingletonReconciled(ctx, disruptionController)
+
+				// With surge eviction the PDB no longer blocks nodes[1], the cheaper node to disrupt since it runs one pod;
+				// without it only nodes[0] is a candidate.
+				disrupted, kept := lo.Ternary(surgeEviction, 1, 0), lo.Ternary(surgeEviction, 0, 1)
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Candidates).To(HaveLen(1))
+				Expect(cmds[0].Candidates[0].NodeClaim.Name).To(Equal(nodeClaims[disrupted].Name))
+				ExpectReconcileSucceeded(ctx, queue, client.ObjectKeyFromObject(nodeClaims[disrupted]))
+				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[disrupted])
+
+				Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+				Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
+				ExpectNotFound(ctx, env.Client, nodeClaims[disrupted], nodes[disrupted])
+				ExpectExists(ctx, env.Client, nodeClaims[kept])
+			},
+			Entry("when the NodePool enables surge eviction", true),
+			Entry("unless surge eviction is enabled", false),
+		)
 		It("can delete nodes, considers karpenter.sh/do-not-disrupt set to true on nodes", func() {
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()

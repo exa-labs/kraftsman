@@ -38,6 +38,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -1396,6 +1397,82 @@ var _ = Describe("Candidate Filtering", func() {
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget))))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
 	})
+	DescribeTable("should exempt surge-evictable pods from PDBs that allow no disruptions",
+		func(poolAnnotation, podAnnotation string, replicas int32, budgetVariant string, expectCandidate bool) {
+			if poolAnnotation != "" {
+				nodePool.Annotations = lo.Assign(nodePool.Annotations, map[string]string{v1.SurgeEvictionAnnotationKey: poolAnnotation})
+			}
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+			})
+			podLabels := map[string]string{"test": "value"}
+			// The pod is its ReplicaSet's only available replica: with more replicas the ReplicaSet is degraded.
+			rs := test.ReplicaSet(test.ReplicaSetOptions{Selector: lo.Assign(podLabels, map[string]string{"pod-template-hash": "5d8f7c9b4"})})
+			rs.Spec.Replicas = new(replicas)
+			ExpectApplied(ctx, env.Client, rs)
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: lo.Assign(podLabels, map[string]string{"pod-template-hash": "5d8f7c9b4"}),
+					OwnerReferences: []metav1.OwnerReference{
+						{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: new(true), BlockOwnerDeletion: new(true)},
+					},
+				},
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(env.Clock.Now().Add(-time.Minute))}},
+			})
+			if podAnnotation != "" {
+				pod.Annotations = map[string]string{v1.SurgeEvictionAnnotationKey: podAnnotation}
+			}
+			budget := test.PodDisruptionBudget(test.PDBOptions{
+				Labels:         podLabels,
+				MaxUnavailable: fromInt(0),
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod, budget)
+			switch budgetVariant {
+			case "second":
+				// The eviction API refuses a pod matched by more than one budget, whatever their status.
+				ExpectApplied(ctx, env.Client, test.PodDisruptionBudget(test.PDBOptions{Labels: podLabels, MaxUnavailable: fromInt(1)}))
+			case "short":
+				// The budget is shared with another workload that is short of healthy pods: it would still refuse the
+				// eviction once this pod's replacement is up.
+				budget.Status = policyv1.PodDisruptionBudgetStatus{ObservedGeneration: budget.Generation, CurrentHealthy: 2, DesiredHealthy: 3, ExpectedPods: 3}
+				Expect(env.Client.Status().Update(ctx, budget)).To(Succeed())
+			}
+			ExpectManualBinding(ctx, env.Client, pod, node)
+
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			var err error
+			pdbLimits, err = pdb.NewLimits(ctx, env.Client)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
+			_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+			if expectCandidate {
+				Expect(err).ToNot(HaveOccurred())
+				return
+			}
+			Expect(err).To(HaveOccurred())
+			if budgetVariant == "second" {
+				Expect(err.Error()).To(ContainSubstring("eviction does not support multiple PDBs"))
+				return
+			}
+			Expect(err.Error()).To(Equal(fmt.Sprintf(`pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget))))
+		},
+		Entry("when the NodePool enables surge eviction", "true", "", int32(1), "", true),
+		Entry("when the pod enables surge eviction", "", "true", int32(1), "", true),
+		Entry("unless the pod disables surge eviction", "true", "false", int32(1), "", false),
+		Entry("unless surge eviction is enabled", "", "", int32(1), "", false),
+		Entry("unless the ReplicaSet is missing an available replica", "true", "", int32(2), "", false),
+		Entry("unless a second PDB matches the pod", "true", "", int32(1), "second", false),
+		Entry("unless the PDB is short of healthy pods", "true", "", int32(1), "short", false),
+	)
 	It("should not consider candidates that have fully blocking PDBs on daemonset pods", func() {
 		daemonSet := test.DaemonSet()
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
