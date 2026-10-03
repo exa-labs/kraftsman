@@ -1396,6 +1396,62 @@ var _ = Describe("Candidate Filtering", func() {
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget))))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
 	})
+	DescribeTable("should exempt surge-evictable pods from PDBs that allow no disruptions",
+		func(poolAnnotation, podAnnotation string, expectCandidate bool) {
+			if poolAnnotation != "" {
+				nodePool.Annotations = lo.Assign(nodePool.Annotations, map[string]string{v1.SurgeEvictionAnnotationKey: poolAnnotation})
+			}
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+			})
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			podLabels := map[string]string{"test": "value"}
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: lo.Assign(podLabels, map[string]string{"pod-template-hash": "5d8f7c9b4"}),
+					OwnerReferences: []metav1.OwnerReference{
+						{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: new(true), BlockOwnerDeletion: new(true)},
+					},
+				},
+			})
+			if podAnnotation != "" {
+				pod.Annotations = map[string]string{v1.SurgeEvictionAnnotationKey: podAnnotation}
+			}
+			budget := test.PodDisruptionBudget(test.PDBOptions{
+				Labels:         podLabels,
+				MaxUnavailable: fromInt(0),
+			})
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod, budget)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			var err error
+			pdbLimits, err = pdb.NewLimits(ctx, env.Client)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
+			_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+			if expectCandidate {
+				Expect(err).ToNot(HaveOccurred())
+				return
+			}
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(Equal(fmt.Sprintf(`pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget))))
+		},
+		Entry("when the NodePool enables surge eviction", "true", "", true),
+		Entry("when the pod enables surge eviction", "", "true", true),
+		Entry("unless the pod disables surge eviction", "true", "false", false),
+		Entry("unless surge eviction is enabled", "", "", false),
+	)
 	It("should not consider candidates that have fully blocking PDBs on daemonset pods", func() {
 		daemonSet := test.DaemonSet()
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{

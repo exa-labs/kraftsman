@@ -95,6 +95,33 @@ const (
 // a scheduled change, or an instance health failure.
 const NodeClaimTerminationCauseCloudInterrupted = "cloud_interrupted"
 
+// Surge eviction annotations. Surge eviction drains a ReplicaSet pod by starting its replacement before removing it:
+// Karpenter removes the pod's pod-template-hash label so its ReplicaSet releases it and creates a replacement while the
+// released pod keeps running (and keeps matching its Services), then deletes the released pod once the ReplicaSet has
+// its full count of available pods again. The released pod is never sent to the eviction API, so PodDisruptionBudgets
+// do not gate it.
+const (
+	// SurgeEvictionAnnotationKey opts pods into surge eviction. On a NodePool, "true" enables it for every eligible pod
+	// on the pool's nodes. On a Pod, "true" enables it for that pod regardless of its NodePool and "false" disables it
+	// even when the NodePool enables it. Any other value is treated as unset. Eligible pods are active, evictable pods
+	// controlled by an apps/v1 ReplicaSet that carry a pod-template-hash label. On a NodePool it lives on the object,
+	// not its template, so toggling it does not change the template hash or drift existing nodes.
+	SurgeEvictionAnnotationKey = apis.Group + "/surge-eviction"
+	// SurgeEvictionReplicaSetAnnotationKey is internal bookkeeping Karpenter writes on a pod it released from its
+	// ReplicaSet: "<name>/<uid>" of that ReplicaSet.
+	SurgeEvictionReplicaSetAnnotationKey = apis.Group + "/surge-eviction-replicaset"
+	// SurgeEvictionPodTemplateHashAnnotationKey is internal bookkeeping Karpenter writes on a pod it released from its
+	// ReplicaSet: the pod-template-hash label value it removed, restored if the surge is rolled back.
+	SurgeEvictionPodTemplateHashAnnotationKey = apis.Group + "/surge-eviction-pod-template-hash"
+	// SurgeEvictionStartedAnnotationKey is internal bookkeeping Karpenter writes on a pod it released from its
+	// ReplicaSet: the RFC3339 time of the release. A pod carrying it is isolated.
+	SurgeEvictionStartedAnnotationKey = apis.Group + "/surge-eviction-started"
+	// SurgeEvictionAbortedAnnotationKey is internal bookkeeping Karpenter writes when it rolls back a surge whose
+	// ReplicaSet did not become fully available within the surge eviction timeout: the RFC3339 time of the rollback.
+	// A pod carrying it is not surge evicted again and drains through the eviction API.
+	SurgeEvictionAbortedAnnotationKey = apis.Group + "/surge-eviction-aborted"
+)
+
 // Karpenter specific finalizers
 const (
 	TerminationFinalizer = apis.Group + "/termination"

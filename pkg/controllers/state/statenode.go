@@ -302,9 +302,10 @@ func (in *StateNode) ValidateNodeDisruptable(clk clock.Clock) error {
 // ValidatePodDisruptable returns an error if the StateNode contains a pod that cannot be disrupted
 // This checks associated PDBs and do-not-disrupt annotations for each pod on the node.
 // ValidatePodDisruptable takes in a recorder to emit events on the nodeclaims when the state node is not a candidate
+// pdbOpts adjust the PDB check, for example to exempt pods that leave the node without the eviction API.
 //
 //nolint:gocyclo
-func (in *StateNode) ValidatePodsDisruptable(ctx context.Context, kubeClient client.Client, pdbs pdb.Limits, clk clock.Clock, recorder events.Recorder) ([]*corev1.Pod, error) {
+func (in *StateNode) ValidatePodsDisruptable(ctx context.Context, kubeClient client.Client, pdbs pdb.Limits, clk clock.Clock, recorder events.Recorder, pdbOpts ...pdb.Option) ([]*corev1.Pod, error) {
 	pods, err := in.Pods(ctx, kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("getting pods from node, %w", err)
@@ -316,7 +317,7 @@ func (in *StateNode) ValidatePodsDisruptable(ctx context.Context, kubeClient cli
 			return pods, NewPodBlockEvictionError(serrors.Wrap(fmt.Errorf(`pod has "karpenter.sh/do-not-disrupt" annotation`), "Pod", klog.KObj(po)))
 		}
 	}
-	if pdbKeys, ok := pdbs.CanEvictPods(pods, clk, recorder); !ok {
+	if pdbKeys, ok := pdbs.CanEvictPods(pods, clk, recorder, pdbOpts...); !ok {
 		if len(pdbKeys) > 1 {
 			return pods, NewPodBlockEvictionError(serrors.Wrap(fmt.Errorf("eviction does not support multiple PDBs"), "PodDisruptionBudget(s)", pdbKeys))
 		}

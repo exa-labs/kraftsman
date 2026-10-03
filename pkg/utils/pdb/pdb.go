@@ -42,6 +42,33 @@ const (
 // Limits is used to evaluate if evicting a list of pods is possible.
 type Limits []*pdbItem
 
+// Option adjusts how Limits evaluates pods.
+type Option func(*evaluation)
+
+type evaluation struct {
+	exempt func(*v1.Pod) bool
+}
+
+// ExemptPods makes Limits ignore PodDisruptionBudgets for the pods the predicate accepts: pods Karpenter removes
+// without the eviction API, which a PodDisruptionBudget therefore cannot block. Every other check still applies.
+func ExemptPods(exempt func(*v1.Pod) bool) Option {
+	return func(e *evaluation) {
+		e.exempt = exempt
+	}
+}
+
+func newEvaluation(opts []Option) evaluation {
+	e := evaluation{}
+	for _, opt := range opts {
+		opt(&e)
+	}
+	return e
+}
+
+func (e evaluation) isExempt(pod *v1.Pod) bool {
+	return e.exempt != nil && e.exempt(pod)
+}
+
 func NewLimits(ctx context.Context, kubeClient client.Client) (Limits, error) {
 	pdbs := []*pdbItem{}
 
@@ -63,9 +90,10 @@ func NewLimits(ctx context.Context, kubeClient client.Client) (Limits, error) {
 // CanEvictPods returns true if every pod in the list is evictable. They may not all be evictable simultaneously, but
 // for every PDB that controls the pods at least one pod can be evicted.
 // nolint:gocyclo
-func (l Limits) CanEvictPods(pods []*v1.Pod, clk clock.Clock, recorder events.Recorder) ([]client.ObjectKey, bool) {
+func (l Limits) CanEvictPods(pods []*v1.Pod, clk clock.Clock, recorder events.Recorder, opts ...Option) ([]client.ObjectKey, bool) {
+	e := newEvaluation(opts)
 	for _, pod := range pods {
-		pdbs, evictable := l.isEvictable(pod, clk, recorder, zeroDisruptions)
+		pdbs, evictable := l.isEvictable(pod, clk, recorder, zeroDisruptions, e)
 
 		if !evictable {
 			return pdbs, false
@@ -75,8 +103,8 @@ func (l Limits) CanEvictPods(pods []*v1.Pod, clk clock.Clock, recorder events.Re
 }
 
 // isFullyBlocked returns true if the given pod is fully blocked by a PDB.
-func (l Limits) isFullyBlocked(pod *v1.Pod, clk clock.Clock, recorder events.Recorder) ([]client.ObjectKey, bool) {
-	pdbs, evictable := l.isEvictable(pod, clk, recorder, fullyBlockingPDBs)
+func (l Limits) isFullyBlocked(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, e evaluation) ([]client.ObjectKey, bool) {
+	pdbs, evictable := l.isEvictable(pod, clk, recorder, fullyBlockingPDBs, e)
 
 	if !evictable {
 		return pdbs, true
@@ -85,10 +113,14 @@ func (l Limits) isFullyBlocked(pod *v1.Pod, clk clock.Clock, recorder events.Rec
 }
 
 // nolint:gocyclo
-func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, evictionBlocker evictionBlocker) ([]client.ObjectKey, bool) {
+func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, evictionBlocker evictionBlocker, e evaluation) ([]client.ObjectKey, bool) {
 	// If the pod isn't eligible for being evicted, then the predicate doesn't matter
 	// This is due to the fact that we won't call the eviction API on these pods when we are disrupting the node
 	if !podutil.IsEvictable(pod, clk, recorder) {
+		return []client.ObjectKey{}, true
+	}
+	// Exempt pods leave the node without the eviction API, so no PDB can block them
+	if e.isExempt(pod) {
 		return []client.ObjectKey{}, true
 	}
 
@@ -135,10 +167,11 @@ func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Record
 // - Does not have fully blocking PDBs which would prevent the pod from being evicted
 // The way this is different from IsReschedulable is that this also considers non-permanent conditions which prevent a pod from being rescheduled
 // to a different node like the "do-not-disrupt" annotation or fully blocking PDBs.
-func (l Limits) IsCurrentlyReschedulable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder) bool {
+// Pods accepted by an ExemptPods option are not checked against PDBs.
+func (l Limits) IsCurrentlyReschedulable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, opts ...Option) bool {
 	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
 	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until these pods are evicted is wasteful.
-	_, isFullyBlocked := l.isFullyBlocked(pod, clk, recorder)
+	_, isFullyBlocked := l.isFullyBlocked(pod, clk, recorder, newEvaluation(opts))
 
 	return podutil.IsReschedulable(pod) &&
 		podutil.IsDisruptable(pod, clk, recorder) &&
