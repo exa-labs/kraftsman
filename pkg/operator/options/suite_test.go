@@ -67,6 +67,7 @@ var _ = Describe("Options", func() {
 		"BATCH_IDLE_DURATION",
 		"PREFERENCE_POLICY",
 		"MIN_VALUES_POLICY",
+		"SURGE_EVICTION_TIMEOUT",
 		"FEATURE_GATES",
 		"OD_TO_SPOT_CONSOLIDATION",
 		"SPOT_TO_SPOT_MIN_INSTANCE_TYPES",
@@ -578,6 +579,30 @@ var _ = Describe("Options", func() {
 		)
 	})
 
+	Context("SurgeEvictionTimeout", func() {
+		It("should default surge-eviction-timeout to 10m", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.SurgeEvictionTimeout).To(Equal(10 * time.Minute))
+		})
+		It("should set surge-eviction-timeout via the environment variable", func() {
+			os.Setenv("SURGE_EVICTION_TIMEOUT", "3m")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.SurgeEvictionTimeout).To(Equal(3 * time.Minute))
+		})
+		It("should set surge-eviction-timeout via the CLI flag", func() {
+			Expect(opts.Parse(fs, "--surge-eviction-timeout=90s")).To(Succeed())
+			Expect(opts.SurgeEvictionTimeout).To(Equal(90 * time.Second))
+		})
+		It("should fail validation when surge-eviction-timeout is not positive", func() {
+			Expect(opts.Parse(fs, "--surge-eviction-timeout=0s")).ToNot(Succeed())
+			Expect(opts.Parse(fs, "--surge-eviction-timeout=-1m")).ToNot(Succeed())
+		})
+	})
+
 })
 
 func expectOptionsMatch(optsA, optsB *options.Options) {
@@ -615,4 +640,5 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	Expect(optsA.FeatureGates.CapacityBuffer).To(Equal(optsB.FeatureGates.CapacityBuffer))
 	Expect(optsA.FeatureGates.SpotToSpotConsolidation).To(Equal(optsB.FeatureGates.SpotToSpotConsolidation))
 	Expect(optsA.IgnoreDRARequests).To(Equal(optsB.IgnoreDRARequests))
+	Expect(optsA.SurgeEvictionTimeout).To(Equal(optsB.SurgeEvictionTimeout))
 }
