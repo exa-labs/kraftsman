@@ -205,11 +205,21 @@ type priceBudget struct {
 	candidatePrice float64
 	// minSavings is the fraction of candidatePrice the replacements must save beyond being cheaper.
 	minSavings float64
+	// minSavingsPerHour is the absolute hourly amount the replacements must save beyond being cheaper. A fraction
+	// of a near-zero price is nearly zero: reserved offerings are priced at a tiny fraction of on-demand, so one
+	// reservation clears any fractional floor against another while neither saves anything.
+	minSavingsPerHour float64
+}
+
+// newPriceBudget is the budget replacements of candidates priced candidatePrice must beat: the given fractional
+// savings margin and the configured absolute one, whichever leaves the lower limit.
+func newPriceBudget(ctx context.Context, candidatePrice, minSavings float64) priceBudget {
+	return priceBudget{candidatePrice: candidatePrice, minSavings: minSavings, minSavingsPerHour: options.FromContext(ctx).ConsolidationReplaceMinSavingsPerHour}
 }
 
 // limit is the aggregate worst-case launch price the replacements must stay under.
 func (b priceBudget) limit() float64 {
-	return b.candidatePrice * (1 - b.minSavings)
+	return min(b.candidatePrice*(1-b.minSavings), b.candidatePrice-b.minSavingsPerHour)
 }
 
 // split divides the limit evenly across n replacement claims for the zone-narrowing retries, which
@@ -341,7 +351,7 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// fallback if we can't find the specific zonal pricing data
 	candidatePrice := sumCandidatePrices(candidates)
 	// the replacement price to beat, tightened by the simulation's savings margin
-	budget := priceBudget{candidatePrice: candidatePrice, minSavings: simOpts.minSavings}
+	budget := newPriceBudget(ctx, candidatePrice, simOpts.minSavings)
 
 	allExistingAreSpot := true
 	for _, cn := range candidates {
@@ -964,6 +974,9 @@ func cheapestWorstLaunchDetail(nc *pscheduling.NodeClaim, budget priceBudget) st
 	}
 	if best == nil {
 		return ""
+	}
+	if budget.minSavingsPerHour > 0 && budget.candidatePrice-budget.minSavingsPerHour < budget.candidatePrice*(1-budget.minSavings) {
+		return fmt.Sprintf(" (cheapest option %s prices worst-case at $%g for %s in %s, budget $%g after the $%g/h minimum savings on $%g)", bestName, best.Price, best.CapacityType(), best.Zone(), budget.limit(), budget.minSavingsPerHour, budget.candidatePrice)
 	}
 	if budget.minSavings > 0 {
 		return fmt.Sprintf(" (cheapest option %s prices worst-case at $%g for %s in %s, budget $%g after the %g%% minimum savings on $%g)", bestName, best.Price, best.CapacityType(), best.Zone(), budget.limit(), budget.minSavings*100, budget.candidatePrice)
