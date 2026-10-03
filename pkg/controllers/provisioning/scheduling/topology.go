@@ -112,42 +112,53 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 	})
 	domainGroups := map[string]TopologyDomainGroup{}
 	for npName, its := range instanceTypes {
-		np := nodePoolIndex[npName]
-		// Requirements carried by every node this NodePool launches, regardless of instance type.
-		// Domains are attributed to them so that a pod which can't select the NodePool doesn't have
-		// its topology spread computed against domains only this NodePool can supply.
-		nodePoolRequirements := nodePoolDomainRequirements(np)
-		for _, it := range its {
-			// We need to intersect the instance type requirements with the current nodePool requirements.  This
-			// ensures that something like zones from an instance type don't expand the universe of valid domains.
-			requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-			requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
-			requirements.Add(it.Requirements.Values()...)
-
-			for topologyKey, requirement := range requirements {
-				if _, ok := domainGroups[topologyKey]; !ok {
-					domainGroups[topologyKey] = NewTopologyDomainGroup()
-				}
-				for _, domain := range requirement.Values() {
-					domainGroups[topologyKey].Insert(domain, npName, np.Spec.Template.Spec.Taints, nodePoolRequirements)
-				}
-			}
-		}
-
-		requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
-		requirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
-		for key, requirement := range requirements {
-			if requirement.Operator() == corev1.NodeSelectorOpIn {
-				if _, ok := domainGroups[key]; !ok {
-					domainGroups[key] = NewTopologyDomainGroup()
-				}
-				for _, value := range requirement.Values() {
-					domainGroups[key].Insert(value, npName, np.Spec.Template.Spec.Taints, nodePoolRequirements)
-				}
-			}
-		}
+		addNodePoolDomains(domainGroups, nodePoolIndex[npName], npName, its)
 	}
 	return domainGroups
+}
+
+// addNodePoolDomains records in domainGroups every domain the NodePool can supply through its instance types and
+// its template requirements and labels.
+func addNodePoolDomains(domainGroups map[string]TopologyDomainGroup, np *v1.NodePool, npName string, its []*cloudprovider.InstanceType) {
+	// Requirements carried by every node this NodePool launches, regardless of instance type.
+	// Domains are attributed to them so that a pod which can't select the NodePool doesn't have
+	// its topology spread computed against domains only this NodePool can supply.
+	nodePoolRequirements := nodePoolDomainRequirements(np)
+	insert := func(topologyKey string, requirement *scheduling.Requirement) {
+		group, ok := domainGroups[topologyKey]
+		if !ok {
+			group = NewTopologyDomainGroup()
+			domainGroups[topologyKey] = group
+		}
+		for _, domain := range requirement.Values() {
+			group.Insert(domain, npName, np.Spec.Template.Spec.Taints, nodePoolRequirements)
+		}
+	}
+	// The template requirements and labels are the same for every instance type of the pool, so they are built
+	// once. Each instance type's requirements are intersected with them key by key, which is exactly what adding
+	// the instance type's requirements to a fresh copy of them would produce: keys only the instance type sets keep
+	// its requirement, keys both set intersect, and keys only the template sets keep the template's.
+	templateRequirements := scheduling.NewNodeSelectorRequirementsWithMinValues(np.Spec.Template.Spec.Requirements...)
+	templateRequirements.Add(scheduling.NewLabelRequirements(np.Spec.Template.Labels).Values()...)
+	for _, it := range its {
+		// We need to intersect the instance type requirements with the current nodePool requirements.  This
+		// ensures that something like zones from an instance type don't expand the universe of valid domains.
+		for topologyKey, requirement := range it.Requirements {
+			if templateRequirement, ok := templateRequirements[topologyKey]; ok {
+				requirement = requirement.Intersection(templateRequirement)
+			}
+			insert(topologyKey, requirement)
+		}
+	}
+	for topologyKey, requirement := range templateRequirements {
+		// Keys only the template sets contribute the template's values for every instance type, so once is enough.
+		if lo.SomeBy(its, func(it *cloudprovider.InstanceType) bool { return !it.Requirements.Has(topologyKey) }) {
+			insert(topologyKey, requirement)
+		}
+		if requirement.Operator() == corev1.NodeSelectorOpIn {
+			insert(topologyKey, requirement)
+		}
+	}
 }
 
 // nodePoolDomainRequirements returns the requirements shared by every node the NodePool can launch:
