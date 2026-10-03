@@ -24,6 +24,7 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
@@ -298,12 +300,11 @@ func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, valid
 }
 
 func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates ...*Candidate) ([]*Candidate, error) {
-	// This GetCandidates call filters out nodes that were nominated
-	validatedCandidates, err := GetCandidates(ctx, e.cluster, e.kubeClient, e.recorder, e.clock, e.cloudProvider, e.filter, GracefulDisruptionClass, e.queue)
+	// This currentCandidates call filters out nodes that were nominated
+	validatedCandidates, err := currentCandidates(ctx, e.cluster, e.kubeClient, e.recorder, e.clock, e.cloudProvider, e.filter, GracefulDisruptionClass, e.queue, candidates)
 	if err != nil {
 		return nil, fmt.Errorf("constructing validation candidates, %w", err)
 	}
-	validatedCandidates = mapCandidates(candidates, validatedCandidates)
 	if len(validatedCandidates) == 0 {
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: e.validationType})
 		return nil, newChurnValidationErrorWithDetail(validationDetailCandidateChanged, fmt.Errorf("%d candidates are no longer valid", len(candidates)))
@@ -340,11 +341,10 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 // If these conditions are met for all candidates, ValidateCandidates returns a slice with the updated representations.
 func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candidates ...*Candidate) ([]*Candidate, error) {
 	// GracefulDisruptionClass is hardcoded here because ValidateCandidates is only used for consolidation disruption. All consolidation disruption is graceful disruption.
-	validatedCandidates, err := GetCandidates(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, c.filter, GracefulDisruptionClass, c.queue)
+	validatedCandidates, err := currentCandidates(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, c.filter, GracefulDisruptionClass, c.queue, candidates)
 	if err != nil {
 		return nil, fmt.Errorf("constructing validation candidates, %w", err)
 	}
-	validatedCandidates = mapCandidates(candidates, validatedCandidates)
 	// If we filtered out any candidates, return nil as some NodeClaims in the consolidation decision have changed.
 	if len(validatedCandidates) != len(candidates) {
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
@@ -369,6 +369,36 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 		disruptionBudgetMapping[vc.NodePool.Name]--
 	}
 	return validatedCandidates, nil
+}
+
+// currentCandidates rebuilds the proposed candidates from current cluster state and returns those
+// that are still candidates for the method. It returns what GetCandidates followed by
+// mapCandidates returns, but builds Candidates only for the proposed nodes: building one lists its
+// node's pods and checks them against PodDisruptionBudgets, and doing that for every node in the
+// cluster to re-check a command's one or few nodes was most of a validation's candidate checks.
+// Node pool totals are not computed, since validation never reads them.
+func currentCandidates(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
+	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, proposed []*Candidate,
+) ([]*Candidate, error) {
+	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
+	if err != nil {
+		return nil, err
+	}
+	pdbs, err := pdb.NewLimits(ctx, kubeClient)
+	if err != nil {
+		return nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
+	}
+	names := sets.New(lo.Map(proposed, func(c *Candidate, _ int) string { return c.Name() })...)
+	var nodes []*state.StateNode
+	for n := range cluster.Nodes() {
+		if names.Has(n.Name()) {
+			nodes = append(nodes, n.DeepCopy())
+		}
+	}
+	return lo.FilterMap(nodes, func(n *state.StateNode, _ int) (*Candidate, bool) {
+		cn, e := NewCandidate(ctx, kubeClient, recorder, clk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
+		return cn, e == nil && shouldDisrupt(ctx, cn)
+	}), nil
 }
 
 // ValidateCommand validates a command for a Method
