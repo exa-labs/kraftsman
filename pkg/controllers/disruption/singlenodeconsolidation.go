@@ -54,6 +54,10 @@ func admissionBudget(proposals int) time.Duration {
 	return commandValidationDelay + time.Duration(proposals)*commandAdmissionReserve
 }
 
+// replacementLaunchPollInterval is how often admission re-checks whether the NodeClaims created by
+// the commands it already admitted have launched.
+var replacementLaunchPollInterval = 250 * time.Millisecond
+
 const SingleNodeConsolidationType = "single"
 
 // consolidationProposal is a command a pass has selected but not yet validated or queued.
@@ -361,6 +365,14 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 // an earlier command consumed fails validation the same way a plan drifting across the settling
 // window does today, instead of double-booking that capacity. Validating the whole batch first
 // and starting the commands concurrently would lose exactly that property.
+//
+// Those effects are only modeled once the replacements have launched. A replacement NodeClaim is
+// created before StartCommand returns, but cluster state has no node for it until the cloud
+// provider resolves its instance, so a re-simulation in that window finds no room for the earlier
+// command's pods, opens a NodeClaim for them, and rejects the next proposal for a NodeClaim it
+// would never launch. Each proposal after a replace therefore waits for the replacements this
+// pass created to launch or disappear. Other unlaunched NodeClaims are not waited on: they were
+// equally absent when the walk computed the proposal, so they do not make its validation stale.
 func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals []consolidationProposal) ([]Command, error) {
 	admitted := []Command{}
 	// Admission runs on its own budget, so a pass that walked right up to its timeout - or past it,
@@ -373,9 +385,15 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 	// the command it found. Every proposal after it costs another re-simulation, so the reserve
 	// gates them whether or not the attempts before them produced a command.
 	attempted := false
+	// launching holds the replacement NodeClaims the commands admitted so far created.
+	launching := sets.New[string]()
 	for _, proposal := range proposals {
 		if attempted && !s.clock.Now().Add(commandAdmissionReserve).Before(deadline) {
 			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "admission_reserve")
+			continue
+		}
+		if !s.awaitReplacementsLaunched(ctx, launching, deadline.Add(-commandAdmissionReserve)) {
+			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "replacements_not_launched")
 			continue
 		}
 		if validationDelay == 0 {
@@ -413,8 +431,49 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 		}
 		ObserveAcceptedCandidate(cmd, s.ConsolidationType(), proposal.position)
 		admitted = append(admitted, cmd)
+		for _, r := range cmd.Replacements {
+			launching.Insert(r.Name)
+		}
 	}
 	return admitted, nil
+}
+
+// awaitReplacementsLaunched waits until every named NodeClaim has launched into cluster state or
+// left it - a launch that failed for lack of capacity deletes its NodeClaim - polling until the
+// given time. It reports whether that happened before that time; a launch first observed after
+// it, at the poll that straddles it, does not count.
+func (s *SingleNodeConsolidation) awaitReplacementsLaunched(ctx context.Context, names sets.Set[string], until time.Time) bool {
+	if names.Len() == 0 {
+		return true
+	}
+	for s.anyUnlaunched(names) {
+		if !s.clock.Now().Before(until) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-s.clock.After(replacementLaunchPollInterval):
+		}
+	}
+	return s.clock.Now().Before(until)
+}
+
+// anyUnlaunched reports whether some named NodeClaim is still in cluster state without a node:
+// cluster state only creates a node for a NodeClaim once it has a provider ID.
+func (s *SingleNodeConsolidation) anyUnlaunched(names sets.Set[string]) bool {
+	launched := sets.New[string]()
+	for n := range s.cluster.Nodes() {
+		if n.NodeClaim != nil && names.Has(n.NodeClaim.Name) {
+			launched.Insert(n.NodeClaim.Name)
+		}
+	}
+	for name := range names {
+		if !launched.Has(name) && s.cluster.NodeClaimExists(name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SingleNodeConsolidation) Reason() v1.DisruptionReason {
