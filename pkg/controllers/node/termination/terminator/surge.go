@@ -27,7 +27,7 @@ limitations under the License.
 //  1. eligible, not isolated: release it with one optimistic-lock patch (remove the label, record the ReplicaSet, the
 //     removed label value and the start time in annotations, and add a non-controller owner reference to the
 //     Deployment so garbage collection still follows the workload). A ReplicaSet that is gone, scaled to zero or does
-//     not select on pod-template-hash, or a patch the API server refuses, falls back to the eviction API.
+//     not select on pod-template-hash, or a patch the API server refuses outright, falls back to the eviction API.
 //  2. isolated: once the ReplicaSet controller has dropped the pod's controller reference and the ReplicaSet's own pods
 //     are all available again, hand the pod to the eviction queue. A ReplicaSet that is gone or scaled to zero no
 //     longer wants a replacement, so the pod is handed over at once. The pod keeps the node draining until it is gone.
@@ -156,7 +156,8 @@ func (r *nodePoolResolver) get(ctx context.Context) (*v1.NodePool, error) {
 // isolate releases an eligible pod from its ReplicaSet. It returns true when the pod falls back to the eviction API
 // instead: its ReplicaSet is gone, scaled to zero or would not release it, or the API server refused the patch (for
 // example RBAC without patch on pods, or an admission webhook). It returns false when the pod was released or the
-// patch lost a race and is retried on the next reconcile, and an error when the ReplicaSet cannot be read.
+// patch lost a race and is retried on the next reconcile, and an error when the ReplicaSet cannot be read or the patch
+// failed in a way a retry may get past.
 func (s *surgeEvictor) isolate(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	ref := podutil.ReplicaSetControllerRef(pod)
 	rs, err := podutil.GetReplicaSet(ctx, s.kubeClient, pod.Namespace, ref.Name, ref.UID)
@@ -196,8 +197,11 @@ func (s *surgeEvictor) isolate(ctx context.Context, pod *corev1.Pod) (bool, erro
 			return false, nil
 		}
 		// Retrying a refused patch cannot succeed until someone changes the cluster, and the pod must not be stranded
-		// meanwhile: drain it the ordinary way.
-		return s.fallback(ctx, pod, "releasing it from its ReplicaSet failed", err)
+		// meanwhile: drain it the ordinary way. Any other failure may be transient and is retried.
+		if isRefusal(err) {
+			return s.fallback(ctx, pod, "releasing it from its ReplicaSet was refused", err)
+		}
+		return false, fmt.Errorf("releasing pod from its replicaset, %w", err)
 	}
 	s.recorder.Publish(terminatorevents.SurgeEvictionIsolated(pod, rs.Name))
 	PodsSurgeEvictionsTotal.Inc(map[string]string{OutcomeLabel: SurgeEvictionOutcomeIsolated})
@@ -345,6 +349,12 @@ func parseReplicaSetRef(value string) (string, types.UID, bool) {
 		return "", "", false
 	}
 	return name, types.UID(uid), true
+}
+
+// isRefusal reports whether the API server definitively refused a request (authorization, admission or validation),
+// as opposed to failing in a way that a retry may get past.
+func isRefusal(err error) bool {
+	return apierrors.IsForbidden(err) || apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) || apierrors.IsMethodNotSupported(err)
 }
 
 // ignoreRetryable drops errors that only mean the pod changed or disappeared under a write: the next reconcile reads

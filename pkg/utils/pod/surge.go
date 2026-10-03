@@ -57,7 +57,8 @@ func IsSurgeEvictionEnabled(pod *corev1.Pod, nodePool *v1.NodePool) bool {
 	return nodePool != nil && nodePool.Annotations[v1.SurgeEvictionAnnotationKey] == "true"
 }
 
-// IsSurgeEvictable reports whether Karpenter drains the pod by surge eviction rather than the eviction API. The pod must:
+// IsSurgeEvictable reports whether Karpenter drains the pod by surge eviction (release it from its ReplicaSet, then
+// evict it once the ReplicaSet is fully available again) rather than evicting it straight away. The pod must:
 // - Have surge eviction enabled (see IsSurgeEvictionEnabled)
 // - Carry no karpenter.sh/surge-eviction-aborted annotation from an earlier surge that was rolled back
 // - Be controlled by an apps/v1 ReplicaSet and carry a non-empty pod-template-hash label

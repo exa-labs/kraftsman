@@ -20,6 +20,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -71,6 +72,42 @@ var _ = Describe("ExemptPods", func() {
 		_, canEvict = limits.CanEvictPods([]*v1.Pod{other}, env.Clock, nil, counting)
 		Expect(canEvict).To(BeFalse())
 		Expect(calls).To(Equal(1))
+	})
+	It("does not exempt pods matched by more than one PDB", func() {
+		ExpectApplied(ctx, env.Client, test.PodDisruptionBudget(test.PDBOptions{Labels: podLabels, MaxUnavailable: new(intstr.FromInt32(1))}))
+		var err error
+		limits, err = pdb.NewLimits(ctx, env.Client)
+		Expect(err).NotTo(HaveOccurred())
+		var calls int
+		counting := pdb.ExemptPods(func(*v1.Pod) bool { calls++; return true })
+		keys, canEvict := limits.CanEvictPods([]*v1.Pod{exempt}, env.Clock, nil, counting)
+		Expect(canEvict).To(BeFalse())
+		Expect(keys).To(HaveLen(2))
+		Expect(limits.IsCurrentlyReschedulable(exempt, env.Clock, nil, counting)).To(BeFalse())
+		Expect(calls).To(BeZero())
+	})
+	It("does not exempt pods whose PDB is short of healthy pods", func() {
+		short := test.PodDisruptionBudget(test.PDBOptions{
+			Labels:         map[string]string{"short": "value"},
+			MaxUnavailable: new(intstr.FromInt32(0)),
+			Status:         &policyv1.PodDisruptionBudgetStatus{ObservedGeneration: 1, CurrentHealthy: 1, DesiredHealthy: 2, ExpectedPods: 2},
+		})
+		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"short": "value"}}})
+		ExpectApplied(ctx, env.Client, short, pod)
+		var err error
+		limits, err = pdb.NewLimits(ctx, env.Client)
+		Expect(err).NotTo(HaveOccurred())
+		admitAll := pdb.ExemptPods(func(*v1.Pod) bool { return true })
+		_, canEvict := limits.CanEvictPods([]*v1.Pod{pod}, env.Clock, nil, admitAll)
+		Expect(canEvict).To(BeFalse())
+		Expect(limits.IsCurrentlyReschedulable(pod, env.Clock, nil, admitAll)).To(BeFalse())
+		// The same budget once whole again admits the exemption.
+		short.Status.CurrentHealthy = 2
+		Expect(env.Client.Status().Update(ctx, short)).To(Succeed())
+		limits, err = pdb.NewLimits(ctx, env.Client)
+		Expect(err).NotTo(HaveOccurred())
+		_, canEvict = limits.CanEvictPods([]*v1.Pod{pod}, env.Clock, nil, admitAll)
+		Expect(canEvict).To(BeTrue())
 	})
 	It("still applies the do-not-disrupt annotation to exempt pods", func() {
 		exempt.Annotations = map[string]string{karpenterv1.DoNotDisruptAnnotationKey: "true"}

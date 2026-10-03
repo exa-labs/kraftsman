@@ -49,10 +49,11 @@ type evaluation struct {
 	exempt func(*v1.Pod) bool
 }
 
-// ExemptPods makes Limits ignore PodDisruptionBudgets for the pods the predicate accepts: pods whose removal leaves
-// their workload as available as it was, which a PodDisruptionBudget therefore must not block. Every other check still
-// applies. The predicate is evaluated only for pods a PodDisruptionBudget would otherwise block, so it may read the
-// cluster without slowing down the common case.
+// ExemptPods makes Limits ignore a PodDisruptionBudget that blocks a pod today for pods that are evicted only after
+// their workload has gained one healthy pod, as surge eviction does: the predicate accepts such pods. The exemption
+// holds only when that later eviction will be admitted (see admitsEvictionAfterSurge): exactly one budget matches the
+// pod and it is not short of healthy pods. Every other check still applies. The predicate is evaluated last, only for
+// pods a budget would otherwise block, so it may read the cluster without slowing down the common case.
 func ExemptPods(exempt func(*v1.Pod) bool) Option {
 	return func(e *evaluation) {
 		e.exempt = exempt
@@ -121,19 +122,36 @@ func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Record
 		return []client.ObjectKey{}, true
 	}
 	keys, evictable := l.pdbBlockers(pod, evictionBlocker)
-	// The exemption is evaluated only for pods a PDB blocks, since it may have to read the cluster
-	if !evictable && e.isExempt(pod) {
+	// The exemption is evaluated only for pods a PDB blocks, and the pod-side predicate last, since it may read the cluster
+	if !evictable && e.exempt != nil && l.admitsEvictionAfterSurge(pod) && e.isExempt(pod) {
 		return []client.ObjectKey{}, true
 	}
 	return keys, evictable
 }
 
+// admitsEvictionAfterSurge reports whether the eviction API will admit evicting the pod once its workload has gained
+// one healthy pod, even though its PodDisruptionBudget blocks the eviction today. During a surge the released pod
+// stays healthy and its replacement adds one more healthy pod, while the budget's desired count does not change: an
+// integer minAvailable is fixed, and percentages and maxUnavailable are computed from the controller's scale, which
+// leaves out the released pod. So the eviction is admitted exactly when the budget was whole before the surge:
+// currentHealthy >= desiredHealthy. A budget shared with another, degraded workload stays short and keeps blocking.
+// More than one matching budget is refused by the eviction API whatever their status.
+func (l Limits) admitsEvictionAfterSurge(pod *v1.Pod) bool {
+	matchingPDBs := l.matching(pod)
+	return len(matchingPDBs) == 1 && matchingPDBs[0].currentHealthy >= matchingPDBs[0].desiredHealthy
+}
+
+// matching returns the PDBs whose selector matches the pod.
+func (l Limits) matching(pod *v1.Pod) []*pdbItem {
+	return lo.Filter(l, func(pdb *pdbItem, _ int) bool {
+		return pdb.key.Namespace == pod.Namespace && pdb.selector.Matches(labels.Set(pod.Labels))
+	})
+}
+
 // pdbBlockers returns the PDBs that block evicting the pod and false, or no PDBs and true when none blocks it.
 // nolint:gocyclo
 func (l Limits) pdbBlockers(pod *v1.Pod, evictionBlocker evictionBlocker) ([]client.ObjectKey, bool) {
-	matchingPDBs := lo.Filter(l, func(pdb *pdbItem, _ int) bool {
-		return pdb.key.Namespace == pod.Namespace && pdb.selector.Matches(labels.Set(pod.Labels))
-	})
+	matchingPDBs := l.matching(pod)
 
 	// Regardless of whether the PDBs allow disruptions, Kubernetes doesn't support multiple PDBs on a single pod:
 	// https://github.com/kubernetes/kubernetes/blob/84cacae7046df93c1f6f8ea97c912d948e1ad06a/pkg/registry/core/pod/storage/eviction.go#L226
@@ -189,6 +207,8 @@ type pdbItem struct {
 	key                         client.ObjectKey
 	selector                    labels.Selector
 	disruptionsAllowed          int32
+	currentHealthy              int32
+	desiredHealthy              int32
 	isFullyBlocking             bool
 	canAlwaysEvictUnhealthyPods bool
 }
@@ -205,6 +225,8 @@ func newPdb(pdb policyv1.PodDisruptionBudget) (*pdbItem, error) {
 		key:                client.ObjectKeyFromObject(&pdb),
 		selector:           selector,
 		disruptionsAllowed: pdb.Status.DisruptionsAllowed,
+		currentHealthy:     pdb.Status.CurrentHealthy,
+		desiredHealthy:     pdb.Status.DesiredHealthy,
 		isFullyBlocking: (pdb.Spec.MaxUnavailable != nil && pdb.Spec.MaxUnavailable.Type == intstr.Int && pdb.Spec.MaxUnavailable.IntVal == 0) ||
 			(pdb.Spec.MaxUnavailable != nil && pdb.Spec.MaxUnavailable.Type == intstr.String && pdb.Spec.MaxUnavailable.StrVal == "0%") ||
 			(pdb.Spec.MinAvailable != nil && pdb.Spec.MinAvailable.Type == intstr.String && pdb.Spec.MinAvailable.StrVal == "100%"),

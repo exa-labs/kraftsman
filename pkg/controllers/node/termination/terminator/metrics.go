@@ -56,7 +56,7 @@ var PodsSurgeEvictionsTotal = opmetrics.NewPrometheusCounter(
 		Namespace: metrics.Namespace,
 		Subsystem: metrics.PodSubsystem,
 		Name:      "surge_evictions_total",
-		Help:      "The total number of surge eviction steps taken by Karpenter while draining nodes, labeled by outcome: isolated (released from its ReplicaSet), completed (released pod deleted), aborted (surge rolled back after the timeout) and fallback (eligible pod drained through the eviction API instead).",
+		Help:      "The total number of surge eviction steps taken by Karpenter while draining nodes, labeled by outcome: isolated (released from its ReplicaSet), completed (released pod handed to the eviction API once its ReplicaSet was fully available again), aborted (surge rolled back after the timeout) and fallback (eligible pod drained through the eviction API instead).",
 	},
 	[]string{OutcomeLabel},
 )

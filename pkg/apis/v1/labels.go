@@ -97,9 +97,9 @@ const NodeClaimTerminationCauseCloudInterrupted = "cloud_interrupted"
 
 // Surge eviction annotations. Surge eviction drains a ReplicaSet pod by starting its replacement before removing it:
 // Karpenter removes the pod's pod-template-hash label so its ReplicaSet releases it and creates a replacement while the
-// released pod keeps running (and keeps matching its Services), then deletes the released pod once the ReplicaSet has
-// its full count of available pods again. The released pod is never sent to the eviction API, so PodDisruptionBudgets
-// do not gate it.
+// released pod keeps running (and keeps matching its Services), then evicts the released pod once the ReplicaSet has
+// its full count of available pods again. By then the released pod is surplus healthy capacity, so a single
+// PodDisruptionBudget that was whole before the surge admits that eviction even if it allowed no disruptions before.
 const (
 	// SurgeEvictionAnnotationKey opts pods into surge eviction. On a NodePool, "true" enables it for every eligible pod
 	// on the pool's nodes. On a Pod, "true" enables it for that pod regardless of its NodePool and "false" disables it

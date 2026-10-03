@@ -523,6 +523,31 @@ var _ = Describe("SurgeEviction", func() {
 		ExpectNotRequeued(ExpectObjectReconciled(ctx, env.Client, controller, node)) // InstanceTerminationValidation
 		ExpectNotFound(ctx, env.Client, node)
 	})
+	It("should retry, not fall back, when releasing the pod fails transiently", func() {
+		failing := true
+		controller := faultyController(&faultyClient{patch: func(obj client.Object) error {
+			if _, ok := obj.(*corev1.Pod); ok && failing {
+				return apierrors.NewInternalError(errors.New("etcd is unavailable"))
+			}
+			return nil
+		}})
+		pod := rsPod(node.Name, ready())
+		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, pod)
+
+		Expect(env.Client.Delete(ctx, node)).To(Succeed())
+		node = ExpectNodeExists(ctx, env.Client, node.Name)
+		Expect(ExpectObjectReconcileFailed(ctx, env.Client, controller, node)).To(MatchError(ContainSubstring("etcd is unavailable")))
+		pod = expectUntouched(pod)
+		Expect(pod.Labels).To(HaveKeyWithValue(podutil.PodTemplateHashLabelKey, hash))
+		Expect(queue.Has(pod)).To(BeFalse())
+		_, counted := FindMetricWithLabelValues("karpenter_pods_surge_evictions_total", map[string]string{terminator.OutcomeLabel: terminator.SurgeEvictionOutcomeFallback})
+		Expect(counted).To(BeFalse())
+
+		failing = false
+		node = ExpectNodeExists(ctx, env.Client, node.Name)
+		ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, controller, node))
+		expectIsolated(pod)
+	})
 	It("should roll back after the timeout while the ReplicaSet cannot be read", func() {
 		pod := rsPod(node.Name, ready())
 		ExpectApplied(ctx, env.Client, nodePool, node, nodeClaim, otherNode, pod)
