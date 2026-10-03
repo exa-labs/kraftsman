@@ -73,6 +73,7 @@ var _ = Describe("Options", func() {
 		"SPOT_TO_SPOT_MIN_NODE_AGE",
 		"SPOT_TO_SPOT_MIN_SAVINGS",
 		"CONSOLIDATION_REPLACE_MIN_SAVINGS",
+		"CONSOLIDATION_ON_DEMAND_ZONE_RETRY",
 		"CONSOLIDATION_SPLIT_SHADOW",
 		"CONSOLIDATION_SPLIT_SHADOW_MAX_REPLACEMENTS",
 		"OD_TO_SPOT_CONSOLIDATION_SHADOW",
@@ -374,6 +375,26 @@ var _ = Describe("Options", func() {
 		It("should opt out of od-to-spot-consolidation via the CLI flag", func() {
 			Expect(opts.Parse(fs, "--od-to-spot-consolidation=false")).To(Succeed())
 			Expect(opts.ODToSpotConsolidation).To(BeFalse())
+		})
+
+		It("should default consolidation-on-demand-zone-retry to false", func() {
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationOnDemandZoneRetry).To(BeFalse())
+		})
+
+		It("should enable consolidation-on-demand-zone-retry via the environment variable", func() {
+			os.Setenv("CONSOLIDATION_ON_DEMAND_ZONE_RETRY", "true")
+			fs = &options.FlagSet{
+				FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError),
+			}
+			opts.AddFlags(fs)
+			Expect(opts.Parse(fs)).To(Succeed())
+			Expect(opts.ConsolidationOnDemandZoneRetry).To(BeTrue())
+		})
+
+		It("should enable consolidation-on-demand-zone-retry via the CLI flag", func() {
+			Expect(opts.Parse(fs, "--consolidation-on-demand-zone-retry=true")).To(Succeed())
+			Expect(opts.ConsolidationOnDemandZoneRetry).To(BeTrue())
 		})
 
 		It("should default the shadow modes off and the shadow replacement cap to 8", func() {

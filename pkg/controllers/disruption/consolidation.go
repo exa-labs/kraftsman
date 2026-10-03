@@ -378,12 +378,22 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 
 	// The price filter can empty every replacement's options, so keep a copy to re-price against
 	// spot-only offerings if it does.
+	snapshotOptions := func() [][]*cloudprovider.InstanceType {
+		return lo.Map(results.NewNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []*cloudprovider.InstanceType {
+			return append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)
+		})
+	}
 	var spotRetrySnapshots [][]*cloudprovider.InstanceType
 	otSpotApplies, odToSpotShadowOnly := c.odToSpotRetryApplies(ctx, candidates, results.NewNodeClaims)
 	if otSpotApplies {
-		spotRetrySnapshots = lo.Map(results.NewNodeClaims, func(nc *pscheduling.NodeClaim, _ int) []*cloudprovider.InstanceType {
-			return append([]*cloudprovider.InstanceType(nil), nc.InstanceTypeOptions...)
-		})
+		spotRetrySnapshots = snapshotOptions()
+	}
+	// The on-demand zone retry re-prices the same emptied options against the cheap on-demand zones.
+	// It arms only when no claim may launch spot and the spot-only retry only when every claim may,
+	// so the two never arm together.
+	var onDemandZoneRetrySnapshots [][]*cloudprovider.InstanceType
+	if c.onDemandZoneRetryApplies(ctx, results.NewNodeClaims) {
+		onDemandZoneRetrySnapshots = snapshotOptions()
 	}
 
 	// filterByPrice returns the instanceTypes that are lower priced than the current candidate and any error that indicates the input couldn't be filtered.
@@ -392,7 +402,19 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 	// causing churns and landing onto lower available spot instance ultimately resulting in higher interruptions.
 	// When the spot-only retry is armed, hold the "can't replace" event back until the retry also
 	// fails: it may still turn the candidate into a replace command.
-	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, budget, !simOpts.silent && (spotRetrySnapshots == nil || odToSpotShadowOnly)); !ok {
+	publishFilterEvents := !simOpts.silent && onDemandZoneRetrySnapshots == nil && (spotRetrySnapshots == nil || odToSpotShadowOnly)
+	if ok, skipReason, priceDetail := c.filterReplacementsAndPublish(results.NewNodeClaims, candidates, budget, publishFilterEvents); !ok {
+		if onDemandZoneRetrySnapshots != nil && c.retryOnDemandZoneNarrowedReplacements(ctx, candidates, results.NewNodeClaims, onDemandZoneRetrySnapshots, budget, skipReason, priceDetail, !simOpts.silent) {
+			cmd := Command{
+				Candidates:            candidates,
+				Replacements:          replacementsFromNodeClaims(results.NewNodeClaims...),
+				Results:               results,
+				PoolDisruptionCosts:   computePoolDisruptionCosts(candidates),
+				NewCapacityPriceLimit: simOpts.newCapacityPriceLimit,
+			}
+			cmd.EmitCandidateEvents(c.recorder)
+			return cmd, nil
+		}
 		if spotRetrySnapshots != nil && odToSpotShadowOnly {
 			c.shadowODToSpotRetry(ctx, consolidationType, simOpts, candidates, results.NewNodeClaims, spotRetrySnapshots, budget)
 		}
@@ -541,14 +563,9 @@ func (c *consolidation) retrySpotOnlyReplacements(consolidationType string, simO
 
 // narrowClaimToCheapSpotZones pins a replacement NodeClaim to spot and to the zones whose spot
 // offerings beat claimBudget, then re-prices its instance type options against that narrowed worst
-// case. The zone restriction is anchored on the cheapest instance type's own cheap zones rather
-// than the union over every type: a zone that is cheap for one type but spiked for another would
-// put the spike right back into the other type's worst-case price and re-empty the claim. Types
-// spiked inside the anchor's zones would fail the worst-case re-pricing for the whole claim, so
-// only the types cheap everywhere the launch may land are kept; the anchor type survives by
-// construction, every zone kept being one of its own cheap zones. On failure it returns the retry
-// outcome naming the constraint that could not be met; the claim is mutated either way, so callers
-// must restore its options before reusing it.
+// case (see narrowClaimToCheapZones for how the zones and types are chosen together). On failure
+// it returns the retry outcome naming the constraint that could not be met; the claim is mutated
+// either way, so callers must restore its options before reusing it.
 func narrowClaimToCheapSpotZones(nc *pscheduling.NodeClaim, claimBudget float64) (string, bool) {
 	// Requirements.Add keeps the larger minValues when intersecting, and the NodeClaim CRD rejects
 	// an In requirement carrying fewer values than its minValues — pinning below that floor would
@@ -557,9 +574,25 @@ func narrowClaimToCheapSpotZones(nc *pscheduling.NodeClaim, claimBudget float64)
 		return ODToSpotRetryOutcomeCapacityTypeMinValues, false
 	}
 	nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeSpot))
+	return narrowClaimToCheapZones(nc, claimBudget)
+}
+
+// narrowClaimToCheapZones pins a replacement NodeClaim to the zones whose launch offerings beat
+// claimBudget, then re-prices its instance type options against that narrowed worst case. The
+// launch offerings are those of the capacity type the launch will use (see launchOfferings), so the
+// zones kept are cheap for the offerings WorstLaunchPrice prices. The zone restriction is anchored
+// on the cheapest instance type's own cheap zones rather than the union over every type: a zone
+// that is cheap for one type but expensive for another would put the expensive offering right back
+// into the other type's worst-case price and re-empty the claim. Types expensive inside the
+// anchor's zones would fail the worst-case re-pricing for the whole claim, so only the types cheap
+// everywhere the launch may land are kept; the anchor type survives by construction, every zone
+// kept being one of its own cheap zones. On failure it returns the retry outcome naming the
+// constraint that could not be met; the claim is mutated either way, so callers must restore its
+// options before reusing it.
+func narrowClaimToCheapZones(nc *pscheduling.NodeClaim, claimBudget float64) (string, bool) {
 	var zones []string
 	for _, it := range nc.InstanceTypeOptions.Compatible(nc.Requirements).OrderByPrice(nc.Requirements) {
-		cheap := lo.Uniq(lo.FilterMap(it.Offerings.Available().Compatible(nc.Requirements), func(of *cloudprovider.Offering, _ int) (string, bool) {
+		cheap := lo.Uniq(lo.FilterMap(launchOfferings(it, nc.Requirements), func(of *cloudprovider.Offering, _ int) (string, bool) {
 			return of.Zone(), of.Price < claimBudget
 		}))
 		if len(cheap) != 0 {
@@ -608,9 +641,54 @@ func (c *consolidation) filterSpotReplacementsWithZoneRetry(ctx context.Context,
 // mutated on success. See the equal-share rationale on retrySpotOnlyReplacements for why each
 // claim is priced against the budget split evenly across the claims.
 func (c *consolidation) retrySpotZoneNarrowedReplacements(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, skipReason, priceDetail string, publishEvents bool) bool {
+	return c.retryZoneNarrowedReplacements(candidates, newNodeClaims, snapshots, budget, skipReason, priceDetail, publishEvents, narrowClaimToCheapSpotZones, func(outcome string) {
+		ObserveConsolidationSpotZoneRetry(consolidationTypeFromContext(ctx), candidates, outcome)
+	})
+}
+
+// onDemandZoneRetryApplies reports whether the on-demand zone-narrowing retry is enabled and
+// applicable: no replacement claim may launch spot. A claim that may launch spot is priced on its
+// spot offerings and has the spot retries above. Reserved capacity does not disqualify a claim: a
+// reservation with capacity is what the claim is priced on, pinned by the scheduler, and one
+// without capacity can only make the launch cheaper than the on-demand offering it was priced on,
+// inside the zones the retry pins.
+func (c *consolidation) onDemandZoneRetryApplies(ctx context.Context, newNodeClaims []*pscheduling.NodeClaim) bool {
+	if !options.FromContext(ctx).ConsolidationOnDemandZoneRetry {
+		return false
+	}
+	return lo.NoneBy(newNodeClaims, mayLaunchSpot)
+}
+
+// mayLaunchSpot reports whether a replacement claim's requirements allow spot capacity. The
+// requirements, not the offerings available right now, decide what the launch may use.
+func mayLaunchSpot(nc *pscheduling.NodeClaim) bool {
+	return nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeSpot)
+}
+
+// retryOnDemandZoneNarrowedReplacements re-runs the aggregate price filter after the ordinary
+// filter emptied on-demand replacements, with each claim restored from its snapshot and narrowed
+// to its cheap zones. On-demand prices differ by zone when a NodePool spans regions or when
+// NodeOverlays adjust prices per zone, and the ordinary filter prices each instance type at its
+// worst-case zone: a node in an expensive zone is then never replaced by the same or a similar
+// type in a cheaper one, because the type's worst case is the zone the node is already in. The
+// retry pins the launch to the cheaper zones, so the worst case it prices is the worst the launch
+// can do and insufficient capacity there fails the launch instead of landing back in an expensive
+// zone. It reports whether every claim kept a viable option; on failure the original skip's
+// events are published.
+func (c *consolidation) retryOnDemandZoneNarrowedReplacements(ctx context.Context, candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, skipReason, priceDetail string, publishEvents bool) bool {
+	return c.retryZoneNarrowedReplacements(candidates, newNodeClaims, snapshots, budget, skipReason, priceDetail, publishEvents, narrowClaimToCheapZones, func(outcome string) {
+		ObserveConsolidationOnDemandZoneRetry(consolidationTypeFromContext(ctx), candidates, outcome)
+	})
+}
+
+// retryZoneNarrowedReplacements is the retry shared by the spot and on-demand zone-narrowing
+// paths: restore each claim from its snapshot, narrow it with narrow against its share of the
+// budget, and let the aggregate price filter have the final say. observe is called with each retry
+// outcome when events are being published.
+func (c *consolidation) retryZoneNarrowedReplacements(candidates []*Candidate, newNodeClaims []*pscheduling.NodeClaim, snapshots [][]*cloudprovider.InstanceType, budget priceBudget, skipReason, priceDetail string, publishEvents bool, narrow func(*pscheduling.NodeClaim, float64) (string, bool), observe func(outcome string)) bool {
 	observeOutcome := func(outcome string) {
 		if publishEvents {
-			ObserveConsolidationSpotZoneRetry(consolidationTypeFromContext(ctx), candidates, outcome)
+			observe(outcome)
 		}
 	}
 	if !priceEmptiedSkip(skipReason) {
@@ -621,7 +699,7 @@ func (c *consolidation) retrySpotZoneNarrowedReplacements(ctx context.Context, c
 	claimBudget := budget.split(len(newNodeClaims))
 	for i, nc := range newNodeClaims {
 		nc.InstanceTypeOptions = snapshots[i]
-		if outcome, narrowed := narrowClaimToCheapSpotZones(nc, claimBudget); !narrowed {
+		if outcome, narrowed := narrow(nc, claimBudget); !narrowed {
 			observeOutcome(outcome)
 			c.publishReplacementSkip(newNodeClaims, candidates, skipReason, priceDetail, publishEvents)
 			return false
@@ -940,10 +1018,20 @@ func (c *consolidation) publishCantReplace(newNodeClaims []*pscheduling.NodeClai
 // requirements: the most expensive compatible offering of the preferred capacity type (reserved, then spot, then
 // on-demand), or nil when none is compatible.
 func worstLaunchOffering(it *cloudprovider.InstanceType, reqs scheduling.Requirements) *cloudprovider.Offering {
+	if ofs := launchOfferings(it, reqs); len(ofs) != 0 {
+		return ofs.MostExpensive()
+	}
+	return nil
+}
+
+// launchOfferings returns the offerings WorstLaunchPrice prices an instance type on under the given
+// requirements: the available, compatible offerings of the capacity type the launch will use
+// (reserved, then spot, then on-demand), or nil when none is compatible.
+func launchOfferings(it *cloudprovider.InstanceType, reqs scheduling.Requirements) cloudprovider.Offerings {
 	ofs := it.Offerings.Available().Compatible(reqs)
 	for _, ctReqs := range []scheduling.Requirements{cloudprovider.ReservedRequirement, cloudprovider.SpotRequirement, cloudprovider.OnDemandRequirement} {
 		if compat := ofs.Compatible(ctReqs); len(compat) != 0 {
-			return compat.MostExpensive()
+			return compat
 		}
 	}
 	return nil
