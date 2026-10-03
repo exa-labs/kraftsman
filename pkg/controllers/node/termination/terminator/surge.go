@@ -21,19 +21,20 @@ limitations under the License.
 // A ReplicaSet selects its pods by the Deployment's labels plus pod-template-hash; removing that label from a running
 // pod makes the ReplicaSet controller release it (drop its controller reference) and create a replacement while the
 // released pod keeps running and keeps matching its Services. Once the ReplicaSet again has its full count of available
-// pods the released pod is surplus, and deleting it restores exactly the availability the workload had before the drain.
+// pods the released pod is surplus, and evicting it leaves the workload exactly as available as it was before the drain.
 //
 // Per pod the state machine is:
 //  1. eligible, not isolated: release it with one optimistic-lock patch (remove the label, record the ReplicaSet, the
 //     removed label value and the start time in annotations, and add a non-controller owner reference to the
-//     Deployment so garbage collection still follows the workload). A ReplicaSet that is gone or scaled to zero falls
-//     back to the eviction API.
+//     Deployment so garbage collection still follows the workload). A ReplicaSet that is gone, scaled to zero or does
+//     not select on pod-template-hash, or a patch the API server refuses, falls back to the eviction API.
 //  2. isolated: once the ReplicaSet controller has dropped the pod's controller reference and the ReplicaSet's own pods
-//     are all available again, delete the pod. A ReplicaSet that is gone or scaled to zero no longer wants a
-//     replacement, so the pod is deleted at once.
-//  3. isolated past the surge eviction timeout: roll back with one optimistic-lock patch (restore the label, drop the
-//     bookkeeping and the Deployment reference, mark the pod aborted). The ReplicaSet re-adopts the pod and removes its
-//     surplus replacement, and the pod drains through the eviction API.
+//     are all available again, hand the pod to the eviction queue. A ReplicaSet that is gone or scaled to zero no
+//     longer wants a replacement, so the pod is handed over at once. The pod keeps the node draining until it is gone.
+//  3. isolated past the surge eviction timeout while the ReplicaSet is not fully available (or cannot be read): roll
+//     back with one optimistic-lock patch (restore the label, drop the bookkeeping and the Deployment reference, mark
+//     the pod aborted). The ReplicaSet re-adopts the pod and removes its surplus replacement, and the pod drains through
+//     the eviction API like any other.
 //
 // Every step is idempotent and reads its state from the pod, so a restart or a conflicting write only delays it.
 
@@ -52,6 +53,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -72,19 +74,27 @@ type surgeEvictor struct {
 }
 
 // drain advances surge eviction for one priority group of a draining node. group is every pod of the group still
-// waiting to leave the node and evictable the subset Drain would hand to the eviction queue. It returns the pods that
-// still go to the eviction queue: evictable pods that are not surge evicted. Isolated pods are never returned, so they
-// keep the node from draining without ever reaching the eviction API. inQueue reports pods the eviction queue already
-// holds; they stay on that path.
+// waiting to leave the node and evictable the subset Drain may hand to the eviction queue. It returns the pods the
+// eviction queue should take: evictable pods that are not surge evicted (or fell back), and isolated pods whose surge
+// has completed. Isolated pods still waiting for their ReplicaSet are not returned, so they keep the node from draining
+// without reaching the eviction API. inQueue reports pods the eviction queue already holds.
 func (s *surgeEvictor) drain(ctx context.Context, node *corev1.Node, group, evictable []*corev1.Pod, inQueue func(*corev1.Pod) bool) ([]*corev1.Pod, error) {
 	var errs []error
+	toEvict := make([]*corev1.Pod, 0, len(evictable))
+	evictableUIDs := sets.New(lo.Map(evictable, func(p *corev1.Pod, _ int) types.UID { return p.UID })...)
 	for _, pod := range group {
-		if podutil.IsSurgeIsolated(pod) && !podutil.IsTerminating(pod) {
-			errs = append(errs, s.advance(ctx, pod))
+		if !podutil.IsSurgeIsolated(pod) || podutil.IsTerminating(pod) {
+			continue
+		}
+		reason, err := s.advance(ctx, pod)
+		errs = append(errs, err)
+		// An isolated pod that has since become non-evictable (for example do-not-disrupt) waits like any other.
+		if reason != "" && evictableUIDs.Has(pod.UID) {
+			s.complete(ctx, pod, reason, inQueue(pod))
+			toEvict = append(toEvict, pod)
 		}
 	}
 	pool := &nodePoolResolver{kubeClient: s.kubeClient, node: node}
-	toEvict := make([]*corev1.Pod, 0, len(evictable))
 	for _, pod := range evictable {
 		evict, err := s.route(ctx, pod, pool, inQueue)
 		errs = append(errs, err)
@@ -95,9 +105,9 @@ func (s *surgeEvictor) drain(ctx context.Context, node *corev1.Node, group, evic
 	return toEvict, errors.Join(errs...)
 }
 
-// route decides whether an evictable pod goes to the eviction queue, isolating it first when it is surge evicted.
-// It returns true for pods the eviction queue should take; an error leaves the pod off the queue until the next
-// reconcile, since neither path is safe to commit to while the pod's NodePool or ReplicaSet cannot be read.
+// route decides whether an evictable pod that is not isolated goes to the eviction queue, isolating it first when it is
+// surge evicted. It returns true for pods the eviction queue should take; an error leaves the pod off the queue until
+// the next reconcile, since neither path is safe to commit to while the pod's NodePool or ReplicaSet cannot be read.
 func (s *surgeEvictor) route(ctx context.Context, pod *corev1.Pod, pool *nodePoolResolver, inQueue func(*corev1.Pod) bool) (bool, error) {
 	if podutil.IsSurgeIsolated(pod) {
 		return false, nil
@@ -113,8 +123,7 @@ func (s *surgeEvictor) route(ctx context.Context, pod *corev1.Pod, pool *nodePoo
 	if !podutil.IsSurgeEvictionEnabled(pod, nodePool) {
 		return true, nil
 	}
-	isolated, err := s.isolate(ctx, pod)
-	return !isolated && err == nil, err
+	return s.isolate(ctx, pod)
 }
 
 // nodePoolResolver looks up the draining node's NodePool once, and only when a pod needs it.
@@ -144,19 +153,23 @@ func (r *nodePoolResolver) get(ctx context.Context) (*v1.NodePool, error) {
 	return r.nodePool, nil
 }
 
-// isolate releases an eligible pod from its ReplicaSet. It returns false when the pod falls back to the eviction API
-// because its ReplicaSet is gone or scaled to zero, and true when the pod was released or its patch must be retried.
+// isolate releases an eligible pod from its ReplicaSet. It returns true when the pod falls back to the eviction API
+// instead: its ReplicaSet is gone, scaled to zero or would not release it, or the API server refused the patch (for
+// example RBAC without patch on pods, or an admission webhook). It returns false when the pod was released or the
+// patch lost a race and is retried on the next reconcile, and an error when the ReplicaSet cannot be read.
 func (s *surgeEvictor) isolate(ctx context.Context, pod *corev1.Pod) (bool, error) {
 	ref := podutil.ReplicaSetControllerRef(pod)
-	rs, err := s.replicaSet(ctx, pod.Namespace, ref.Name, ref.UID)
+	rs, err := podutil.GetReplicaSet(ctx, s.kubeClient, pod.Namespace, ref.Name, ref.UID)
 	if err != nil {
-		return true, err
+		return false, err
 	}
-	if rs == nil || replicas(rs) == 0 {
-		reason := lo.Ternary(rs == nil, "its ReplicaSet no longer exists", "its ReplicaSet is scaled to zero")
-		s.recorder.Publish(terminatorevents.SurgeEvictionFallback(pod, reason))
-		PodsSurgeEvictionsTotal.Inc(map[string]string{OutcomeLabel: SurgeEvictionOutcomeFallback})
-		return false, nil
+	switch {
+	case rs == nil:
+		return s.fallback(ctx, pod, "its ReplicaSet no longer exists", nil)
+	case podutil.ReplicaSetReplicas(rs) == 0:
+		return s.fallback(ctx, pod, "its ReplicaSet is scaled to zero", nil)
+	case !podutil.CanReleaseFromReplicaSet(pod, rs):
+		return s.fallback(ctx, pod, fmt.Sprintf("its ReplicaSet does not select on %s", podutil.PodTemplateHashLabelKey), nil)
 	}
 	stored := pod.DeepCopy()
 	released := pod.DeepCopy()
@@ -179,61 +192,80 @@ func (s *surgeEvictor) isolate(ctx context.Context, pod *corev1.Pod) (bool, erro
 	// The optimistic lock makes the label removal, the bookkeeping and the owner reference list land together on the
 	// version of the pod they were computed from; the ReplicaSet controller edits the same owner reference list.
 	if err := s.kubeClient.Patch(ctx, released, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
-		return true, ignoreRetryable(err, "releasing pod from its replicaset")
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			return false, nil
+		}
+		// Retrying a refused patch cannot succeed until someone changes the cluster, and the pod must not be stranded
+		// meanwhile: drain it the ordinary way.
+		return s.fallback(ctx, pod, "releasing it from its ReplicaSet failed", err)
 	}
 	s.recorder.Publish(terminatorevents.SurgeEvictionIsolated(pod, rs.Name))
 	PodsSurgeEvictionsTotal.Inc(map[string]string{OutcomeLabel: SurgeEvictionOutcomeIsolated})
 	log.FromContext(ctx).WithValues("Pod", klog.KObj(pod), "ReplicaSet", klog.KObj(rs)).Info("released pod from its replicaset for surge eviction")
+	return false, nil
+}
+
+// fallback records that an eligible pod drains through the eviction API instead of surge eviction. cause is the error
+// that forced it, if any; it is logged and included in the event but does not fail the drain. It returns isolate's
+// verdict for a pod that falls back.
+func (s *surgeEvictor) fallback(ctx context.Context, pod *corev1.Pod, reason string, cause error) (bool, error) {
+	logger := log.FromContext(ctx).WithValues("Pod", klog.KObj(pod), "reason", reason)
+	if cause != nil {
+		reason = fmt.Sprintf("%s: %s", reason, cause)
+		logger.Error(cause, "falling back to eviction")
+	} else {
+		logger.V(1).Info("falling back to eviction")
+	}
+	s.recorder.Publish(terminatorevents.SurgeEvictionFallback(pod, reason))
+	PodsSurgeEvictionsTotal.Inc(map[string]string{OutcomeLabel: SurgeEvictionOutcomeFallback})
 	return true, nil
 }
 
-// advance moves an isolated pod forward: it deletes the pod once its ReplicaSet no longer needs it, and rolls the
-// surge back once the timeout has passed.
-func (s *surgeEvictor) advance(ctx context.Context, pod *corev1.Pod) error {
+// advance moves an isolated pod forward. It returns a non-empty reason once the pod can leave: its ReplicaSet has
+// released it and is fully available again, or no longer wants a replacement. Past the surge eviction timeout it
+// otherwise rolls the surge back, also when the ReplicaSet or its pods cannot be read, so an unreadable ReplicaSet
+// cannot hold the pod isolated forever.
+func (s *surgeEvictor) advance(ctx context.Context, pod *corev1.Pod) (string, error) {
 	name, uid, ok := parseReplicaSetRef(pod.Annotations[v1.SurgeEvictionReplicaSetAnnotationKey])
 	if !ok {
-		return s.rollback(ctx, pod, nil, "its surge eviction bookkeeping does not name a ReplicaSet")
+		return "", s.rollback(ctx, pod, nil, "its surge eviction bookkeeping does not name a ReplicaSet")
 	}
-	rs, err := s.replicaSet(ctx, pod.Namespace, name, uid)
+	reason, rs, err := s.completion(ctx, pod, name, uid)
+	if reason != "" || !s.timedOut(ctx, pod) {
+		return reason, err
+	}
+	timeout := options.FromContext(ctx).SurgeEvictionTimeout
 	if err != nil {
-		return err
+		log.FromContext(ctx).WithValues("Pod", klog.KObj(pod)).Error(err, "reading surge eviction state past its timeout")
+		return "", s.rollback(ctx, pod, rs, fmt.Sprintf("its ReplicaSet could not be read within %s", timeout))
+	}
+	return "", s.rollback(ctx, pod, rs, fmt.Sprintf("its ReplicaSet was not fully available within %s", timeout))
+}
+
+// completion decides whether an isolated pod can leave, returning a non-empty reason when it can. It also returns the
+// ReplicaSet the pod was released from when it could be read, for a rollback to clean up after.
+func (s *surgeEvictor) completion(ctx context.Context, pod *corev1.Pod, name string, uid types.UID) (string, *appsv1.ReplicaSet, error) {
+	rs, err := podutil.GetReplicaSet(ctx, s.kubeClient, pod.Namespace, name, uid)
+	if err != nil {
+		return "", nil, err
 	}
 	if rs == nil {
-		return s.complete(ctx, pod, "its ReplicaSet no longer exists")
+		return "its ReplicaSet no longer exists", nil, nil
 	}
-	if replicas(rs) == 0 {
-		return s.complete(ctx, pod, "its ReplicaSet is scaled to zero")
+	replicas := podutil.ReplicaSetReplicas(rs)
+	if replicas == 0 {
+		return "its ReplicaSet is scaled to zero", rs, nil
 	}
 	// Until the ReplicaSet controller has dropped the pod's controller reference it has not created the replacement
 	// either, and its pods cannot be trusted to show it.
-	if metav1.GetControllerOf(pod) == nil {
-		available, err := s.availableReplicas(ctx, rs)
-		if err != nil {
-			return err
-		}
-		if available >= replicas(rs) {
-			return s.complete(ctx, pod, fmt.Sprintf("its ReplicaSet has %d/%d available pods", available, replicas(rs)))
-		}
+	if metav1.GetControllerOf(pod) != nil {
+		return "", rs, nil
 	}
-	if s.timedOut(ctx, pod) {
-		return s.rollback(ctx, pod, rs, fmt.Sprintf("its ReplicaSet was not fully available within %s", options.FromContext(ctx).SurgeEvictionTimeout))
+	full, available, err := podutil.IsReplicaSetFullyAvailable(ctx, s.kubeClient, rs, s.clock.Now())
+	if err != nil || !full {
+		return "", rs, err
 	}
-	return nil
-}
-
-// availableReplicas counts the ReplicaSet's own pods that are available. It reads pods rather than the ReplicaSet's
-// status, which lags the release of the isolated pod and the start of its replacement.
-func (s *surgeEvictor) availableReplicas(ctx context.Context, rs *appsv1.ReplicaSet) (int32, error) {
-	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
-	if err != nil {
-		return 0, fmt.Errorf("parsing replicaset selector, %w", err)
-	}
-	podList := &corev1.PodList{}
-	if err := s.kubeClient.List(ctx, podList, client.InNamespace(rs.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
-		return 0, fmt.Errorf("listing replicaset pods, %w", err)
-	}
-	pods := lo.ToSlicePtr(podList.Items)
-	return podutil.AvailableControlledPods(pods, rs.UID, rs.Spec.MinReadySeconds, s.clock.Now()), nil
+	return fmt.Sprintf("its ReplicaSet has %d/%d available pods", available, replicas), rs, nil
 }
 
 // timedOut reports whether the pod has been isolated for longer than the surge eviction timeout. An unreadable start
@@ -246,16 +278,21 @@ func (s *surgeEvictor) timedOut(ctx context.Context, pod *corev1.Pod) bool {
 	return s.clock.Since(started) > options.FromContext(ctx).SurgeEvictionTimeout
 }
 
-// complete deletes an isolated pod. It bypasses the eviction API on purpose: the pod is surplus to its ReplicaSet, so
-// removing it leaves the workload exactly as available as it was before the drain.
-func (s *surgeEvictor) complete(ctx context.Context, pod *corev1.Pod, reason string) error {
-	if err := s.kubeClient.Delete(ctx, pod, client.Preconditions{UID: lo.ToPtr(pod.UID)}); err != nil {
-		return ignoreRetryable(err, "deleting pod released for surge eviction")
+// complete records that an isolated pod is handed to the eviction queue, once: a pod the queue already holds was
+// recorded when it was first handed over.
+//
+// The pod goes through the eviction API rather than a plain delete so that its PodDisruptionBudget, not a possibly
+// stale cached pod list, arbitrates races with other drains. Once the ReplicaSet's own pods are all available the
+// isolated pod is extra healthy capacity: the disruption controller counts a pod with no controller as healthy but
+// leaves it out of the expected count (it reports it as unmanaged), so the budget allows the eviction exactly when the
+// surge has succeeded.
+func (s *surgeEvictor) complete(ctx context.Context, pod *corev1.Pod, reason string, queued bool) {
+	if queued {
+		return
 	}
 	s.recorder.Publish(terminatorevents.SurgeEvictionCompleted(pod, reason))
 	PodsSurgeEvictionsTotal.Inc(map[string]string{OutcomeLabel: SurgeEvictionOutcomeCompleted})
-	log.FromContext(ctx).WithValues("Pod", klog.KObj(pod), "reason", reason).Info("deleted pod released for surge eviction")
-	return nil
+	log.FromContext(ctx).WithValues("Pod", klog.KObj(pod), "reason", reason).Info("evicting pod released for surge eviction")
 }
 
 // rollback returns an isolated pod to its ReplicaSet and marks it so it drains through the eviction API. rs is the
@@ -285,27 +322,6 @@ func (s *surgeEvictor) rollback(ctx context.Context, pod *corev1.Pod, rs *appsv1
 	PodsSurgeEvictionsTotal.Inc(map[string]string{OutcomeLabel: SurgeEvictionOutcomeAborted})
 	log.FromContext(ctx).WithValues("Pod", klog.KObj(pod), "reason", reason).Info("rolled back surge eviction")
 	return nil
-}
-
-// replicaSet returns the ReplicaSet with the given name and UID, or nil when it no longer exists (a ReplicaSet
-// recreated under the same name is a different ReplicaSet).
-func (s *surgeEvictor) replicaSet(ctx context.Context, namespace, name string, uid types.UID) (*appsv1.ReplicaSet, error) {
-	rs := &appsv1.ReplicaSet{}
-	if err := s.kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, rs); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("getting replicaset, %w", err)
-	}
-	if rs.UID != uid {
-		return nil, nil
-	}
-	return rs, nil
-}
-
-// replicas is the ReplicaSet's desired pod count; the API defaults an unset count to 1.
-func replicas(rs *appsv1.ReplicaSet) int32 {
-	return lo.FromPtrOr(rs.Spec.Replicas, 1)
 }
 
 // deploymentControllerRef returns the ReplicaSet's controller owner reference when it is an apps/v1 Deployment.

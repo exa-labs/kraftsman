@@ -49,8 +49,10 @@ type evaluation struct {
 	exempt func(*v1.Pod) bool
 }
 
-// ExemptPods makes Limits ignore PodDisruptionBudgets for the pods the predicate accepts: pods Karpenter removes
-// without the eviction API, which a PodDisruptionBudget therefore cannot block. Every other check still applies.
+// ExemptPods makes Limits ignore PodDisruptionBudgets for the pods the predicate accepts: pods whose removal leaves
+// their workload as available as it was, which a PodDisruptionBudget therefore must not block. Every other check still
+// applies. The predicate is evaluated only for pods a PodDisruptionBudget would otherwise block, so it may read the
+// cluster without slowing down the common case.
 func ExemptPods(exempt func(*v1.Pod) bool) Option {
 	return func(e *evaluation) {
 		e.exempt = exempt
@@ -112,18 +114,23 @@ func (l Limits) isFullyBlocked(pod *v1.Pod, clk clock.Clock, recorder events.Rec
 	return []client.ObjectKey{}, false
 }
 
-// nolint:gocyclo
 func (l Limits) isEvictable(pod *v1.Pod, clk clock.Clock, recorder events.Recorder, evictionBlocker evictionBlocker, e evaluation) ([]client.ObjectKey, bool) {
 	// If the pod isn't eligible for being evicted, then the predicate doesn't matter
 	// This is due to the fact that we won't call the eviction API on these pods when we are disrupting the node
 	if !podutil.IsEvictable(pod, clk, recorder) {
 		return []client.ObjectKey{}, true
 	}
-	// Exempt pods leave the node without the eviction API, so no PDB can block them
-	if e.isExempt(pod) {
+	keys, evictable := l.pdbBlockers(pod, evictionBlocker)
+	// The exemption is evaluated only for pods a PDB blocks, since it may have to read the cluster
+	if !evictable && e.isExempt(pod) {
 		return []client.ObjectKey{}, true
 	}
+	return keys, evictable
+}
 
+// pdbBlockers returns the PDBs that block evicting the pod and false, or no PDBs and true when none blocks it.
+// nolint:gocyclo
+func (l Limits) pdbBlockers(pod *v1.Pod, evictionBlocker evictionBlocker) ([]client.ObjectKey, bool) {
 	matchingPDBs := lo.Filter(l, func(pdb *pdbItem, _ int) bool {
 		return pdb.key.Namespace == pod.Namespace && pdb.selector.Matches(labels.Set(pod.Labels))
 	})

@@ -16,20 +16,26 @@ limitations under the License.
 
 // Surge eviction predicates. Surge eviction drains a ReplicaSet pod by removing its pod-template-hash label, which makes
 // the ReplicaSet release the pod and create a replacement while the released ("isolated") pod keeps running; the
-// isolated pod is deleted once the ReplicaSet is fully available again. The functions here are pure: they decide from
-// the pod, its NodePool and the ReplicaSet's pods alone, so the disruption and termination controllers agree on which
-// pods are surge evicted. See the SurgeEviction* annotation keys in pkg/apis/v1 for the API.
+// isolated pod is evicted once the ReplicaSet is fully available again. The predicates here decide from the pod, its
+// NodePool, its ReplicaSet and the ReplicaSet's pods, and are shared by the disruption and termination controllers so
+// that both agree on which pods are surge evicted and when a surge can complete. See the SurgeEviction* annotation keys
+// in pkg/apis/v1 for the API.
 
 package pod
 
 import (
+	"context"
+	"fmt"
 	"time"
 
+	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -123,4 +129,77 @@ func AvailableControlledPods(pods []*corev1.Pod, controllerUID types.UID, minRea
 		}
 	}
 	return count
+}
+
+// GetReplicaSet returns the ReplicaSet with the given name and UID, or nil when it no longer exists. A ReplicaSet
+// recreated under the same name is a different ReplicaSet and also yields nil.
+func GetReplicaSet(ctx context.Context, kubeClient client.Client, namespace, name string, uid types.UID) (*appsv1.ReplicaSet, error) {
+	rs := &appsv1.ReplicaSet{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, rs); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting replicaset, %w", err)
+	}
+	if rs.UID != uid {
+		return nil, nil
+	}
+	return rs, nil
+}
+
+// ReplicaSetReplicas is the ReplicaSet's desired pod count; the API defaults an unset count to 1.
+func ReplicaSetReplicas(rs *appsv1.ReplicaSet) int32 {
+	return lo.FromPtrOr(rs.Spec.Replicas, 1)
+}
+
+// CanReleaseFromReplicaSet reports whether removing the pod's pod-template-hash label makes the ReplicaSet release it:
+// the ReplicaSet must select on that label with the pod's value, as the ReplicaSets a Deployment creates do.
+func CanReleaseFromReplicaSet(pod *corev1.Pod, rs *appsv1.ReplicaSet) bool {
+	hash := pod.Labels[PodTemplateHashLabelKey]
+	return hash != "" && rs.Spec.Selector != nil && rs.Spec.Selector.MatchLabels[PodTemplateHashLabelKey] == hash
+}
+
+// AvailableReplicaSetPods counts the ReplicaSet's own pods that are available (see AvailableControlledPods). It reads
+// pods rather than the ReplicaSet's status, which lags the release of a pod and the start of its replacement. A pod
+// still controlled by the ReplicaSet but no longer matching its selector is not counted.
+func AvailableReplicaSetPods(ctx context.Context, kubeClient client.Client, rs *appsv1.ReplicaSet, now time.Time) (int32, error) {
+	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
+	if err != nil {
+		return 0, fmt.Errorf("parsing replicaset selector, %w", err)
+	}
+	podList := &corev1.PodList{}
+	if err := kubeClient.List(ctx, podList, client.InNamespace(rs.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return 0, fmt.Errorf("listing replicaset pods, %w", err)
+	}
+	return AvailableControlledPods(lo.ToSlicePtr(podList.Items), rs.UID, rs.Spec.MinReadySeconds, now), nil
+}
+
+// IsReplicaSetFullyAvailable reports whether the ReplicaSet wants at least one pod and has all of them available.
+func IsReplicaSetFullyAvailable(ctx context.Context, kubeClient client.Client, rs *appsv1.ReplicaSet, now time.Time) (bool, int32, error) {
+	replicas := ReplicaSetReplicas(rs)
+	if replicas < 1 {
+		return false, 0, nil
+	}
+	available, err := AvailableReplicaSetPods(ctx, kubeClient, rs, now)
+	if err != nil {
+		return false, 0, err
+	}
+	return available >= replicas, available, nil
+}
+
+// CanCompleteSurgeEviction reports whether a surge eviction of the pod, started now, would end with the ReplicaSet
+// as available as it is now: the pod's ReplicaSet releases it when its pod-template-hash label is removed, and has all
+// of its replicas available counting the pod itself. A degraded ReplicaSet's surge cannot complete before it recovers,
+// so its pods are not exempt from the checks that guard the eviction API. Any read error yields false.
+func CanCompleteSurgeEviction(ctx context.Context, kubeClient client.Client, pod *corev1.Pod, now time.Time) bool {
+	ref := ReplicaSetControllerRef(pod)
+	if ref == nil {
+		return false
+	}
+	rs, err := GetReplicaSet(ctx, kubeClient, pod.Namespace, ref.Name, ref.UID)
+	if err != nil || rs == nil || !CanReleaseFromReplicaSet(pod, rs) {
+		return false
+	}
+	full, _, err := IsReplicaSetFullyAvailable(ctx, kubeClient, rs, now)
+	return err == nil && full
 }

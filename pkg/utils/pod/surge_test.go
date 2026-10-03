@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -143,6 +144,22 @@ var _ = Describe("SurgeEviction", func() {
 		p.Annotations[v1.SurgeEvictionStartedAnnotationKey] = "2026-01-01T00:00:00Z"
 		Expect(pod.IsSurgeIsolated(p)).To(BeTrue())
 		Expect(pod.IsReschedulable(p)).To(BeFalse())
+	})
+
+	DescribeTable("CanReleaseFromReplicaSet",
+		func(selector map[string]string, podHash string, expected bool) {
+			p := surgePod(func(p *corev1.Pod) { p.Labels[pod.PodTemplateHashLabelKey] = podHash })
+			rs := &appsv1.ReplicaSet{Spec: appsv1.ReplicaSetSpec{Selector: &metav1.LabelSelector{MatchLabels: selector}}}
+			Expect(pod.CanReleaseFromReplicaSet(p, rs)).To(Equal(expected))
+		},
+		Entry("selector carries the pod's hash", map[string]string{"app": "web", pod.PodTemplateHashLabelKey: "5d8f7c"}, "5d8f7c", true),
+		Entry("selector without the hash", map[string]string{"app": "web"}, "5d8f7c", false),
+		Entry("selector with another hash", map[string]string{"app": "web", pod.PodTemplateHashLabelKey: "other"}, "5d8f7c", false),
+		Entry("pod without a hash", map[string]string{"app": "web", pod.PodTemplateHashLabelKey: ""}, "", false),
+	)
+
+	It("should not release a pod from a ReplicaSet without a selector", func() {
+		Expect(pod.CanReleaseFromReplicaSet(surgePod(nil), &appsv1.ReplicaSet{})).To(BeFalse())
 	})
 
 	DescribeTable("IsAvailable",
