@@ -158,6 +158,10 @@ const (
 	// an identical candidate - same node, claim, pods, pool and instance type revision - and found
 	// nothing worth doing, and that verdict has not yet expired.
 	CandidateSkipUnchangedNegative = "unchanged_negative_result"
+	// CandidateSkipReplacementBackoff marks a candidate whose replace was skipped because a recent
+	// command that would have replaced it failed to launch or initialize its replacement. A held
+	// candidate that can be deleted is not skipped.
+	CandidateSkipReplacementBackoff = "replacement_failure_backoff"
 )
 
 // Negative-result cache lookup outcomes. The counter is observed on every lookup whether or not

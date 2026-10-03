@@ -244,6 +244,22 @@ func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...
 // errCandidateTimedOut reports a candidate abandoned by its own budget rather than by a failure.
 var errCandidateTimedOut = errors.New("candidate simulation exceeded its budget")
 
+// replacementsHeldKey marks a candidate simulation whose replace is held off by the replacement
+// failure back-off: only a delete may come out of it.
+type replacementsHeldKey struct{}
+
+// withReplacementsHeld returns a context whose consolidation simulation may produce a delete but
+// stops with a no-op as soon as the candidate would need a replacement.
+func withReplacementsHeld(ctx context.Context) context.Context {
+	return context.WithValue(ctx, replacementsHeldKey{}, true)
+}
+
+// replacementsHeld reports whether the simulation's replace is held off.
+func replacementsHeld(ctx context.Context) bool {
+	held, _ := ctx.Value(replacementsHeldKey{}).(bool)
+	return held
+}
+
 // computeConsolidationWithinCandidateBudget evaluates one candidate under a deadline of its own.
 //
 // The pass timeout bounds discovery in aggregate, which leaves one pathological candidate free to
@@ -316,6 +332,15 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 			Results:             results,
 			PoolDisruptionCosts: computePoolDisruptionCosts(candidates),
 		}, nil
+	}
+	// A candidate whose last replacement failed to launch may still be deleted, but its replace is
+	// held off. Stop before pricing, split and spot retries, which would announce, and spend the
+	// pass's split budget on, a command the walk could not admit. This is not a verdict about the
+	// candidate, so it stays out of the negative-result cache.
+	if replacementsHeld(ctx) {
+		observeSingleNodeSkip(CandidateSkipReplacementBackoff)
+		markNoOpInconclusive(ctx)
+		return Command{}, nil
 	}
 
 	// A single candidate may be split into up to MaxConsolidationReplacements replacement nodes

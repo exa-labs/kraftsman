@@ -106,6 +106,14 @@ type Queue struct {
 	// It is a fleet-change signal: consumers holding state computed against the fleet (the
 	// negative-result cache) compare it between passes to notice that capacity moved.
 	completedCommands atomic.Uint64
+	// replacementBackoff holds consolidation candidates off after their replacements failed to
+	// launch or initialize; the queue records the failures and the passes read the holds.
+	replacementBackoff *ReplacementBackoff
+}
+
+// ReplacementBackoff returns the queue's replacement failure back-off.
+func (q *Queue) ReplacementBackoff() *ReplacementBackoff {
+	return q.replacementBackoff
 }
 
 // CompletedCommandCount reports how many commands the queue has completed since startup.
@@ -127,6 +135,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		cluster:             cluster,
 		clock:               clock,
 		provisioner:         provisioner,
+		replacementBackoff:  NewReplacementBackoff(clock),
 	}
 	return queue
 }
@@ -179,6 +188,11 @@ func (q *Queue) Reconcile(ctx context.Context, req reconcile.Request) (reconcile
 			metrics.ReasonLabel:    pretty.ToSnakeCase(string(cmd.Reason())),
 			ConsolidationTypeLabel: cmd.ConsolidationType(),
 		})
+		// A consolidation whose replacement never came up is likely to fail the same way if it is
+		// proposed again right away, so its candidates are held off for a while (when enabled).
+		if len(failedLaunches) > 0 && (cmd.ConsolidationType() == SingleNodeConsolidationType || cmd.ConsolidationType() == MultiNodeConsolidationType) {
+			q.replacementBackoff.RecordFailure(ctx, cmd.Candidates)
+		}
 		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 		multiErr := multierr.Combine(err, state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
 		multiErr = multierr.Combine(multiErr, state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
@@ -186,6 +200,7 @@ func (q *Queue) Reconcile(ctx context.Context, req reconcile.Request) (reconcile
 		log.FromContext(ctx).Error(multiErr, "failed terminating nodes while executing a disruption command")
 	} else {
 		log.FromContext(ctx).V(1).Info("command succeeded")
+		q.replacementBackoff.Forget(cmd.Candidates)
 		alreadySucceeded := cmd.Succeeded
 		cmd.Succeeded = true
 		if !alreadySucceeded && (cmd.ConsolidationType() == SingleNodeConsolidationType || cmd.ConsolidationType() == MultiNodeConsolidationType) {
