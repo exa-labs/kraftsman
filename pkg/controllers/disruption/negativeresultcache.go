@@ -18,7 +18,9 @@ package disruption
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"sync"
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,8 +43,10 @@ import (
 // stale entry can do is delay one node's consolidation until the entry expires or one of its
 // fingerprinted inputs moves.
 //
-// The fingerprint covers the candidate-local inputs that can flip a no into a yes: the Node and
-// NodeClaim resourceVersions (capacity, labels, taints), the NodePool's generation (template,
+// The fingerprint covers the candidate-local inputs that can flip a no into a yes: the content of
+// the Node and NodeClaim a simulation reads (labels, annotations, spec, capacity, allocatable,
+// condition statuses - not resourceVersion, which kubelet heartbeats and pod-event timestamps move
+// every few minutes without changing any of those), the NodePool's generation (template,
 // requirements, budgets - spec only, so the counter patches of ordinary node churn don't
 // invalidate entries), the set of reschedulable pods at their own resourceVersions (a pod that
 // gains a toleration or resizes its requests changes what the simulation would do), and the
@@ -199,6 +204,14 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 	if !ok {
 		return ""
 	}
+	node, ok := nodeContentHash(candidate.Node)
+	if !ok {
+		return ""
+	}
+	nodeClaim, ok := nodeClaimContentHash(candidate.NodeClaim)
+	if !ok {
+		return ""
+	}
 	// Pods carry their resourceVersion, not just their identity: a spec update (new tolerations,
 	// changed requests via in-place resize) changes what the simulation would do without changing
 	// the pod set.
@@ -218,8 +231,8 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 	// spot-to-spot stability annotations steer the decision from metadata, which generation does
 	// not track, so their raw values are carried explicitly.
 	return fmt.Sprintf("%s|%s|%s:%d|%d|%s|%s|%s|%s",
-		candidate.Node.ResourceVersion,
-		candidate.NodeClaim.ResourceVersion,
+		node,
+		nodeClaim,
 		candidate.NodePool.UID,
 		candidate.NodePool.Generation,
 		revision,
@@ -228,6 +241,77 @@ func (f *negativeCacheFingerprints) fingerprint(ctx context.Context, candidate *
 		candidate.NodePool.Annotations[v1.NodePoolSpotToSpotMinSavingsAnnotationKey],
 		fleet,
 	)
+}
+
+// conditionState is the part of a status condition a simulation can depend on. Transition and
+// heartbeat timestamps are left out: they move without the condition changing.
+type conditionState struct {
+	Type   string
+	Status string
+}
+
+// nodeContentHash hashes what a consolidation simulation reads from a Node: labels, annotations,
+// spec (taints, unschedulable, provider ID), capacity, allocatable, and each condition's status.
+// The Node's resourceVersion is deliberately not used: the kubelet rewrites condition heartbeat
+// timestamps on every status report, so on a large fleet it moves for a large share of nodes
+// between two passes while nothing the simulation sees has changed.
+func nodeContentHash(node *corev1.Node) (string, bool) {
+	conditions := make([]conditionState, 0, len(node.Status.Conditions))
+	for _, condition := range node.Status.Conditions {
+		conditions = append(conditions, conditionState{Type: string(condition.Type), Status: string(condition.Status)})
+	}
+	return contentHash(struct {
+		Labels      map[string]string
+		Annotations map[string]string
+		Spec        corev1.NodeSpec
+		Capacity    corev1.ResourceList
+		Allocatable corev1.ResourceList
+		Conditions  []conditionState
+	}{node.Labels, node.Annotations, node.Spec, node.Status.Capacity, node.Status.Allocatable, sortedConditions(conditions)})
+}
+
+// nodeClaimContentHash hashes what a consolidation simulation reads from a NodeClaim: labels,
+// annotations, spec (requirements, resources, taints), the launched node's identity, capacity,
+// allocatable, and each condition's status. The NodeClaim's resourceVersion is deliberately not
+// used: status.lastPodEventTime is patched on pod events, which the reschedulable pod set already
+// covers, and condition transition timestamps move without the condition changing.
+func nodeClaimContentHash(nodeClaim *v1.NodeClaim) (string, bool) {
+	conditions := make([]conditionState, 0, len(nodeClaim.Status.Conditions))
+	for _, condition := range nodeClaim.Status.Conditions {
+		conditions = append(conditions, conditionState{Type: condition.Type, Status: string(condition.Status)})
+	}
+	return contentHash(struct {
+		Labels      map[string]string
+		Annotations map[string]string
+		Spec        v1.NodeClaimSpec
+		NodeName    string
+		ProviderID  string
+		ImageID     string
+		Capacity    corev1.ResourceList
+		Allocatable corev1.ResourceList
+		Conditions  []conditionState
+	}{nodeClaim.Labels, nodeClaim.Annotations, nodeClaim.Spec, nodeClaim.Status.NodeName, nodeClaim.Status.ProviderID,
+		nodeClaim.Status.ImageID, nodeClaim.Status.Capacity, nodeClaim.Status.Allocatable, sortedConditions(conditions)})
+}
+
+func sortedConditions(conditions []conditionState) []conditionState {
+	sort.Slice(conditions, func(i, j int) bool {
+		return conditions[i].Type < conditions[j].Type
+	})
+	return conditions
+}
+
+// contentHash returns a hash of the value's JSON encoding, which orders map keys and so is
+// canonical for the structs above. It fails closed - no hash, no fingerprint - if the value
+// cannot be encoded.
+func contentHash(value any) (string, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", false
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write(encoded)
+	return fmt.Sprintf("%016x", hash.Sum64()), true
 }
 
 // fleetComponent is the fingerprint's view of every NodePool a replacement could be templated

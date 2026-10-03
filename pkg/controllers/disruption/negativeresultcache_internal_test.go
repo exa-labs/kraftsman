@@ -24,6 +24,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -126,15 +127,20 @@ func (f *fakeRevisionProvider) InstanceTypeRevision(_ context.Context, _ *v1.Nod
 	return f.revision, nil
 }
 
-func fingerprintCandidate(nodeRV, claimRV string, poolGeneration int64, podUIDs ...string) *Candidate {
+// fingerprintCandidate builds a candidate whose Node and NodeClaim carry the given values as a
+// label, so tests can change their content; both objects also carry a resourceVersion, which the
+// fingerprint must ignore.
+func fingerprintCandidate(nodeContent, claimContent string, poolGeneration int64, podUIDs ...string) *Candidate {
 	pods := make([]*corev1.Pod, 0, len(podUIDs))
 	for _, uid := range podUIDs {
 		pods = append(pods, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(uid), ResourceVersion: "rv-" + uid}})
 	}
 	return &Candidate{
 		StateNode: &state.StateNode{
-			Node:      &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", ResourceVersion: nodeRV}},
-			NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-a", ResourceVersion: claimRV}},
+			Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", ResourceVersion: "node-rv",
+				Labels: map[string]string{"fingerprint-test": nodeContent}}},
+			NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-a", ResourceVersion: "claim-rv",
+				Labels: map[string]string{"fingerprint-test": claimContent}}},
 		},
 		NodePool:          &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", UID: "pool-a-uid", Generation: poolGeneration, ResourceVersion: "pool-rv"}},
 		reschedulablePods: pods,
@@ -163,10 +169,50 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 	}
 
 	for name, changed := range map[string]*Candidate{
-		"node resourceVersion":      fingerprintCandidate("n2", "c1", 1, "uid-a", "uid-b"),
-		"nodeclaim resourceVersion": fingerprintCandidate("n1", "c2", 1, "uid-a", "uid-b"),
-		"nodepool generation":       fingerprintCandidate("n1", "c1", 2, "uid-a", "uid-b"),
-		"pod set":                   fingerprintCandidate("n1", "c1", 1, "uid-a"),
+		"node labels":         fingerprintCandidate("n2", "c1", 1, "uid-a", "uid-b"),
+		"nodeclaim labels":    fingerprintCandidate("n1", "c2", 1, "uid-a", "uid-b"),
+		"nodepool generation": fingerprintCandidate("n1", "c1", 2, "uid-a", "uid-b"),
+		"pod set":             fingerprintCandidate("n1", "c1", 1, "uid-a"),
+		"node taints": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.Node.Spec.Taints = []corev1.Taint{{Key: "example.com/taint", Effect: corev1.TaintEffectNoSchedule}}
+			return c
+		}(),
+		"node unschedulable": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.Node.Spec.Unschedulable = true
+			return c
+		}(),
+		"node allocatable": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.Node.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}
+			return c
+		}(),
+		"node annotations": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.Node.Annotations = map[string]string{"example.com/annotation": "set"}
+			return c
+		}(),
+		"node condition status": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.Node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
+			return c
+		}(),
+		"nodeclaim taints": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.NodeClaim.Spec.Taints = []corev1.Taint{{Key: "example.com/taint", Effect: corev1.TaintEffectNoSchedule}}
+			return c
+		}(),
+		"nodeclaim allocatable": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.NodeClaim.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}
+			return c
+		}(),
+		"nodeclaim condition status": func() *Candidate {
+			c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+			c.NodeClaim.StatusConditions().SetFalse(v1.ConditionTypeConsolidatable, "NotConsolidatable", "test")
+			return c
+		}(),
 		// A NodePool deleted and recreated under the same name resets its generation and may reuse
 		// an instance type revision, so only the UID distinguishes it from the pool the verdict
 		// was computed against.
@@ -221,6 +267,39 @@ func TestNegativeCacheFingerprintCoversEveryInput(t *testing.T) {
 	// the fingerprint: the simulation the verdict came from could have used that pool.
 	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(managedNodePool(1, false)), provider).fingerprint(ctx, base); got != baseFingerprint {
 		t.Fatal("an unready NodePool entered the fleet component")
+	}
+}
+
+// TestNegativeCacheFingerprintIgnoresHeartbeats pins that the writes a healthy node receives
+// continuously - kubelet status heartbeats, pod-event timestamps on its NodeClaim, condition
+// transition times - leave the fingerprint alone. They move the objects' resourceVersions every
+// few minutes, which would otherwise expire most verdicts between two passes.
+func TestNegativeCacheFingerprintIgnoresHeartbeats(t *testing.T) {
+	ctx := context.Background()
+	provider := &fakeRevisionProvider{CloudProvider: fake.NewCloudProvider(), revision: 7}
+	withConditions := func(heartbeat time.Time) *Candidate {
+		c := fingerprintCandidate("n1", "c1", 1, "uid-a", "uid-b")
+		c.Node.Status.Conditions = []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue, LastHeartbeatTime: metav1.NewTime(heartbeat)},
+			{Type: corev1.NodeMemoryPressure, Status: corev1.ConditionFalse, LastHeartbeatTime: metav1.NewTime(heartbeat)},
+		}
+		c.NodeClaim.Status.LastPodEventTime = metav1.NewTime(heartbeat)
+		c.NodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		return c
+	}
+	before := withConditions(time.Unix(1000, 0))
+	after := withConditions(time.Unix(2000, 0))
+	after.Node.ResourceVersion = "node-rv-heartbeat"
+	after.NodeClaim.ResourceVersion = "claim-rv-heartbeat"
+	// Condition order is not meaningful either.
+	after.Node.Status.Conditions[0], after.Node.Status.Conditions[1] = after.Node.Status.Conditions[1], after.Node.Status.Conditions[0]
+
+	beforeFingerprint := newNegativeCacheFingerprints(fakecr.NewFakeClient(), provider).fingerprint(ctx, before)
+	if beforeFingerprint == "" {
+		t.Fatal("a fully versioned candidate must fingerprint")
+	}
+	if got := newNegativeCacheFingerprints(fakecr.NewFakeClient(), provider).fingerprint(ctx, after); got != beforeFingerprint {
+		t.Fatal("a heartbeat-only update changed the fingerprint")
 	}
 }
 
