@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,11 +29,13 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 type daemonOverheadCacheContextKey struct{}
@@ -108,18 +111,14 @@ func DaemonOverheadCacheFromContext(ctx context.Context) *DaemonOverheadCache {
 	return cache
 }
 
+// daemonSetPodsGeneration fingerprints the DaemonSet pod set the daemon caches are derived from. The
+// pods are live pods (the newest pod of each DaemonSet) where one exists, so the fingerprint is taken
+// over daemonPodGenerationInputs rather than the raw pod: otherwise every node join, which makes a
+// fresh pod the newest one, would read as a DaemonSet change and flush every daemon-derived entry.
 func daemonSetPodsGeneration(daemonSetPods []*corev1.Pod) (string, bool) {
 	entries := make([]string, len(daemonSetPods))
 	for i, pod := range daemonSetPods {
-		content, err := json.Marshal(struct {
-			Namespace string
-			Name      string
-			Spec      corev1.PodSpec
-		}{
-			Namespace: pod.Namespace,
-			Name:      pod.Name,
-			Spec:      pod.Spec,
-		})
+		content, err := json.Marshal(newDaemonPodGenerationInputs(pod))
 		if err != nil {
 			return "", false
 		}
@@ -128,6 +127,74 @@ func daemonSetPodsGeneration(daemonSetPods []*corev1.Pod) (string, bool) {
 	sort.Strings(entries)
 	sum := sha256.Sum256([]byte(strings.Join(entries, "\x01")))
 	return hex.EncodeToString(sum[:]), true
+}
+
+// daemonPodGenerationInputs is what the daemon caches read from a daemon pod: its tolerations, node
+// selector and required node affinity (compatibility), its host ports and resource claims, and its
+// effective requests (resources.Ceiling, which reads the containers, sidecars, overhead and pod-level
+// resources in the spec, and the status resources and resize condition an in-place resize sets).
+// The effective requests are hashed as computed rather than through the raw status, so a stand-in
+// pod that has not reported its resources yet and a running one that has fingerprint alike whenever
+// their requests agree. Left out, because nothing reads them and they differ between pods of one
+// DaemonSet:
+//   - the pod's name and node binding: spec.nodeName, and the matchFields node affinity term the
+//     DaemonSet controller pins each pod to its node with (requirements ignore matchFields);
+//   - per-pod volumes, such as the projected service account token volume admission names with a
+//     random suffix, and the container mounts that reference them;
+//   - ephemeral (debug) containers, which do not count towards requests.
+//
+// The pod is identified by its namespace and controlling DaemonSet, which is stable across its pods,
+// or by its name when it has no controller (a pod synthesized from a template carries its
+// DaemonSet's name). Cached values that carry a pod name (host port usage, the cached daemon pod
+// list) only use it as a label, so serving them for another pod of the same DaemonSet is equivalent.
+// A new input read from daemon pods by any daemon cache must be added here.
+type daemonPodGenerationInputs struct {
+	Namespace string
+	DaemonSet string
+	Spec      *corev1.PodSpec
+	Requests  corev1.ResourceList
+}
+
+func newDaemonPodGenerationInputs(pod *corev1.Pod) daemonPodGenerationInputs {
+	owner := pod.Name
+	if ref := metav1.GetControllerOf(pod); ref != nil {
+		owner = ref.Kind + "/" + ref.Name
+	}
+	spec := pod.Spec // shallow: every field cleared below is replaced, never written through
+	spec.NodeName = ""
+	spec.Volumes = nil
+	spec.EphemeralContainers = nil
+	spec.Containers = withoutVolumeMounts(pod.Spec.Containers)
+	spec.InitContainers = withoutVolumeMounts(pod.Spec.InitContainers)
+	if a := spec.Affinity; a != nil && a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		terms := slices.Clone(a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms)
+		for i := range terms {
+			terms[i].MatchFields = nil
+		}
+		nodeAffinity := *a.NodeAffinity
+		nodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{NodeSelectorTerms: terms}
+		affinity := *a
+		affinity.NodeAffinity = &nodeAffinity
+		spec.Affinity = &affinity
+	}
+	return daemonPodGenerationInputs{
+		Namespace: pod.Namespace,
+		DaemonSet: owner,
+		Spec:      &spec,
+		Requests:  resources.Ceiling(pod).Requests,
+	}
+}
+
+// withoutVolumeMounts returns a copy of containers with their volume mounts dropped.
+func withoutVolumeMounts(containers []corev1.Container) []corev1.Container {
+	if len(containers) == 0 {
+		return containers
+	}
+	out := slices.Clone(containers)
+	for i := range out {
+		out[i].VolumeMounts = nil
+	}
+	return out
 }
 
 func nodeCacheKey(node *state.StateNode, ignoreDRA bool) (string, bool) {

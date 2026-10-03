@@ -33,6 +33,7 @@ import (
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -1361,7 +1362,7 @@ func buildDaemonOverheadGroupsForTemplate(ctx context.Context, nct *NodeClaimTem
 		} else {
 			hostPortUsage := scheduling.NewHostPortUsage()
 			for _, p := range compatible {
-				hostPortUsage.Add(p, scheduling.GetHostPorts(p))
+				hostPortUsage.Add(daemonHostPortReservation(p), scheduling.GetHostPorts(p))
 			}
 			groups[key] = &DaemonOverheadGroup{
 				InstanceTypes:  []*cloudprovider.InstanceType{it},
@@ -1371,6 +1372,19 @@ func buildDaemonOverheadGroupsForTemplate(ctx context.Context, nct *NodeClaimTem
 		}
 	}
 	return lo.Map(lo.Values(groups), func(g *DaemonOverheadGroup, _ int) DaemonOverheadGroup { return *g })
+}
+
+// daemonHostPortReservation returns the identity a daemon pod's host ports are reserved under in a daemon overhead
+// group. HostPortUsage exempts a pod from conflicting with reservations held under its own namespaced name, and
+// cached groups outlive the stand-in pod they were built from (the DaemonSet generation deliberately ignores which pod
+// stands in), so the reservation is keyed by a name no pod can carry: pod names are DNS subdomains, which cannot
+// contain ':'.
+func daemonHostPortReservation(p *corev1.Pod) *corev1.Pod {
+	owner := p.Name
+	if ref := metav1.GetControllerOf(p); ref != nil {
+		owner = ref.Kind + "/" + ref.Name
+	}
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: "daemon:" + owner}}
 }
 
 // podSetKey creates a deterministic key from a list of pods for grouping.

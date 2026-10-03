@@ -225,7 +225,7 @@ func referenceDaemonOverheadGroups(ctx context.Context, nct *NodeClaimTemplate, 
 		}
 		hostPortUsage := scheduling.NewHostPortUsage()
 		for _, p := range compatible {
-			hostPortUsage.Add(p, scheduling.GetHostPorts(p))
+			hostPortUsage.Add(daemonHostPortReservation(p), scheduling.GetHostPorts(p))
 		}
 		groups[key] = &DaemonOverheadGroup{InstanceTypes: []*cloudprovider.InstanceType{it}, DaemonOverhead: overhead, HostPortUsage: hostPortUsage}
 		order = append(order, key)
