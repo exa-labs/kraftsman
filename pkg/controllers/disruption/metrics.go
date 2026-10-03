@@ -59,6 +59,8 @@ const (
 	policyLabel                  = "policy"
 	outcomeLabel                 = "outcome"
 	reasonLabel                  = "reason"
+	detailLabel                  = "detail"
+	afterAdmittedLabel           = "after_admitted"
 	dispositionLabel             = "disposition"
 	replacementCountLabel        = "replacement_count"
 	capacityTypeTransitionLabel  = "capacity_type_transition"
@@ -480,9 +482,9 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "consolidation_admission_failures_total",
-			Help:      "Number of held consolidation proposals that did not become commands, by the stage that rejected them and the reason.",
+			Help:      "Number of held consolidation proposals that did not become commands, by the stage that rejected them, the reason, the specific check that failed (detail), the proposal's decision, and the decision of the command the same pass admitted last before it (after_admitted, none if it admitted nothing yet).",
 		},
-		[]string{ConsolidationTypeLabel, stageLabel, reasonLabel},
+		[]string{ConsolidationTypeLabel, stageLabel, reasonLabel, detailLabel, decisionLabel, afterAdmittedLabel},
 	)
 	ConsolidationCandidateSkipsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
@@ -935,12 +937,22 @@ func ObserveConsolidationCommandsAdmitted(consolidationType string, admitted int
 	})
 }
 
+// AdmittedNothingYet is the after_admitted label of a proposal rejected before its pass admitted
+// any command.
+const AdmittedNothingYet = "none"
+
 // ObserveConsolidationAdmissionFailure records a held proposal that did not become a command.
-func ObserveConsolidationAdmissionFailure(consolidationType, stage, reason string) {
+// detail names the specific check that rejected it (empty outside validation), decision is the
+// proposal's own decision, and afterAdmitted the decision of the last command its pass admitted
+// before it, or AdmittedNothingYet.
+func ObserveConsolidationAdmissionFailure(consolidationType, stage, reason, detail string, decision Decision, afterAdmitted string) {
 	ConsolidationAdmissionFailuresTotal.Inc(map[string]string{
 		ConsolidationTypeLabel: consolidationType,
 		stageLabel:             stage,
 		reasonLabel:            reason,
+		detailLabel:            detail,
+		decisionLabel:          string(decision),
+		afterAdmittedLabel:     afterAdmitted,
 	})
 }
 

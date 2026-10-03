@@ -23,6 +23,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clocktesting "k8s.io/utils/clock/testing"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -252,4 +253,58 @@ func TestIsValidRecordsWaitStageOnCancellation(t *testing.T) {
 		}
 	}
 	t.Fatal("expected a validation_wait stage series for the canceled wait")
+}
+
+func TestValidationFailureDetail(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"churn", newChurnValidationErrorWithDetail(validationDetailCandidateChanged, fmt.Errorf("x")), validationDetailCandidateChanged},
+		{"budget", newBudgetValidationErrorWithDetail(validationDetailCandidateNominated, fmt.Errorf("x")), validationDetailCandidateNominated},
+		{"scheduling", newSchedulingValidationErrorWithDetail(validationDetailReplacementMismatch, fmt.Errorf("x")), validationDetailReplacementMismatch},
+		{"wrapped", fmt.Errorf("validating: %w", newSchedulingValidationErrorWithDetail(validationDetailUninitializedNode, fmt.Errorf("x"))), validationDetailUninitializedNode},
+		{"no detail", NewSchedulingValidationError(fmt.Errorf("x")), "unknown"},
+		{"not a validation error", fmt.Errorf("x"), "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := getValidationFailureDetail(tc.err); got != tc.want {
+				t.Fatalf("getValidationFailureDetail() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// The detail refines the reason; it never changes it.
+	if got := getValidationFailureReason(newSchedulingValidationErrorWithDetail(validationDetailReplacementCountChanged, fmt.Errorf("x"))); got != "scheduling" {
+		t.Fatalf("getValidationFailureReason() = %q, want scheduling", got)
+	}
+}
+
+func TestUnscheduledPodsDetail(t *testing.T) {
+	bound := func(name string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: corev1.PodSpec{NodeName: "candidate"}}
+	}
+	pending := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pending"},
+		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
+			Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
+		}}},
+	}
+	uninitialized := NewUninitializedNodeError(&pscheduling.ExistingNode{})
+	for _, tc := range []struct {
+		name   string
+		errors map[*corev1.Pod]error
+		want   string
+	}{
+		{"uninitialized node", map[*corev1.Pod]error{bound("a"): uninitialized, bound("b"): fmt.Errorf("no fit")}, validationDetailUninitializedNode},
+		{"fits nowhere", map[*corev1.Pod]error{bound("a"): fmt.Errorf("no fit")}, validationDetailPodsUnschedulable},
+		// A pending pod's error never fails validation, so it does not decide the detail either.
+		{"pending pod ignored", map[*corev1.Pod]error{pending: uninitialized, bound("a"): fmt.Errorf("no fit")}, validationDetailPodsUnschedulable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unscheduledPodsDetail(pscheduling.Results{PodErrors: tc.errors}); got != tc.want {
+				t.Fatalf("unscheduledPodsDetail() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

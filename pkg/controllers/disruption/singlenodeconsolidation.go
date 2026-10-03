@@ -394,13 +394,16 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 	attempted := false
 	// launching holds the replacement NodeClaims the commands admitted so far created.
 	launching := sets.New[string]()
+	// lastAdmitted labels each rejection with what the pass admitted just before it, since an
+	// earlier command changes the cluster the next proposal is judged against.
+	lastAdmitted := AdmittedNothingYet
 	for _, proposal := range proposals {
 		if attempted && !s.clock.Now().Add(commandAdmissionReserve).Before(deadline) {
-			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "admission_reserve")
+			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "admission_reserve", "", proposal.cmd.Decision(), lastAdmitted)
 			continue
 		}
 		if !s.awaitReplacementsLaunched(ctx, launching, deadline.Add(-commandAdmissionReserve)) {
-			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "replacements_not_launched")
+			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageDeadline, "replacements_not_launched", "", proposal.cmd.Decision(), lastAdmitted)
 			continue
 		}
 		// Each proposal is validated no sooner than commandValidationDelay after it was computed,
@@ -428,7 +431,7 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 			}
 			reason := getValidationFailureReason(err)
 			proposal.cmd.EmitRejectedEvents(s.recorder, reason)
-			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageValidation, reason)
+			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageValidation, reason, getValidationFailureDetail(err), proposal.cmd.Decision(), lastAdmitted)
 			continue
 		}
 
@@ -438,7 +441,7 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 		cmd.Method = s
 		cmd.Admitted = true
 		if err := s.queue.StartCommand(ctx, &cmd); err != nil {
-			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageStart, "error")
+			ObserveConsolidationAdmissionFailure(s.ConsolidationType(), AdmissionStageStart, "error", "", cmd.Decision(), lastAdmitted)
 			return admitted, fmt.Errorf("disrupting candidates, %w", err)
 		}
 		ObserveAcceptedCandidate(cmd, s.ConsolidationType(), proposal.position)
@@ -446,6 +449,7 @@ func (s *SingleNodeConsolidation) admitProposals(ctx context.Context, proposals 
 		for _, r := range cmd.Replacements {
 			launching.Insert(r.Name)
 		}
+		lastAdmitted = string(cmd.Decision())
 	}
 	return admitted, nil
 }
