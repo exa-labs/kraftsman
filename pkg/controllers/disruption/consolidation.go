@@ -389,7 +389,8 @@ func (c *consolidation) computeConsolidationWithOptions(ctx context.Context, sim
 		spotRetrySnapshots = snapshotOptions()
 	}
 	// The on-demand zone retry re-prices the same emptied options against the cheap on-demand zones.
-	// It only arms for claims that cannot launch spot, so the two retries never arm together.
+	// It arms only when no claim may launch spot and the spot-only retry only when every claim may,
+	// so the two never arm together.
 	var onDemandZoneRetrySnapshots [][]*cloudprovider.InstanceType
 	if c.onDemandZoneRetryApplies(ctx, results.NewNodeClaims) {
 		onDemandZoneRetrySnapshots = snapshotOptions()
@@ -646,25 +647,22 @@ func (c *consolidation) retrySpotZoneNarrowedReplacements(ctx context.Context, c
 }
 
 // onDemandZoneRetryApplies reports whether the on-demand zone-narrowing retry is enabled and
-// applicable: every replacement claim can only launch on-demand capacity. A claim that may launch
-// spot is priced on its spot offerings and has the spot retries above; one that may launch reserved
-// capacity is priced on its reservations, which the scheduler already pins.
+// applicable: no replacement claim may launch spot. A claim that may launch spot is priced on its
+// spot offerings and has the spot retries above. Reserved capacity does not disqualify a claim: a
+// reservation with capacity is what the claim is priced on, pinned by the scheduler, and one
+// without capacity can only make the launch cheaper than the on-demand offering it was priced on,
+// inside the zones the retry pins.
 func (c *consolidation) onDemandZoneRetryApplies(ctx context.Context, newNodeClaims []*pscheduling.NodeClaim) bool {
 	if !options.FromContext(ctx).ConsolidationOnDemandZoneRetry {
 		return false
 	}
-	return lo.EveryBy(newNodeClaims, launchesOnDemandOnly)
+	return lo.NoneBy(newNodeClaims, mayLaunchSpot)
 }
 
-// launchesOnDemandOnly reports whether every offering a replacement claim is compatible with,
-// available or not, is on-demand. Unavailable offerings count: availability is a transient signal
-// and the claim's requirements, not the offerings priced here, decide what the launch may use.
-func launchesOnDemandOnly(nc *pscheduling.NodeClaim) bool {
-	return lo.EveryBy(nc.InstanceTypeOptions, func(it *cloudprovider.InstanceType) bool {
-		return lo.EveryBy(it.Offerings.Compatible(nc.Requirements), func(of *cloudprovider.Offering) bool {
-			return of.CapacityType() == v1.CapacityTypeOnDemand
-		})
-	})
+// mayLaunchSpot reports whether a replacement claim's requirements allow spot capacity. The
+// requirements, not the offerings available right now, decide what the launch may use.
+func mayLaunchSpot(nc *pscheduling.NodeClaim) bool {
+	return nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeSpot)
 }
 
 // retryOnDemandZoneNarrowedReplacements re-runs the aggregate price filter after the ordinary

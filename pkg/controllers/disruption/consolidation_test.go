@@ -3543,6 +3543,12 @@ var _ = Describe("Consolidation", func() {
 			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{currentInstance}
 			ExpectSingletonReconciled(ctx, pricingController)
 			disruption.ConsolidationOnDemandZoneRetryTotal.Reset()
+			// the retry is for claims that cannot launch spot
+			nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, v1.NodeSelectorRequirementWithMinValues{
+				Key:      v1.CapacityTypeLabelKey,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{v1.CapacityTypeOnDemand},
+			})
 
 			rs = test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
@@ -3603,6 +3609,7 @@ var _ = Describe("Consolidation", func() {
 		It("replaces an on-demand node with the same instance type pinned to the cheaper zone", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ConsolidationOnDemandZoneRetry: lo.ToPtr(true)}))
 			applyPackedNode()
+			recorder.Reset()
 			ExpectSingletonReconciled(ctx, disruptionController)
 			ExpectMetricCounterValue(disruption.ConsolidationOnDemandZoneRetryTotal, 1, map[string]string{
 				disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType,
@@ -3628,6 +3635,10 @@ var _ = Describe("Consolidation", func() {
 			reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaims[0].Spec.Requirements...)
 			// priced against the cheaper zone only, so the launch must be pinned there and stay on-demand
 			Expect(reqs.Get(corev1.LabelTopologyZone).Values()).To(ConsistOf("test-zone-1a"))
+			_, skipped := lo.Find(recorder.Events(), func(e events.Event) bool {
+				return strings.Contains(e.Message, "Can't replace with a cheaper node")
+			})
+			Expect(skipped).To(BeFalse())
 			Expect(reqs.Get(v1.CapacityTypeLabelKey).Values()).To(ConsistOf(v1.CapacityTypeOnDemand))
 			Expect(reqs.Get(corev1.LabelInstanceTypeStable).Values()).To(ConsistOf(currentInstance.Name))
 			ExpectNotFound(ctx, env.Client, nodeClaim, node)
@@ -3654,10 +3665,31 @@ var _ = Describe("Consolidation", func() {
 
 			Expect(queue.GetCommands()).To(BeEmpty())
 			ExpectExists(ctx, env.Client, nodeClaim)
-			_, ok := lo.Find(recorder.Events(), func(e events.Event) bool {
+			// a failed retry publishes the skip once: an event for the Node and one for the NodeClaim
+			Expect(lo.CountBy(recorder.Events(), func(e events.Event) bool {
 				return strings.Contains(e.Message, "Can't replace with a cheaper node")
+			})).To(Equal(2))
+		})
+		It("does not arm for a NodePool whose requirements allow spot", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ConsolidationOnDemandZoneRetry: lo.ToPtr(true)}))
+			nodePool.Spec.Template.Spec.Requirements = lo.Reject(nodePool.Spec.Template.Spec.Requirements, func(r v1.NodeSelectorRequirementWithMinValues, _ int) bool {
+				return r.Key == v1.CapacityTypeLabelKey
 			})
-			Expect(ok).To(BeTrue())
+			applyPackedNode()
+			recorder.Reset()
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			Expect(queue.GetCommands()).To(BeEmpty())
+			ExpectExists(ctx, env.Client, nodeClaim)
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_on_demand_zone_retries_total", map[string]string{
+				metrics.NodePoolLabel: nodePool.Name,
+			})
+			Expect(found).To(BeFalse())
+			// the skip is published once (an event for the Node and one for the NodeClaim): the two
+			// retries never both publish it
+			Expect(lo.CountBy(recorder.Events(), func(e events.Event) bool {
+				return strings.Contains(e.Message, "Can't replace with a cheaper node")
+			})).To(Equal(2))
 		})
 		It("leaves a node that already runs in the cheapest zone alone", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{ConsolidationOnDemandZoneRetry: lo.ToPtr(true)}))

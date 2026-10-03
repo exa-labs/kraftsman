@@ -193,44 +193,75 @@ func TestOnDemandZoneRetryNarrowsEachSplitClaimAgainstItsShare(t *testing.T) {
 	}
 }
 
-func TestLaunchesOnDemandOnly(t *testing.T) {
-	unavailableSpot := odToSpotOffering(v1.CapacityTypeSpot, "zone-a", 0.3)
-	unavailableSpot.Available = false
+// The retry is for claims that cannot launch spot: spot-capable claims are priced on their spot
+// offerings and have their own retries, so the two never arm for the same command.
+func TestOnDemandZoneRetryAppliesOnlyToClaimsThatExcludeSpot(t *testing.T) {
+	it := odToSpotInstanceType("gpu",
+		odToSpotOffering(v1.CapacityTypeOnDemand, "zone-a", 1.0),
+		odToSpotOffering(v1.CapacityTypeOnDemand, "zone-b", 1.2),
+	)
+	claim := func(capacityTypes ...string) *pscheduling.NodeClaim {
+		nc := onDemandZoneNodeClaim([]string{"zone-a", "zone-b"}, it)
+		nc.Requirements = scheduling.NewRequirements(
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "zone-a", "zone-b"),
+		)
+		if len(capacityTypes) != 0 {
+			nc.Requirements.Add(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityTypes...))
+		}
+		return nc
+	}
+	onDemand := claim(v1.CapacityTypeOnDemand)
+	reserved := claim(v1.CapacityTypeOnDemand, v1.CapacityTypeReserved)
+	mixed := claim(v1.CapacityTypeOnDemand, v1.CapacityTypeSpot)
+	unconstrained := claim()
+
+	c := &consolidation{}
+	ctx := options.ToContext(context.Background(), &options.Options{ConsolidationOnDemandZoneRetry: true, ODToSpotConsolidation: true})
 	for name, tc := range map[string]struct {
-		offerings []cloudprovider.Offering
-		want      bool
+		claims []*pscheduling.NodeClaim
+		want   bool
 	}{
-		"on-demand offerings only": {
-			offerings: []cloudprovider.Offering{odToSpotOffering(v1.CapacityTypeOnDemand, "zone-a", 1.0), odToSpotOffering(v1.CapacityTypeOnDemand, "zone-b", 1.2)},
-			want:      true,
-		},
-		"a compatible spot offering": {
-			offerings: []cloudprovider.Offering{odToSpotOffering(v1.CapacityTypeOnDemand, "zone-a", 1.0), odToSpotOffering(v1.CapacityTypeSpot, "zone-a", 0.3)},
-			want:      false,
-		},
-		"an unavailable spot offering still counts": {
-			offerings: []cloudprovider.Offering{odToSpotOffering(v1.CapacityTypeOnDemand, "zone-a", 1.0), unavailableSpot},
-			want:      false,
-		},
-		"a compatible reserved offering": {
-			offerings: []cloudprovider.Offering{odToSpotOffering(v1.CapacityTypeOnDemand, "zone-a", 1.0), odToSpotOffering(v1.CapacityTypeReserved, "zone-a", 0.0)},
-			want:      false,
-		},
-		"a spot offering outside the claim's zones": {
-			offerings: []cloudprovider.Offering{odToSpotOffering(v1.CapacityTypeOnDemand, "zone-a", 1.0), odToSpotOffering(v1.CapacityTypeSpot, "zone-c", 0.3)},
-			want:      true,
-		},
+		"on-demand only":                       {claims: []*pscheduling.NodeClaim{onDemand}, want: true},
+		"on-demand or reserved":                {claims: []*pscheduling.NodeClaim{reserved}, want: true},
+		"spot allowed":                         {claims: []*pscheduling.NodeClaim{mixed}, want: false},
+		"no capacity type requirement":         {claims: []*pscheduling.NodeClaim{unconstrained}, want: false},
+		"one claim of a split may launch spot": {claims: []*pscheduling.NodeClaim{onDemand, mixed}, want: false},
+		"every claim of a split excludes spot": {claims: []*pscheduling.NodeClaim{onDemand, reserved}, want: true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			nc := onDemandZoneNodeClaim([]string{"zone-a", "zone-b"}, odToSpotInstanceType("gpu", tc.offerings...))
-			// the claim allows every capacity type so that only its offerings decide
-			nc.Requirements = scheduling.NewRequirements(
-				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "zone-a", "zone-b"),
-			)
-			if got := launchesOnDemandOnly(nc); got != tc.want {
-				t.Errorf("launchesOnDemandOnly() = %t, want %t", got, tc.want)
+			if got := c.onDemandZoneRetryApplies(ctx, tc.claims); got != tc.want {
+				t.Errorf("onDemandZoneRetryApplies() = %t, want %t", got, tc.want)
+			}
+			// the spot-only retry needs every claim to allow spot, so it never arms alongside
+			if spot, _ := c.odToSpotRetryApplies(ctx, []*Candidate{{capacityType: v1.CapacityTypeOnDemand}}, tc.claims); spot && tc.want {
+				t.Error("the on-demand zone retry and the spot-only retry both apply")
 			}
 		})
+	}
+}
+
+// A reservation that is full prices nothing, so the claim is priced on its on-demand offerings and
+// the retry still moves it to the cheaper zone; the launch may only get cheaper if the reservation
+// frees up inside the pinned zone.
+func TestOnDemandZoneRetryMovesClaimsThatMayAlsoLaunchReserved(t *testing.T) {
+	fullReservation := odToSpotOffering(v1.CapacityTypeReserved, "zone-b", 0.0000001)
+	fullReservation.Available = false
+	it := odToSpotInstanceType("gpu",
+		odToSpotOffering(v1.CapacityTypeOnDemand, "zone-a", 1.0),
+		odToSpotOffering(v1.CapacityTypeOnDemand, "zone-b", 1.2),
+		fullReservation,
+	)
+	nc := onDemandZoneNodeClaim([]string{"zone-a", "zone-b"}, it)
+	nc.Requirements = scheduling.NewRequirements(
+		scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeOnDemand, v1.CapacityTypeReserved),
+		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "zone-a", "zone-b"),
+	)
+
+	if !retryOnDemandZones(t, priceBudget{candidatePrice: 1.2}, nc) {
+		t.Fatal("expected the on-demand zone retry to succeed")
+	}
+	if got := zoneValues(nc); len(got) != 1 || got[0] != "zone-a" {
+		t.Errorf("zone requirement = %v, want [zone-a]", got)
 	}
 }
 
